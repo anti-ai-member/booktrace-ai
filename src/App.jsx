@@ -458,34 +458,59 @@ export function App() {
   }
 
   async function importBook(event) {
-    const file = event.target.files?.[0];
-    if (!file) return;
-    const extension = file.name.split(".").pop()?.toLowerCase() || "";
-    if (!EPUB_FORMATS.has(extension)) {
-      const label = PLANNED_BOOK_FORMATS.get(extension) || extension.toUpperCase() || "该格式";
+    const files = [...(event.target.files || [])];
+    if (!files.length) return;
+
+    const unsupported = files.filter((file) => !EPUB_FORMATS.has(file.name.split(".").pop()?.toLowerCase() || ""));
+    const epubFiles = files.filter((file) => EPUB_FORMATS.has(file.name.split(".").pop()?.toLowerCase() || ""));
+    if (!epubFiles.length) {
+      const label = unsupported.length === 1
+        ? PLANNED_BOOK_FORMATS.get(unsupported[0].name.split(".").pop()?.toLowerCase() || "") || unsupported[0].name.split(".").pop()?.toUpperCase() || "该格式"
+        : "这些格式";
       showNotice(`${label} 导入解析待接入；当前可直接阅读 EPUB`);
       event.target.value = "";
       return;
     }
+
     setIsLoading(true);
-      setLoadError("");
-      try {
-        const parsed = await parseEpub(file);
-      const fingerprint = createBookFingerprint(parsed, file);
-      const existing = libraryBooks.find((item) => item.fingerprint === fingerprint);
-      if (existing) {
-        setBook(existing);
-        setScreen("shelf");
-        showNotice(`《${existing.title}》已在书架中`);
-        return;
+    setLoadError("");
+    try {
+      const existingFingerprints = new Set(libraryBooks.map((item) => item.fingerprint).filter(Boolean));
+      const importedBooks = [];
+      let duplicateCount = 0;
+      let failedCount = 0;
+
+      for (const file of epubFiles) {
+        try {
+          const parsed = await parseEpub(file);
+          const fingerprint = createBookFingerprint(parsed, file);
+          if (existingFingerprints.has(fingerprint)) {
+            duplicateCount += 1;
+            continue;
+          }
+          existingFingerprints.add(fingerprint);
+          importedBooks.push({ ...parsed, id: `import-${Date.now()}-${importedBooks.length}`, fingerprint, fileName: file.name, cover: parsed.cover || "", local: false });
+        } catch {
+          failedCount += 1;
+        }
       }
-      const imported = { ...parsed, id: `import-${Date.now()}`, fingerprint, fileName: file.name, cover: parsed.cover || "", local: false };
-      setLibraryBooks((items) => [...items, imported]);
-      setBook(imported);
-      setBookCategories([categories[0]].filter(Boolean));
-      setChapterIndex(0);
-      setScreen("shelf");
-      showNotice(`已导入《${parsed.title}》`);
+
+      if (importedBooks.length) {
+        setLibraryBooks((items) => [...items, ...importedBooks]);
+        const latest = importedBooks[importedBooks.length - 1];
+        setBook(latest);
+        setBookCategories([categories[0]].filter(Boolean));
+        setChapterIndex(0);
+        setPageIndex(0);
+        setScreen("shelf");
+      }
+
+      const messages = [];
+      if (importedBooks.length) messages.push(`已导入 ${importedBooks.length} 本书`);
+      if (duplicateCount) messages.push(`${duplicateCount} 本已在书架中`);
+      if (unsupported.length) messages.push(`${unsupported.length} 个非 EPUB 文件已跳过`);
+      if (failedCount) messages.push(`${failedCount} 本导入失败`);
+      showNotice(messages.join("，") || "没有可导入的 EPUB");
     } catch (error) {
       setLoadError(error.message || "导入失败，请检查书籍文件");
     } finally {
@@ -690,7 +715,7 @@ export function App() {
   }
 
   if (loadError || !book) {
-    return <main className="loading-screen"><div className="loader-mark"><FileText size={26} /></div><strong>无法打开这本书</strong><span>{loadError}</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 选择书籍文件</button><input ref={inputRef} className="sr-only" type="file" accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
+    return <main className="loading-screen"><div className="loader-mark"><FileText size={26} /></div><strong>无法打开这本书</strong><span>{loadError}</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 选择书籍文件</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
   }
 
   if (screen === "skills") {
@@ -702,7 +727,7 @@ export function App() {
       <main className="library-shell">
         <header className="library-topbar">
           <div className="brand"><span className="brand-mark"><BookOpen size={18} /></span>{APP_NAME} <small>{APP_SLOGAN}</small></div>
-          <div className="library-actions"><button className="text-action" onClick={() => setCategoryModalOpen(true)}><Tag size={16} /> 管理分类</button><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 导入书籍</button><input ref={inputRef} className="sr-only" type="file" accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></div>
+          <div className="library-actions"><button className="text-action" onClick={() => setCategoryModalOpen(true)}><Tag size={16} /> 管理分类</button><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 导入书籍</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></div>
         </header>
         <aside className="library-sidebar">
           <div className="library-nav-title">我的书架</div>
