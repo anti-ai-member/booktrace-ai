@@ -200,6 +200,7 @@ export function App() {
   const [aiIndex, setAiIndex] = useState(null);
   const [bookProfile, setBookProfile] = useState(null);
   const [analysisRecord, setAnalysisRecord] = useState(null);
+  const [importStatus, setImportStatus] = useState(null);
   const [readPages, setReadPages] = useState([]);
   const [bookmarks, setBookmarks] = useState([]);
   const [notes, setNotes] = useState([]);
@@ -555,16 +556,18 @@ export function App() {
       return;
     }
 
-    setIsLoading(true);
+    setImportStatus({ total: epubFiles.length, current: 0, title: "", stage: "准备导入", classified: 0, failed: 0 });
     setLoadError("");
     try {
       const existingFingerprints = new Set(libraryBooks.map((item) => item.fingerprint).filter(Boolean));
       const importedBooks = [];
       let duplicateCount = 0;
       let failedCount = 0;
+      let classifiedCount = 0;
 
-      for (const file of epubFiles) {
+      for (const [fileIndex, file] of epubFiles.entries()) {
         try {
+          setImportStatus((status) => ({ ...status, current: fileIndex + 1, title: file.name, stage: "解析书籍结构" }));
           const parsed = await parseEpub(file);
           const fingerprint = createBookFingerprint(parsed, file);
           if (existingFingerprints.has(fingerprint)) {
@@ -572,9 +575,24 @@ export function App() {
             continue;
           }
           existingFingerprints.add(fingerprint);
-          importedBooks.push({ ...parsed, id: `import:${fingerprint}`, fingerprint, fileName: file.name, cover: parsed.cover || "", local: false });
+          setImportStatus((status) => ({ ...status, title: parsed.title || file.name, stage: "调用大模型识别类型" }));
+          const classification = await classifyImportedBook(parsed);
+          if (classification) classifiedCount += 1;
+          const profile = classification?.profile;
+          importedBooks.push({
+            ...parsed,
+            id: `import:${fingerprint}`,
+            fingerprint,
+            fileName: file.name,
+            cover: parsed.cover || "",
+            bookType: profile?.category || "",
+            indexSchema: profile?.facets || [],
+            local: false,
+          });
+          setImportStatus((status) => ({ ...status, classified: classifiedCount, stage: classification ? "完成分类" : "分类跳过，保留待识别" }));
         } catch {
           failedCount += 1;
+          setImportStatus((status) => ({ ...status, failed: failedCount, stage: "这本导入失败，继续下一本" }));
         }
       }
 
@@ -591,6 +609,7 @@ export function App() {
 
       const messages = [];
       if (importedBooks.length) messages.push(`已导入 ${importedBooks.length} 本书`);
+      if (classifiedCount) messages.push(`已识别 ${classifiedCount} 本类型`);
       if (duplicateCount) messages.push(`${duplicateCount} 本已在书架中`);
       if (unsupported.length) messages.push(`${unsupported.length} 个非 EPUB 文件已跳过`);
       if (failedCount) messages.push(`${failedCount} 本导入失败`);
@@ -598,8 +617,26 @@ export function App() {
     } catch (error) {
       setLoadError(error.message || "导入失败，请检查书籍文件");
     } finally {
-      setIsLoading(false);
+      setImportStatus(null);
       event.target.value = "";
+    }
+  }
+
+  async function classifyImportedBook(parsed) {
+    try {
+      const response = await fetch("/api/classify-book", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: analysisSettings.provider,
+          model: analysisSettings.model,
+          book: createClassificationPayload(parsed),
+        }),
+      });
+      if (!response.ok) return null;
+      return await response.json();
+    } catch {
+      return null;
     }
   }
 
@@ -817,7 +854,7 @@ export function App() {
       <main className="library-shell">
         <header className="library-topbar">
           <div className="brand"><span className="brand-mark"><BookOpen size={18} /></span>{APP_NAME} <small>{APP_SLOGAN}</small></div>
-          <div className="library-actions"><button className="text-action" onClick={() => setCategoryModalOpen(true)}><Tag size={16} /> 管理分类</button><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 导入书籍</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></div>
+          <div className="library-actions"><button className="text-action" onClick={() => setCategoryModalOpen(true)}><Tag size={16} /> 管理分类</button><button className="primary-button" disabled={Boolean(importStatus)} onClick={() => inputRef.current?.click()}><Upload size={16} /> {importStatus ? "正在导入" : "导入书籍"}</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></div>
         </header>
         <aside className="library-sidebar">
           <div className="library-nav-title">我的书架</div>
@@ -837,6 +874,7 @@ export function App() {
         </section>
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
         {deleteCandidate && <DeleteBookConfirmModal book={deleteCandidate} onCancel={() => setDeleteCandidate(null)} onConfirm={confirmDeleteBook} />}
+        {importStatus && <ImportProgressModal status={importStatus} />}
       </main>
     );
   }
@@ -1433,6 +1471,20 @@ function createBookFingerprint(parsed, file) {
   return `epub:${basis}`;
 }
 
+function createClassificationPayload(book) {
+  return {
+    title: book.title,
+    creator: book.creator,
+    publisher: book.publisher,
+    language: book.language,
+    tableOfContents: book.chapters.slice(0, 18).map((chapter) => chapter.title),
+    sampleText: book.chapters.slice(0, 4).map((chapter) => ({
+      title: chapter.title,
+      paragraphs: chapter.paragraphs.slice(0, 4).map((paragraph) => paragraph.slice(0, 360)),
+    })),
+  };
+}
+
 function SearchDialog({ query, setQuery, results, onSelect, onClose }) {
   const inputRef = useRef(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
@@ -1442,6 +1494,11 @@ function SearchDialog({ query, setQuery, results, onSelect, onClose }) {
 function highlightMatch(text, query) {
   const parts = text.split(query);
   return parts.map((part, index) => <span key={`${part}-${index}`}>{part}{index < parts.length - 1 && <mark>{query}</mark>}</span>);
+}
+
+function ImportProgressModal({ status }) {
+  const progress = status.total ? Math.round((status.current / status.total) * 100) : 0;
+  return <div className="import-progress-backdrop" role="status" aria-live="polite"><section className="import-progress-card"><div className="import-orbit" aria-hidden="true"><i /><i /><i /></div><div><span>导入书籍</span><h2>{status.stage}</h2><p>{status.title || "正在准备书籍文件"}</p></div><div className="import-progress-line"><i style={{ width: `${progress}%` }} /></div><footer><span>{status.current || 0} / {status.total || 1} 本</span><span>{status.classified || 0} 本已分类</span>{!!status.failed && <span>{status.failed} 本失败</span>}</footer></section></div>;
 }
 
 function CategoryModal({ categories, selected, newCategory, setNewCategory, onAdd, onToggle, onClose }) {

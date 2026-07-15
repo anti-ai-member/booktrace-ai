@@ -21,6 +21,34 @@ const PROVIDERS = {
 
 app.get("/api/health", (_request, response) => response.json({ ok: true }));
 
+app.post("/api/classify-book", async (request, response) => {
+  const { provider = "deepseek", model, book } = request.body || {};
+  const config = PROVIDERS[provider];
+  if (!config) return response.status(400).json({ error: "Unsupported model provider" });
+  if (!book?.title) return response.status(400).json({ error: "Missing book metadata" });
+
+  const apiKey = process.env[config.apiKey];
+  if (!apiKey) return response.status(400).json({ error: `Please configure ${config.apiKey} in .env first` });
+
+  try {
+    const modelClient = new ChatOpenAI({
+      apiKey,
+      model: model || config.defaultModel,
+      temperature: 0,
+      configuration: config.baseURL ? { baseURL: config.baseURL } : undefined,
+    });
+    const result = await modelClient.invoke([
+      ["system", "You classify books for a quiet AI reading app. Return compact JSON only, with no Markdown."],
+      ["human", buildClassificationPrompt(book)],
+    ]);
+    const parsed = parseJson(result.content);
+    const profile = normaliseProfile({ category: parsed.category, facets: parsed.facets });
+    response.json({ provider, model: model || config.defaultModel, profile, reason: String(parsed.reason || "").slice(0, 140) });
+  } catch (error) {
+    response.status(502).json({ error: error.message || "Book classification failed" });
+  }
+});
+
 app.post("/api/analyze", async (request, response) => {
   const { provider = "deepseek", model, book, previousIndex, cursor, scope = "read" } = request.body || {};
   const config = PROVIDERS[provider];
@@ -49,6 +77,22 @@ app.post("/api/analyze", async (request, response) => {
     response.status(502).json({ error: error.message || "大模型分析失败" });
   }
 });
+
+function buildClassificationPrompt(book) {
+  const candidates = BOOK_TYPES.map((type) => ({ name: type.name, facets: type.facets }));
+  return `Classify the imported book into exactly one candidate type and choose 4-6 useful reading-index facets from that type.
+
+Candidate types:
+${JSON.stringify(candidates)}
+
+Use only the supplied metadata, table of contents, and sample text. Prefer the book's actual subject and reading workflow over filename hints. If uncertain, choose the closest general type.
+
+Return JSON exactly like:
+{"category":"one candidate name","facets":["facet"],"reason":"short reason"}
+
+Book metadata:
+${JSON.stringify(book)}`;
+}
 
 function buildAnalysisPrompt(book, previousIndex, cursor, scope) {
   const source = book.chapters.map((chapter, chapterIndex) => ({
