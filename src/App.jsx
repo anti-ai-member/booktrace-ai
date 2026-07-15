@@ -46,7 +46,7 @@ const COVER_PATH = "/books/long-march-cover.jpeg";
 const APP_NAME = "书脉";
 const APP_SLOGAN = "读得清脉络，记得住来处";
 const SUPPORTED_IMPORT_ACCEPT = ".epub,.pdf,.txt,.html,.htm,.rtf,.doc,.docx,.mobi,.azw,.azw3,.fb2,.djvu,.cbz,.cbr,application/epub+zip,application/pdf,text/plain,text/html";
-const EPUB_FORMATS = new Set(["epub"]);
+const READABLE_IMPORT_FORMATS = new Set(["epub", "pdf"]);
 const PLANNED_BOOK_FORMATS = new Map([
   ["pdf", "PDF"],
   ["txt", "TXT"],
@@ -545,18 +545,18 @@ export function App() {
     const files = [...(event.target.files || [])];
     if (!files.length) return;
 
-    const unsupported = files.filter((file) => !EPUB_FORMATS.has(file.name.split(".").pop()?.toLowerCase() || ""));
-    const epubFiles = files.filter((file) => EPUB_FORMATS.has(file.name.split(".").pop()?.toLowerCase() || ""));
-    if (!epubFiles.length) {
+    const unsupported = files.filter((file) => !READABLE_IMPORT_FORMATS.has(getFileExtension(file)));
+    const readableFiles = files.filter((file) => READABLE_IMPORT_FORMATS.has(getFileExtension(file)));
+    if (!readableFiles.length) {
       const label = unsupported.length === 1
         ? PLANNED_BOOK_FORMATS.get(unsupported[0].name.split(".").pop()?.toLowerCase() || "") || unsupported[0].name.split(".").pop()?.toUpperCase() || "该格式"
         : "这些格式";
-      showNotice(`${label} 导入解析待接入；当前可直接阅读 EPUB`);
+      showNotice(`${label} 导入解析待接入；当前可直接阅读 EPUB 和 PDF`);
       event.target.value = "";
       return;
     }
 
-    setImportStatus({ total: epubFiles.length, current: 0, title: "", stage: "准备导入", classified: 0, failed: 0 });
+    setImportStatus({ total: readableFiles.length, current: 0, title: "", stage: "准备导入", classified: 0, failed: 0 });
     setLoadError("");
     try {
       const existingFingerprints = new Set(libraryBooks.map((item) => item.fingerprint).filter(Boolean));
@@ -565,10 +565,10 @@ export function App() {
       let failedCount = 0;
       let classifiedCount = 0;
 
-      for (const [fileIndex, file] of epubFiles.entries()) {
+      for (const [fileIndex, file] of readableFiles.entries()) {
         try {
           setImportStatus((status) => ({ ...status, current: fileIndex + 1, title: file.name, stage: "解析书籍结构" }));
-          const parsed = await parseEpub(file);
+          const parsed = await parseImportedBook(file);
           const fingerprint = createBookFingerprint(parsed, file);
           if (existingFingerprints.has(fingerprint)) {
             duplicateCount += 1;
@@ -611,9 +611,9 @@ export function App() {
       if (importedBooks.length) messages.push(`已导入 ${importedBooks.length} 本书`);
       if (classifiedCount) messages.push(`已识别 ${classifiedCount} 本类型`);
       if (duplicateCount) messages.push(`${duplicateCount} 本已在书架中`);
-      if (unsupported.length) messages.push(`${unsupported.length} 个非 EPUB 文件已跳过`);
+      if (unsupported.length) messages.push(`${unsupported.length} 个暂不支持的文件已跳过`);
       if (failedCount) messages.push(`${failedCount} 本导入失败`);
-      showNotice(messages.join("，") || "没有可导入的 EPUB");
+      showNotice(messages.join("，") || "没有可导入的书籍");
     } catch (error) {
       setLoadError(error.message || "导入失败，请检查书籍文件");
     } finally {
@@ -638,6 +638,15 @@ export function App() {
     } catch {
       return null;
     }
+  }
+
+  async function parseImportedBook(file) {
+    const extension = getFileExtension(file);
+    if (extension === "pdf") {
+      const { parsePdf } = await import("./pdf.js");
+      return parsePdf(file);
+    }
+    return parseEpub(file);
   }
 
   function requestDeleteBook(targetBook) {
@@ -866,10 +875,10 @@ export function App() {
           <div className="type-browser"><button className={activeType === "全部类型" ? "type-chip active" : "type-chip"} onClick={() => setActiveType("全部类型")}>全部类型</button>{BOOK_TYPES.slice(0, typeBrowserExpanded ? BOOK_TYPES.length : 6).map((type) => <button className={activeType === type.name ? "type-chip active" : "type-chip"} key={type.id} onClick={() => { setActiveType(type.name); setTypeBrowserExpanded(true); }}><i /><span>{type.name}</span><small>{shelfBooks.filter((item) => item.bookType === type.name).length}</small></button>)}<button className="type-browser-more" onClick={() => setTypeBrowserExpanded((value) => !value)}>{typeBrowserExpanded ? "收起类型" : `展开其余 ${BOOK_TYPES.length - 6} 类`}</button></div>
         </aside>
         <section className="library-content">
-          <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB；PDF、TXT、MOBI、AZW3 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
+          <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB、PDF；TXT、MOBI、AZW3 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
           {visibleShelfBooks.length ? <div className="book-grid">{visibleShelfBooks.map((shelfBook) => {
             const shelfState = shelfBookStates.get(shelfBook.id) || getBookShelfState(shelfBook);
-            return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || "本地 EPUB"}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
+            return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || localFormatLabel(shelfBook)}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
           })}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>你可以为《{book.title}》添加“{activeCategory}”标签。</span><button className="text-action" onClick={() => setCategoryModalOpen(true)}>管理分类</button></div>}
         </section>
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
@@ -903,7 +912,7 @@ export function App() {
           {activePanel === "地点" && <EntityIndexList title="地点" kind="place" items={bookIndex.places} icon={<MapPin size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠地点实体。" />}
           {activePanel !== "目录" && activePanel !== "人物" && activePanel !== "时间线" && activePanel !== "地点" && <FacetIndexPanel title={activePanel} category={bookProfile?.category} />}
         </div>
-        <div className="side-book-meta"><span>共 {book.chapters.length} 节</span><span>本地 EPUB</span></div>
+        <div className="side-book-meta"><span>共 {book.chapters.length} 节</span><span>{localFormatLabel(book)}</span></div>
       </aside>
       <section className="reading-stage">
         <header className="chapter-toolbar"><button disabled={chapterIndex === 0} onClick={() => selectChapter(chapterIndex - 1)}><ChevronLeft size={18} /></button><span>{chapter.title}</span><button disabled={chapterIndex === book.chapters.length - 1} onClick={() => selectChapter(chapterIndex + 1)}><ChevronRight size={18} /></button></header>
@@ -913,7 +922,7 @@ export function App() {
         </article>
         <footer className="reader-footer"><button disabled={pageIndex === 0} onClick={() => turnPage(-1)}><ChevronLeft size={17} /> 上一页</button><span>第 {pageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button disabled={pageIndex === pageCount - 1} onClick={() => turnPage(1)}>下一页 <ChevronRight size={17} /></button></footer>
       </section>
-      {drawerOpen && <section className="context-drawer"><div className="drawer-handle" /><header className="drawer-header"><div><span className="eyebrow">阅读上下文</span><strong>{chapter.title} · 第 {(selectedParagraph ?? 0) + 1} 段</strong></div><button onClick={() => setDrawerOpen(false)} title="收起阅读上下文"><X size={18} /></button></header><div className="context-grid"><section><h2><Sparkles size={17} /> 本地阅读提示</h2><p>这段内容位于《{book.title}》的“{chapter.title}”。选择其他段落后，可在此保留它与当前章节的上下文。</p>{selectedIndexEntries.length > 0 && <div className="context-entities">{selectedIndexEntries.map((entry) => <button key={entry.id} onClick={() => openIndexEntry(entry)}>{entry.name}</button>)}</div>}<span className="local-note">实体与日期均从本地 EPUB 原文识别，点击可回到其首个证据位置。</span></section><section><h2><Clock3 size={17} /> 相邻原文</h2>{contextualParagraphs.map((paragraph, index) => <button className="context-excerpt" key={paragraph} onClick={() => jumpToParagraph(Math.max(0, (selectedParagraph ?? 0) - 1) + index)}>{paragraph.slice(0, 86)}{paragraph.length > 86 ? "…" : ""}</button>)}</section><section><h2><FileText size={17} /> 出处</h2><dl className="source-data"><div><dt>书名</dt><dd>{book.title}</dd></div><div><dt>章节</dt><dd>{chapter.title}</dd></div><div><dt>位置</dt><dd>第 {(selectedParagraph ?? 0) + 1} 段</dd></div><div><dt>版本</dt><dd>{book.publisher || "本地 EPUB"}</dd></div></dl><button className="source-jump" onClick={() => jumpToParagraph(selectedParagraph ?? 0)}>回到原文 <ChevronRight size={15} /></button></section></div></section>}
+      {drawerOpen && <section className="context-drawer"><div className="drawer-handle" /><header className="drawer-header"><div><span className="eyebrow">阅读上下文</span><strong>{chapter.title} · 第 {(selectedParagraph ?? 0) + 1} 段</strong></div><button onClick={() => setDrawerOpen(false)} title="收起阅读上下文"><X size={18} /></button></header><div className="context-grid"><section><h2><Sparkles size={17} /> 本地阅读提示</h2><p>这段内容位于《{book.title}》的“{chapter.title}”。选择其他段落后，可在此保留它与当前章节的上下文。</p>{selectedIndexEntries.length > 0 && <div className="context-entities">{selectedIndexEntries.map((entry) => <button key={entry.id} onClick={() => openIndexEntry(entry)}>{entry.name}</button>)}</div>}<span className="local-note">实体与日期均从本地原文识别，点击可回到其首个证据位置。</span></section><section><h2><Clock3 size={17} /> 相邻原文</h2>{contextualParagraphs.map((paragraph, index) => <button className="context-excerpt" key={paragraph} onClick={() => jumpToParagraph(Math.max(0, (selectedParagraph ?? 0) - 1) + index)}>{paragraph.slice(0, 86)}{paragraph.length > 86 ? "…" : ""}</button>)}</section><section><h2><FileText size={17} /> 出处</h2><dl className="source-data"><div><dt>书名</dt><dd>{book.title}</dd></div><div><dt>章节</dt><dd>{chapter.title}</dd></div><div><dt>位置</dt><dd>第 {(selectedParagraph ?? 0) + 1} 段</dd></div><div><dt>版本</dt><dd>{book.publisher || localFormatLabel(book)}</dd></div></dl><button className="source-jump" onClick={() => jumpToParagraph(selectedParagraph ?? 0)}>回到原文 <ChevronRight size={15} /></button></section></div></section>}
       {!drawerOpen && selectedParagraph !== null && <button className="open-context" onClick={() => setDrawerOpen(true)}><Lightbulb size={17} /> 打开阅读上下文</button>}
       {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
       {noteComposerOpen && <NoteComposer draft={noteDraft} setDraft={setNoteDraft} selection={selectionBloom?.text || ""} onClose={() => setNoteComposerOpen(false)} onSave={saveNote} />}
@@ -1459,7 +1468,9 @@ function searchBook(chapters, query) {
 }
 
 function createBookFingerprint(parsed, file) {
+  const extension = getFileExtension(file) || String(parsed.format || "book").toLowerCase();
   const basis = [
+    extension,
     parsed.title,
     parsed.creator,
     parsed.publisher,
@@ -1468,7 +1479,7 @@ function createBookFingerprint(parsed, file) {
     parsed.chapters?.length,
     parsed.chapters?.[0]?.title,
   ].map((part) => String(part || "").trim().toLowerCase()).join("|");
-  return `epub:${basis}`;
+  return `${extension || "book"}:${basis}`;
 }
 
 function createClassificationPayload(book) {
@@ -1485,10 +1496,18 @@ function createClassificationPayload(book) {
   };
 }
 
+function getFileExtension(file) {
+  return String(file?.name || "").split(".").pop()?.toLowerCase() || "";
+}
+
+function localFormatLabel(book) {
+  return `本地 ${book?.format || "EPUB"}`;
+}
+
 function SearchDialog({ query, setQuery, results, onSelect, onClose }) {
   const inputRef = useRef(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
-  return <div className="search-backdrop" role="presentation" onMouseDown={onClose}><section className="search-dialog" role="dialog" aria-modal="true" aria-label="搜索书内内容" onMouseDown={(event) => event.stopPropagation()}><header><Search size={19} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索人物、地点、事件或任意文字" /><button onClick={onClose} title="关闭搜索"><X size={18} /></button></header>{query.trim() ? <div className="search-results">{results.length ? results.map((result) => <button key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span><small>{result.chapterTitle} · 第 {result.paragraphIndex + 1} 段</small><b>{highlightMatch(result.excerpt, query.trim())}</b></span><ChevronRight size={16} /></button>) : <div className="search-empty"><Search size={24} /><strong>书内没有找到“{query}”</strong><span>试试人物、地点或更短的关键词。</span></div>}</div> : <div className="search-empty"><BookOpen size={25} /><strong>在《长征》中查找</strong><span>输入人物、地点、事件，或直接输入一段原文。</span><div className="search-suggestions"><button onClick={() => setQuery("湘江")}>湘江</button><button onClick={() => setQuery("遵义")}>遵义</button><button onClick={() => setQuery("红军")}>红军</button></div></div>}<footer><span>所有结果都来自本地 EPUB</span><kbd>Esc</kbd> 关闭</footer></section></div>;
+  return <div className="search-backdrop" role="presentation" onMouseDown={onClose}><section className="search-dialog" role="dialog" aria-modal="true" aria-label="搜索书内内容" onMouseDown={(event) => event.stopPropagation()}><header><Search size={19} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索人物、地点、事件或任意文字" /><button onClick={onClose} title="关闭搜索"><X size={18} /></button></header>{query.trim() ? <div className="search-results">{results.length ? results.map((result) => <button key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span><small>{result.chapterTitle} · 第 {result.paragraphIndex + 1} 段</small><b>{highlightMatch(result.excerpt, query.trim())}</b></span><ChevronRight size={16} /></button>) : <div className="search-empty"><Search size={24} /><strong>书内没有找到“{query}”</strong><span>试试人物、地点或更短的关键词。</span></div>}</div> : <div className="search-empty"><BookOpen size={25} /><strong>在《长征》中查找</strong><span>输入人物、地点、事件，或直接输入一段原文。</span><div className="search-suggestions"><button onClick={() => setQuery("湘江")}>湘江</button><button onClick={() => setQuery("遵义")}>遵义</button><button onClick={() => setQuery("红军")}>红军</button></div></div>}<footer><span>所有结果都来自本地图书</span><kbd>Esc</kbd> 关闭</footer></section></div>;
 }
 
 function highlightMatch(text, query) {
