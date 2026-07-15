@@ -1,6 +1,6 @@
 # 书脉
 
-> 读得清脉络，记得往来处。
+> 读得清脉络，记得住来处。
 
 [English README](./README.en.md)
 
