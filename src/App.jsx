@@ -561,9 +561,11 @@ export function App() {
     try {
       const existingFingerprints = new Set(libraryBooks.map((item) => item.fingerprint).filter(Boolean));
       const importedBooks = [];
+      const duplicateBooks = [];
       let duplicateCount = 0;
       let failedCount = 0;
       let classifiedCount = 0;
+      let firstFailureMessage = "";
 
       for (const [fileIndex, file] of readableFiles.entries()) {
         try {
@@ -572,6 +574,8 @@ export function App() {
           const fingerprint = createBookFingerprint(parsed, file);
           if (existingFingerprints.has(fingerprint)) {
             duplicateCount += 1;
+            const existingBook = libraryBooks.find((item) => item.fingerprint === fingerprint);
+            if (existingBook) duplicateBooks.push(existingBook);
             continue;
           }
           existingFingerprints.add(fingerprint);
@@ -590,8 +594,9 @@ export function App() {
             local: false,
           });
           setImportStatus((status) => ({ ...status, classified: classifiedCount, stage: classification ? "完成分类" : "分类跳过，保留待识别" }));
-        } catch {
+        } catch (error) {
           failedCount += 1;
+          if (!firstFailureMessage) firstFailureMessage = error?.message || `${file.name} 导入失败`;
           setImportStatus((status) => ({ ...status, failed: failedCount, stage: "这本导入失败，继续下一本" }));
         }
       }
@@ -602,8 +607,16 @@ export function App() {
         const latest = importedBooks[importedBooks.length - 1];
         setBook(latest);
         setBookCategories([categories[0]].filter(Boolean));
+        setActiveCategory("全部");
+        setActiveType("全部类型");
         setChapterIndex(0);
         setPageIndex(0);
+        setScreen("shelf");
+      } else if (duplicateBooks.length) {
+        const existing = duplicateBooks[duplicateBooks.length - 1];
+        setBook(existing);
+        setActiveCategory("全部");
+        setActiveType("全部类型");
         setScreen("shelf");
       }
 
@@ -613,6 +626,7 @@ export function App() {
       if (duplicateCount) messages.push(`${duplicateCount} 本已在书架中`);
       if (unsupported.length) messages.push(`${unsupported.length} 个暂不支持的文件已跳过`);
       if (failedCount) messages.push(`${failedCount} 本导入失败`);
+      if (!importedBooks.length && failedCount && firstFailureMessage) messages.push(firstFailureMessage);
       showNotice(messages.join("，") || "没有可导入的书籍");
     } catch (error) {
       setLoadError(error.message || "导入失败，请检查书籍文件");

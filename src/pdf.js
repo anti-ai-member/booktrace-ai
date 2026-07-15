@@ -10,9 +10,9 @@ export async function parsePdf(file) {
   const document = await pdfjsLib.getDocument({ data: buffer }).promise;
   const metadata = await document.getMetadata().catch(() => ({}));
   const info = metadata.info || {};
-  const title = cleanMeta(info.Title) || cleanFileTitle(file.name) || "未命名 PDF";
-  const creator = cleanMeta(info.Author) || "未知作者";
-  const publisher = cleanMeta(info.Producer) || cleanMeta(info.Creator) || "本地 PDF";
+  const title = cleanMeta(info.Title) || cleanFileTitle(file.name) || "Untitled PDF";
+  const creator = cleanMeta(info.Author) || "Unknown author";
+  const publisher = cleanMeta(info.Producer) || cleanMeta(info.Creator) || "Local PDF";
   const pages = [];
 
   for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
