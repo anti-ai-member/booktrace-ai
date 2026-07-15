@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Background, Controls, MiniMap, ReactFlow } from "@xyflow/react";
+import { Background, Controls, ReactFlow } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import dagre from "dagre";
 import {
   ArrowLeft,
   BookOpen,
   Bookmark,
+  Bot,
+  Camera,
   Check,
   ChevronDown,
   ChevronLeft,
@@ -174,7 +176,7 @@ export function App() {
   const [activeCategory, setActiveCategory] = useState("全部");
   const [activeType, setActiveType] = useState("全部类型");
   const [typeBrowserExpanded, setTypeBrowserExpanded] = useState(false);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [facetMenuOpen, setFacetMenuOpen] = useState(false);
   const [pageTurn, setPageTurn] = useState("");
   const [categoryModalOpen, setCategoryModalOpen] = useState(false);
@@ -190,6 +192,8 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [shelfSearchOpen, setShelfSearchOpen] = useState(false);
+  const [shelfSearchQuery, setShelfSearchQuery] = useState("");
   const [analysisSettings, setAnalysisSettings] = useState(() => ({ ...DEFAULT_AI_SETTINGS, ...loadStored("yuezhi-ai-settings", DEFAULT_AI_SETTINGS) }));
   const [analysisSettingsOpen, setAnalysisSettingsOpen] = useState(false);
   const [themeSettingsOpen, setThemeSettingsOpen] = useState(false);
@@ -241,7 +245,8 @@ export function App() {
   useEffect(() => {
     if (!book) return;
     const storageKey = analysisStorageKey(book);
-    const record = loadStored(storageKey, loadStored(`yuezhi-analysis:${book.title}`, null));
+    const storedRecord = loadStored(storageKey, loadStored(`yuezhi-analysis:${book.title}`, null));
+    const record = storedRecord ? { ...storedRecord, summary: normalizeAnalysisSummary(storedRecord.summary) } : null;
     setReadPages(loadStored(readPagesStorageKey(book), []));
     setAnalysisRecord(record);
     setAiIndex(record?.index || null);
@@ -375,10 +380,23 @@ export function App() {
     const matchesCategory = activeCategory === "全部" || (item.id === book?.id && bookCategories.includes(activeCategory));
     return matchesType && matchesCategory;
   });
+  const shelfSearchText = shelfSearchQuery.trim().toLowerCase();
+  const searchedShelfBooks = shelfSearchText
+    ? visibleShelfBooks.filter((item) => [item.title, item.creator, item.publisher, item.bookType, localFormatLabel(item)].filter(Boolean).join(" ").toLowerCase().includes(shelfSearchText))
+    : visibleShelfBooks;
+  const shelfSearchSuggestions = useMemo(() => {
+    const typeItems = BOOK_TYPES.map((type) => ({ label: type.name, count: shelfBooks.filter((item) => item.bookType === type.name).length }))
+      .filter((item) => item.count > 0)
+      .slice(0, 4);
+    const categoryItems = categories.map((category) => ({ label: category, count: bookCategories.includes(category) ? 1 : 0 }))
+      .filter((item) => item.count > 0)
+      .slice(0, 4);
+    return [...typeItems, ...categoryItems].slice(0, 6);
+  }, [shelfBooks, categories, bookCategories]);
   const shelfLabel = activeType !== "全部类型" ? activeType : activeCategory === "全部" ? "本地书架" : activeCategory;
   const searchResults = useMemo(() => searchBook(book?.chapters || [], searchQuery), [book, searchQuery]);
   const fallbackIndex = useMemo(() => buildReadingIndex(book?.chapters || []), [book]);
-  const bookIndex = aiIndex || fallbackIndex;
+  const bookIndex = useMemo(() => normalizeReadingIndex(aiIndex || fallbackIndex), [aiIndex, fallbackIndex]);
   const activeSkillDomain = resolveSkillDomain(book?.bookType, bookCategories);
   const activeSkillConfig = getDomainConfig(activeSkillDomain);
   const activeDomainProgress = domainProgress(readingProgress, activeSkillDomain);
@@ -719,7 +737,7 @@ export function App() {
       setBookProfile(result.profile);
       setBook((current) => current ? { ...current, bookType: result.profile.category, indexSchema: result.profile.facets } : current);
       setLibraryBooks((items) => items.map((item) => item.id === book.id ? { ...item, bookType: result.profile.category, indexSchema: result.profile.facets } : item));
-      const record = { index: result.index, profile: result.profile, summary: result.summary, cursor, updatedAt: new Date().toISOString() };
+      const record = { index: result.index, profile: result.profile, summary: normalizeAnalysisSummary(result.summary), cursor, updatedAt: new Date().toISOString() };
       setAnalysisRecord(record);
       localStorage.setItem(analysisStorageKey(book), JSON.stringify(record));
       setAnalysisState({ status: "done", message: `已由 ${result.model} 提取主线索引` });
@@ -874,27 +892,35 @@ export function App() {
 
   if (screen === "shelf") {
     return (
-      <main className="library-shell">
+      <main className={typeBrowserExpanded ? "library-shell panel-open" : "library-shell"}>
         <header className="library-topbar">
-          <div className="brand"><span className="brand-mark"><BookOpen size={18} /></span>{APP_NAME} <small>{APP_SLOGAN}</small></div>
-          <div className="library-actions"><button className="text-action" onClick={() => setCategoryModalOpen(true)}><Tag size={16} /> 管理分类</button><button className="primary-button" disabled={Boolean(importStatus)} onClick={() => inputRef.current?.click()}><Upload size={16} /> {importStatus ? "正在导入" : "导入书籍"}</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></div>
+          <div className="brand"><span className="brand-mark brand-wordmark">脉</span>{APP_NAME} <small>{APP_SLOGAN}</small></div>
+          <label className={shelfSearchOpen ? "library-search active" : "library-search"} role="search" aria-label="搜索书架" title="搜索书架"><Search size={18} /><input value={shelfSearchQuery} placeholder="搜索" onFocus={() => setShelfSearchOpen(true)} onChange={(event) => { setShelfSearchQuery(event.target.value); setShelfSearchOpen(true); }} onKeyDown={(event) => { if (event.key === "Escape") setShelfSearchOpen(false); }} /><button type="button" title="图片搜索" aria-label="图片搜索"><Camera size={22} /></button></label>
+          <div className="library-actions"><button className="text-action" title="管理分类" aria-label="管理分类" onClick={() => setCategoryModalOpen(true)}><Tag size={16} /><span>管理分类</span></button><button className="primary-button" title={importStatus ? "正在导入" : "导入书籍"} aria-label={importStatus ? "正在导入" : "导入书籍"} disabled={Boolean(importStatus)} onClick={() => inputRef.current?.click()}><Upload size={16} /><span>{importStatus ? "正在导入" : "导入书籍"}</span></button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></div>
         </header>
         <aside className="library-sidebar">
           <div className="library-nav-title">我的书架</div>
-          <button className={activeCategory === "全部" ? "library-nav active" : "library-nav"} onClick={() => setActiveCategory("全部")}><BookOpen size={17} /> 全部图书 <span>{shelfBooks.length}</span></button>
-          <button className="library-nav"><History size={17} /> 最近阅读</button>
+          <button className={activeCategory === "全部" ? "library-nav active" : "library-nav"} title={`全部图书（${shelfBooks.length}）`} aria-label={`全部图书（${shelfBooks.length}）`} onClick={() => setActiveCategory("全部")}><BookOpen size={17} /> 全部图书 <span>{shelfBooks.length}</span></button>
+          <button className="library-nav" title="最近阅读" aria-label="最近阅读"><Clock3 size={17} /> 最近阅读</button>
           <div className="library-nav-title category-title">自定义标签 <button onClick={() => setCategoryModalOpen(true)} title="新建分类"><Plus size={15} /></button></div>
-          {categories.map((category) => <button className={activeCategory === category ? "library-nav active" : "library-nav"} key={category} onClick={() => setActiveCategory(category)}><span className="category-dot" />{category}<span>{bookCategories.includes(category) ? 1 : 0}</span></button>)}
+          {categories.map((category) => <button className={activeCategory === category ? "library-nav active" : "library-nav"} title={`${category}（${bookCategories.includes(category) ? 1 : 0}）`} aria-label={`${category}（${bookCategories.includes(category) ? 1 : 0}）`} key={category} onClick={() => setActiveCategory(category)}><span className="category-dot" />{category}<span>{bookCategories.includes(category) ? 1 : 0}</span></button>)}
           <div className="library-nav-title type-browser-title">图书类型 <span>{BOOK_TYPES.length}</span></div>
-          <div className="type-browser"><button className={activeType === "全部类型" ? "type-chip active" : "type-chip"} onClick={() => setActiveType("全部类型")}>全部类型</button>{BOOK_TYPES.slice(0, typeBrowserExpanded ? BOOK_TYPES.length : 6).map((type) => <button className={activeType === type.name ? "type-chip active" : "type-chip"} key={type.id} onClick={() => { setActiveType(type.name); setTypeBrowserExpanded(true); }}><i /><span>{type.name}</span><small>{shelfBooks.filter((item) => item.bookType === type.name).length}</small></button>)}<button className="type-browser-more" onClick={() => setTypeBrowserExpanded((value) => !value)}>{typeBrowserExpanded ? "收起类型" : `展开其余 ${BOOK_TYPES.length - 6} 类`}</button></div>
+          <button className={typeBrowserExpanded ? "library-nav rail-settings active" : "library-nav rail-settings"} title="筛选与分类" aria-label="筛选与分类" onClick={() => setTypeBrowserExpanded((value) => !value)}><Settings2 size={22} /><span>筛选与分类</span></button>
+        </aside>
+        <aside className="library-filter-panel" aria-hidden={!typeBrowserExpanded}>
+          <div className="filter-panel-head"><h2>筛选与分类</h2><button title="关闭" aria-label="关闭筛选与分类" onClick={() => setTypeBrowserExpanded(false)}><X size={22} /></button></div>
+          <section><h3>书架</h3><button className={activeCategory === "全部" && activeType === "全部类型" ? "filter-row active" : "filter-row"} onClick={() => { setActiveCategory("全部"); setActiveType("全部类型"); }}>全部图书<span>{shelfBooks.length}</span></button><button className="filter-row">最近阅读<History size={16} /></button></section>
+          <section><h3>自定义标签</h3>{categories.map((category) => <button className={activeCategory === category ? "filter-row active" : "filter-row"} key={category} onClick={() => setActiveCategory(category)}>{category}<span>{bookCategories.includes(category) ? 1 : 0}</span></button>)}<button className="filter-row muted" onClick={() => setCategoryModalOpen(true)}>管理分类<Tag size={15} /></button></section>
+          <section><h3>图书类型</h3><button className={activeType === "全部类型" ? "filter-row active" : "filter-row"} onClick={() => setActiveType("全部类型")}>全部类型<span>{shelfBooks.length}</span></button>{BOOK_TYPES.map((type) => <button className={activeType === type.name ? "filter-row active" : "filter-row"} key={type.id} onClick={() => setActiveType(type.name)}><i /><span>{type.name}</span><small>{shelfBooks.filter((item) => item.bookType === type.name).length}</small></button>)}</section>
         </aside>
         <section className="library-content">
           <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB、PDF；TXT、MOBI、AZW3 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
-          {visibleShelfBooks.length ? <div className="book-grid">{visibleShelfBooks.map((shelfBook) => {
+          {searchedShelfBooks.length ? <div className="book-grid">{searchedShelfBooks.map((shelfBook) => {
             const shelfState = shelfBookStates.get(shelfBook.id) || getBookShelfState(shelfBook);
             return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || localFormatLabel(shelfBook)}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
           })}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>你可以为《{book.title}》添加“{activeCategory}”标签。</span><button className="text-action" onClick={() => setCategoryModalOpen(true)}>管理分类</button></div>}
         </section>
+        {shelfSearchOpen && <div className="library-search-panel"><div className="search-panel-head"><h2>{shelfSearchText ? "搜索结果" : "书架上的热门"}</h2><button onClick={() => setShelfSearchOpen(false)} aria-label="关闭搜索"><X size={20} /></button></div><div className="search-suggestion-grid">{(shelfSearchText ? searchedShelfBooks : shelfBooks).slice(0, 6).map((item) => <button className="search-suggestion-card" key={item.id} onClick={() => { setShelfSearchOpen(false); openShelfBook(item); }}><BookCover book={item} /><span>{item.title}</span><small>{item.bookType || localFormatLabel(item)}</small></button>)}{!shelfSearchText && shelfSearchSuggestions.map((item) => <button className="search-suggestion-card type-result" key={item.label} onClick={() => { setActiveType(item.label); setShelfSearchOpen(false); }}><i /><span>{item.label}</span><small>{item.count} 本</small></button>)}</div></div>}
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
         {deleteCandidate && <DeleteBookConfirmModal book={deleteCandidate} onCancel={() => setDeleteCandidate(null)} onConfirm={confirmDeleteBook} />}
         {importStatus && <ImportProgressModal status={importStatus} />}
@@ -903,28 +929,39 @@ export function App() {
   }
 
   const contextualParagraphs = chapter.paragraphs.slice(Math.max(0, (selectedParagraph ?? 0) - 1), Math.min(chapter.paragraphs.length, (selectedParagraph ?? 0) + 2));
-  const selectedIndexEntries = [...bookIndex.people, ...bookIndex.timeline, ...bookIndex.places]
+  const selectedIndexEntries = [...bookIndex.people, ...(bookIndex.organizations || []), ...bookIndex.timeline, ...bookIndex.places]
     .filter((entry) => entry.occurrences.some((occurrence) => occurrence.chapterIndex === chapterIndex && occurrence.paragraphIndex === selectedParagraph));
   const currentPageRead = isPageRead(chapterIndex, pageIndex);
   const relationshipAvailable = (bookIndex.relationships || []).length > 0 && activeSpecialSkills.some(([name]) => /关系|指挥/.test(name));
   const readerTabs = ["目录", ...new Set([...(bookProfile?.facets || ["人物", "时间线", "地点"]).slice(0, 6), ...(relationshipAvailable ? ["关系"] : [])])];
   return (
-    <main className={`reader-shell theme-${readingTheme}${sidebarCollapsed ? " sidebar-collapsed" : ""}`}>
+    <main className={`reader-shell theme-${readingTheme}${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}`}>
       <header className="reader-topbar">
-        <button className="theme-toolbar-trigger" onClick={() => setThemeSettingsOpen(true)} title="阅读主题"><Palette size={16} /><span>主题</span></button>
-        <button className="back-to-shelf" onClick={() => setScreen("shelf")}><ArrowLeft size={18} /> 书架</button>
-        <div className="book-title"><BookOpen size={17} /><span>{book.title}</span><small>{book.creator}</small>{bookProfile && <small>{bookProfile.category}</small>}</div>
-        <div className="reader-progress"><span>第 {chapterIndex + 1} 节</span><i><b style={{ width: `${progress}%` }} /></i><span>{progress}%</span></div>
-        <div className="reader-status"><button className="search-trigger" onClick={() => setSearchOpen(true)}><Search size={16} /> 搜索书内内容 <kbd>Ctrl K</kbd></button><button className="analysis-settings-trigger" onClick={() => setAnalysisSettingsOpen(true)} title="大模型分析设置"><Settings2 size={16} /> {analysisState.status === "done" ? "AI 索引" : "分析设置"}</button><button className="analysis-settings-trigger" onClick={() => setSidebarCollapsed((value) => !value)} title={sidebarCollapsed ? "展开阅读索引" : "收起阅读索引"}>{sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}</button><span><ShieldCheck size={16} /> 本地阅读 · 无剧透</span></div>
+        <div className="book-title" title={`${book.title} · ${book.creator}`}><BookOpen size={17} /><span>{book.title}</span><small>{book.creator}</small>{bookProfile && <small>{bookProfile.category}</small>}</div>
+        <label className={searchOpen ? "reader-search-box active" : "reader-search-box"} role="search" aria-label="搜索书内内容" title="搜索书内内容">
+          <Search size={18} />
+          <input value={searchQuery} placeholder="搜索书内内容" onFocus={() => setSearchOpen(true)} onChange={(event) => { setSearchQuery(event.target.value); setSearchOpen(true); }} onKeyDown={(event) => { if (event.key === "Escape") setSearchOpen(false); }} />
+          <kbd>Ctrl K</kbd>
+        </label>
+        <div className="reader-status">
+          <div className="reader-progress" title={`阅读进度 ${progress}%`}><i><b style={{ width: `${progress}%` }} /></i><span>{progress}%</span></div>
+          <span title="本地阅读 · 无剧透"><ShieldCheck size={16} /> 本地阅读 · 无剧透</span>
+        </div>
       </header>
       <aside className="reader-sidebar">
-        <nav className="reader-tabs"><button className={activePanel === "目录" ? "active directory-tab" : "directory-tab"} onClick={() => { setActivePanel("目录"); setFacetMenuOpen(false); }}>目录</button><div className="facet-picker"><button className={activePanel !== "目录" ? "facet-trigger active" : "facet-trigger"} onClick={() => setFacetMenuOpen((value) => !value)} aria-haspopup="menu" aria-expanded={facetMenuOpen}><Sparkles size={14} /><span>{activePanel === "目录" ? "阅读索引" : activePanel}</span><ChevronDown size={14} /></button>{facetMenuOpen && <div className="facet-menu" role="menu">{readerTabs.filter((tab) => tab !== "目录").map((tab) => <button className={activePanel === tab ? "active" : ""} key={tab} role="menuitem" onClick={() => { setActivePanel(tab); setFacetMenuOpen(false); }}><span>{tab}</span><small>{facetDescription(tab)}</small></button>)}</div>}</div></nav>
+        <nav className="reader-tabs"><button className="back-to-shelf" title="返回书架" aria-label="返回书架" onClick={() => setScreen("shelf")}><ArrowLeft size={20} /><span>书架</span></button><button className={activePanel === "主题" ? "active theme-toolbar-trigger" : "theme-toolbar-trigger"} onClick={() => { setActivePanel("主题"); setFacetMenuOpen(false); setSidebarCollapsed(false); }} title="阅读主题" aria-label="阅读主题"><Palette size={20} /><span>主题</span></button><button className={activePanel === "目录" ? "active directory-tab" : "directory-tab"} title="目录" aria-label="目录" onClick={() => { setActivePanel("目录"); setFacetMenuOpen(false); setSidebarCollapsed(false); }}><ListFilter size={20} /><span>目录</span></button><button className={activePanel === "书签" ? "active reader-rail-button" : "reader-rail-button"} title="书签" aria-label={`书签（${bookmarks.length}）`} onClick={() => { setActivePanel("书签"); setFacetMenuOpen(false); setSidebarCollapsed(false); }}><Bookmark size={20} /><span>书签</span></button><button className={activePanel === "笔记" ? "active reader-rail-button" : "reader-rail-button"} title="笔记" aria-label={`笔记（${notes.length}）`} onClick={() => { setActivePanel("笔记"); setFacetMenuOpen(false); setSidebarCollapsed(false); }}><FileText size={20} /><span>笔记</span></button><div className="facet-picker"><button className={activePanel === "阅读索引" || readerTabs.includes(activePanel) && activePanel !== "目录" ? "facet-trigger active" : "facet-trigger"} title="阅读索引" aria-label="阅读索引" onClick={() => { setActivePanel("阅读索引"); setFacetMenuOpen(false); setSidebarCollapsed(false); }}><Sparkles size={18} /><span>阅读索引</span></button></div><button className={activePanel === "AI 阅读" ? "active analysis-settings-trigger ai-rail-trigger" : "analysis-settings-trigger ai-rail-trigger"} onClick={() => { setActivePanel("AI 阅读"); setFacetMenuOpen(false); setSidebarCollapsed(false); }} title="AI 阅读设置" aria-label="AI 阅读设置"><Bot size={21} /> <span>{analysisState.status === "done" ? "AI 索引" : "AI 阅读"}</span></button><button className="analysis-settings-trigger rail-toggle" onClick={() => setSidebarCollapsed((value) => !value)} title={sidebarCollapsed ? "展开阅读索引" : "收起阅读索引"} aria-label={sidebarCollapsed ? "展开阅读索引" : "收起阅读索引"}>{sidebarCollapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}</button></nav>
         <div className="reader-side-content">
-          {activePanel === "目录" && <><div className="toc-list">{book.chapters.map((item, index) => <button className={index === chapterIndex ? "toc-row active" : "toc-row"} key={item.id} onClick={() => selectChapter(index)}><span>{index + 1}</span>{item.title}</button>)}</div><BookmarkList items={bookmarks} onOpen={openBookmark} onRemove={removeBookmark} /><NoteList items={notes} onOpen={openNote} onRemove={removeNote} /></>}
+          {activePanel === "目录" && <div className="toc-list">{book.chapters.map((item, index) => <button className={index === chapterIndex ? "toc-row active" : "toc-row"} key={item.id} onClick={() => selectChapter(index)}><span>{index + 1}</span>{item.title}</button>)}</div>}
+          {activePanel === "主题" && <ReaderThemePanel theme={readingTheme} onChange={setReadingTheme} />}
+          {activePanel === "AI 阅读" && <ReaderAnalysisPanel settings={analysisSettings} setSettings={setAnalysisSettings} state={analysisState} onAnalyze={analyzeBook} />}
+          {activePanel === "阅读索引" && <ReaderIndexPicker tabs={readerTabs.filter((tab) => tab !== "目录")} activePanel={activePanel} onSelect={(tab) => { setActivePanel(tab); setSidebarCollapsed(false); }} />}
+          {activePanel === "书签" && <BookmarkList items={bookmarks} onOpen={openBookmark} onRemove={removeBookmark} />}
+          {activePanel === "笔记" && <NoteList items={notes} onOpen={openNote} onRemove={removeNote} />}
           {activePanel === "人物" && <EntityIndexList title="人物" kind="person" items={bookIndex.people} icon={<Network size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠人物实体。" />}
+          {activePanel === "组织" && <EntityIndexList title="组织" kind="organization" items={bookIndex.organizations || []} icon={<Network size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠组织实体。" />}
           {activePanel === "时间线" && <TimelineList items={bookIndex.timeline} activeChapter={chapterIndex} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} />}
           {activePanel === "地点" && <EntityIndexList title="地点" kind="place" items={bookIndex.places} icon={<MapPin size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠地点实体。" />}
-          {activePanel !== "目录" && activePanel !== "人物" && activePanel !== "时间线" && activePanel !== "地点" && <FacetIndexPanel title={activePanel} category={bookProfile?.category} />}
+          {activePanel !== "目录" && activePanel !== "主题" && activePanel !== "AI 阅读" && activePanel !== "阅读索引" && activePanel !== "书签" && activePanel !== "笔记" && activePanel !== "人物" && activePanel !== "组织" && activePanel !== "时间线" && activePanel !== "地点" && <FacetIndexPanel title={activePanel} category={bookProfile?.category} />}
         </div>
         <div className="side-book-meta"><span>共 {book.chapters.length} 节</span><span>{localFormatLabel(book)}</span></div>
       </aside>
@@ -937,13 +974,11 @@ export function App() {
         <footer className="reader-footer"><button disabled={pageIndex === 0} onClick={() => turnPage(-1)}><ChevronLeft size={17} /> 上一页</button><span>第 {pageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button disabled={pageIndex === pageCount - 1} onClick={() => turnPage(1)}>下一页 <ChevronRight size={17} /></button></footer>
       </section>
       {drawerOpen && <section className="context-drawer"><div className="drawer-handle" /><header className="drawer-header"><div><span className="eyebrow">阅读上下文</span><strong>{chapter.title} · 第 {(selectedParagraph ?? 0) + 1} 段</strong></div><button onClick={() => setDrawerOpen(false)} title="收起阅读上下文"><X size={18} /></button></header><div className="context-grid"><section><h2><Sparkles size={17} /> 本地阅读提示</h2><p>这段内容位于《{book.title}》的“{chapter.title}”。选择其他段落后，可在此保留它与当前章节的上下文。</p>{selectedIndexEntries.length > 0 && <div className="context-entities">{selectedIndexEntries.map((entry) => <button key={entry.id} onClick={() => openIndexEntry(entry)}>{entry.name}</button>)}</div>}<span className="local-note">实体与日期均从本地原文识别，点击可回到其首个证据位置。</span></section><section><h2><Clock3 size={17} /> 相邻原文</h2>{contextualParagraphs.map((paragraph, index) => <button className="context-excerpt" key={paragraph} onClick={() => jumpToParagraph(Math.max(0, (selectedParagraph ?? 0) - 1) + index)}>{paragraph.slice(0, 86)}{paragraph.length > 86 ? "…" : ""}</button>)}</section><section><h2><FileText size={17} /> 出处</h2><dl className="source-data"><div><dt>书名</dt><dd>{book.title}</dd></div><div><dt>章节</dt><dd>{chapter.title}</dd></div><div><dt>位置</dt><dd>第 {(selectedParagraph ?? 0) + 1} 段</dd></div><div><dt>版本</dt><dd>{book.publisher || localFormatLabel(book)}</dd></div></dl><button className="source-jump" onClick={() => jumpToParagraph(selectedParagraph ?? 0)}>回到原文 <ChevronRight size={15} /></button></section></div></section>}
+      {searchOpen && <ReaderSearchOverlay bookTitle={book.title} query={searchQuery} setQuery={setSearchQuery} results={searchResults} onSelect={openSearchResult} onClose={() => setSearchOpen(false)} />}
       {!drawerOpen && selectedParagraph !== null && <button className="open-context" onClick={() => setDrawerOpen(true)}><Lightbulb size={17} /> 打开阅读上下文</button>}
       {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
       {noteComposerOpen && <NoteComposer draft={noteDraft} setDraft={setNoteDraft} selection={selectionBloom?.text || ""} onClose={() => setNoteComposerOpen(false)} onSave={saveNote} />}
-      {searchOpen && <SearchDialog query={searchQuery} setQuery={setSearchQuery} results={searchResults} onSelect={openSearchResult} onClose={() => setSearchOpen(false)} />}
-      {analysisSettingsOpen && <AnalysisSettingsModal settings={analysisSettings} setSettings={setAnalysisSettings} state={analysisState} onAnalyze={analyzeBook} onClose={() => setAnalysisSettingsOpen(false)} />}
       {analysisSummaryOpen && analysisRecord?.summary && <AnalysisSummaryModal summary={analysisRecord.summary} onClose={() => setAnalysisSummaryOpen(false)} />}
-      {themeSettingsOpen && <ReadingThemeModal theme={readingTheme} onChange={setReadingTheme} onClose={() => setThemeSettingsOpen(false)} />}
       {relationshipOpen && <RelationshipWorkspace relationships={bookIndex.relationships || []} onEvidence={openRelationshipEvidence} onClose={() => { setRelationshipOpen(false); setActivePanel("目录"); }} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </main>
@@ -1132,7 +1167,7 @@ function RelationshipWorkspace({ relationships, onEvidence, onClose }) {
     <header className="relationship-header"><div><span>阅读图谱</span><h2>关系</h2><small>{visibleRelationships.length} 条可追溯关系</small></div><button onClick={onClose} title="关闭关系图谱"><X size={18} /></button></header>
     <div className="relationship-view-switch" role="tablist"><button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>关系图</button><button className={view === "organization" ? "active" : ""} onClick={() => setView("organization")}>组织架构</button><button className={view === "matrix" ? "active" : ""} onClick={() => setView("matrix")}>关系矩阵</button></div>
     <div className="relationship-canvas">
-      {view === "matrix" ? <RelationshipMatrix entities={entities} relationships={visibleRelationships} onSelect={setSelectedName} /> : visibleRelationships.length ? <ReactFlow nodes={graph.nodes} edges={graph.edges} fitView nodesDraggable={false} nodesConnectable={false} elementsSelectable onNodeClick={(_event, node) => setSelectedName(node.data.entityName)} onEdgeClick={(_event, edge) => setSelectedName(edge.data.relationship.source)}><Background gap={18} size={1} color="#e3ebe2" /><MiniMap zoomable pannable nodeColor={(node) => relationshipNodeColor(node.data.entityType)} /><Controls showInteractive={false} /></ReactFlow> : <div className="relationship-empty">当前已读内容中，没有足以建立组织层级的可靠关系。</div>}
+      {view === "matrix" ? <RelationshipMatrix entities={entities} relationships={visibleRelationships} onSelect={setSelectedName} /> : visibleRelationships.length ? <ReactFlow nodes={graph.nodes} edges={graph.edges} fitView nodesDraggable={false} nodesConnectable={false} elementsSelectable onNodeClick={(_event, node) => setSelectedName(node.data.entityName)} onEdgeClick={(_event, edge) => setSelectedName(edge.data.relationship.source)}><Background gap={18} size={1} color="#e3ebe2" /><Controls showInteractive={false} /></ReactFlow> : <div className="relationship-empty">当前已读内容中，没有足以建立组织层级的可靠关系。</div>}
     </div>
     {selectedRelationship && <footer className="relationship-detail"><div><span>{selectedRelationship.source} <i>·</i> {selectedRelationship.relation} <i>·</i> {selectedRelationship.target}</span><small>第 {selectedRelationship.evidence.chapterIndex + 1} 节 · 原文证据</small></div><button onClick={() => onEvidence(selectedRelationship)}>查看原文 <ChevronRight size={15} /></button></footer>}
   </section>;
@@ -1189,6 +1224,66 @@ function SelectionBloom({ selection, theme, onAction, onClose }) {
   </div>;
 }
 
+function ReaderThemePanel({ theme, onChange }) {
+  return <section className="reader-theme-panel reader-panel-list">
+    {READING_THEMES.map((item) => { const Icon = item.icon; return <button className={theme === item.id ? "active" : ""} key={item.id} onClick={() => onChange(item.id)}><Icon size={17} /><span>{item.name}</span><small>{item.detail}</small></button>; })}
+  </section>;
+}
+
+function ReaderAnalysisPanel({ settings, setSettings, state, onAnalyze }) {
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const isAnalyzing = state.status === "loading";
+  const updateProvider = (provider) => setSettings((current) => ({
+    ...current,
+    provider,
+    model: provider === "deepseek" ? "deepseek-v4-flash" : "gpt-4.1-mini",
+  }));
+  const adjustThreshold = (amount) => setSettings((current) => ({ ...current, autoPageThreshold: Math.max(1, Math.min(50, Number(current.autoPageThreshold || 5) + amount)) }));
+  const toggleAuto = () => setSettings((current) => ({ ...current, analysisMode: current.analysisMode === "auto" ? "read" : "auto" }));
+  return <section className="reader-analysis-panel">
+    <header className="reader-ai-hero"><i><Bot size={22} /></i><div><strong>AI 阅读</strong><span>提取已读范围内的人物、地点、时间线与关系。</span></div></header>
+    <div className="reader-panel-actions">
+      <button className="active" disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "read" })); onAnalyze("read"); }}><Sparkles size={17} /><span>{isAnalyzing ? "正在分析" : "分析已读"}</span><small>只处理已读范围</small></button>
+      <button disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "full" })); onAnalyze("full"); }}><BookOpen size={17} /><span>全书分析</span><small>较慢，重建索引</small></button>
+    </div>
+    <div className={`reader-panel-state ${state.status}`}>{state.message || "AI 索引会围绕人物、地点、时间线和关系整理已读内容。"}</div>
+    <section className="reader-auto-card">
+      <label className="reader-auto-row"><input type="checkbox" checked={settings.analysisMode === "auto"} onChange={toggleAuto} /><span>自动更新索引</span></label>
+      <div className="reader-stepper"><span>每读</span><button title="减少页数" onClick={() => adjustThreshold(-1)}><Minus size={14} /></button><b>{settings.autoPageThreshold}</b><button title="增加页数" onClick={() => adjustThreshold(1)}><Plus size={14} /></button><span>页</span></div>
+    </section>
+    <button className="reader-panel-toggle" onClick={() => setAdvancedOpen((value) => !value)}><span>模型设置</span><ChevronDown size={14} /></button>
+    {advancedOpen && <div className="reader-model-panel">
+      <div className="reader-provider-row"><button className={settings.provider === "deepseek" ? "active" : ""} onClick={() => updateProvider("deepseek")}>DeepSeek</button><button className={settings.provider === "openai" ? "active" : ""} onClick={() => updateProvider("openai")}>OpenAI</button></div>
+      <label>模型名称<input value={settings.model} onChange={(event) => setSettings((current) => ({ ...current, model: event.target.value }))} placeholder="deepseek-v4-flash" /></label>
+      <small>API Key 只从本机 .env 读取。</small>
+    </div>}
+  </section>;
+}
+
+function ReaderSearchOverlay({ bookTitle, query, setQuery, results, onSelect, onClose }) {
+  const suggestions = ["湘江", "遵义", "红军"];
+  const hasQuery = query.trim();
+  return <div className="library-search-panel reader-search-panel-overlay">
+    <div className="search-panel-head"><h2>{hasQuery ? "搜索结果" : `在《${bookTitle}》中查找`}</h2><button onClick={onClose} aria-label="关闭搜索"><X size={20} /></button></div>
+    {hasQuery ? <div className="search-suggestion-grid reader-search-result-grid">{results.length ? results.map((result) => <button className="search-suggestion-card reader-search-result-card" key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span>{result.chapterTitle}</span><small>第 {result.paragraphIndex + 1} 段</small><b>{highlightMatch(result.excerpt, query.trim())}</b></button>) : <div className="reader-search-empty"><Search size={22} /><strong>没有找到“{query}”</strong><span>试试更短的关键词。</span></div>}</div> : <div className="search-suggestion-grid">{suggestions.map((item) => <button className="search-suggestion-card type-result" key={item} onClick={() => setQuery(item)}><i /><span>{item}</span><small>常用检索词</small></button>)}</div>}
+  </div>;
+}
+
+function ReaderSearchPanel({ bookTitle, query, setQuery, results, onSelect }) {
+  const inputRef = useRef(null);
+  useEffect(() => { inputRef.current?.focus(); }, []);
+  return <section className="reader-search-panel">
+    <label className="reader-panel-search"><Search size={17} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索人物、地点、事件或文字" /></label>
+    {query.trim() ? <div className="reader-search-results">{results.length ? results.map((result) => <button key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><small>{result.chapterTitle} · 第 {result.paragraphIndex + 1} 段</small><span>{highlightMatch(result.excerpt, query.trim())}</span></button>) : <p className="reader-panel-empty">没有找到“{query}”</p>}</div> : <div className="reader-panel-start"><strong>在《{bookTitle}》中查找</strong><span>输入关键词，或从下面开始。</span><div><button onClick={() => setQuery("湘江")}>湘江</button><button onClick={() => setQuery("遵义")}>遵义</button><button onClick={() => setQuery("红军")}>红军</button></div></div>}
+  </section>;
+}
+
+function ReaderIndexPicker({ tabs, activePanel, onSelect }) {
+  return <section className="reader-index-picker">
+    {tabs.map((tab) => <button className={activePanel === tab ? "active" : ""} key={tab} onClick={() => onSelect(tab)}><span>{tab}</span><small>{facetDescription(tab)}</small></button>)}
+  </section>;
+}
+
 function BookmarkList({ items, onOpen, onRemove }) {
   return <section className="bookmark-list">
     <header><span><Bookmark size={14} /> 书签</span><small>{items.length}</small></header>
@@ -1241,9 +1336,10 @@ function EntityRow({ item, onItem, kind, compact = false }) {
 }
 
 function TimelineList({ items, activeChapter, activeCursor, onItem }) {
-  if (!items.length) return <div className="timeline-list"><header><Clock3 size={16} /><div><strong>正文时间线</strong><span>尚未识别到明确日期</span></div></header></div>;
+  const readableItems = normalizeTimelineItems(items);
+  if (!readableItems.length) return <div className="timeline-list"><header><Clock3 size={16} /><div><strong>正文时间线</strong><span>尚未识别到明确日期</span></div></header></div>;
 
-  const grouped = prioritizeIndexEntries(items, activeCursor, "timeline");
+  const grouped = prioritizeIndexEntries(readableItems, activeCursor, "timeline");
   const featured = grouped.important.length ? grouped.important : grouped.recent.slice(0, 8);
   const featuredIds = new Set(featured.map((item) => item.id));
   const recent = grouped.important.length ? grouped.recent.filter((item) => !featuredIds.has(item.id)).slice(0, 4) : [];
@@ -1265,6 +1361,60 @@ function TimelineList({ items, activeChapter, activeCursor, onItem }) {
     </div>
     {rest.length > 0 && <details className="secondary-entities timeline-secondary"><summary>展开其余时间 <span>{rest.length}</span></summary><div>{rest.map((item) => <button className="entity-row compact" key={item.id} onClick={() => onItem(item)}><div className="entity-row-heading"><b>{item.name}</b></div><span>{item.subtitle}</span></button>)}</div></details>}
   </div>;
+}
+
+function normalizeReadingIndex(index = {}) {
+  const people = [];
+  const organizations = [];
+  (Array.isArray(index.people) ? index.people : []).forEach((item) => {
+    if (!summaryText(item?.name)) return;
+    if (isOrganizationName(item.name)) organizations.push({ ...item, attributes: [] });
+    else people.push(item);
+  });
+  (Array.isArray(index.organizations) ? index.organizations : []).forEach((item) => {
+    if (summaryText(item?.name)) organizations.push({ ...item, attributes: [] });
+  });
+  const uniqueByName = (items) => Array.from(new Map(items.map((item) => [item.name, item])).values());
+  return {
+    people: uniqueByName(people),
+    organizations: uniqueByName(organizations),
+    places: Array.isArray(index.places) ? index.places.filter((item) => summaryText(item?.name)) : [],
+    timeline: normalizeTimelineItems(index.timeline),
+    relationships: Array.isArray(index.relationships) ? index.relationships : [],
+  };
+}
+
+function isOrganizationName(value) {
+  const name = summaryText(value);
+  return /(军团|方面军|集团军|红军|白军|桂军|黔军|川军|滇军|湘军|部队|纵队|支队|机枪连|警卫连|侦察连|运输队|工作队|先头部队|师|旅|团|营|党|政府|委员会|军委|机关|总部|司令部|同盟|联盟|公司|学校|大学|学院|研究所|协会|组织)$/.test(name)
+    || /^(红|白|桂|黔|川|滇|湘|粤|中央|南京|国民党|共产党|中共).*(军|党|政府|军委|委员会|机关|总部|司令部)$/.test(name);
+}
+
+function normalizeTimelineItems(items = []) {
+  return (Array.isArray(items) ? items : []).map((item, index) => {
+    const quote = summaryText(item?.evidenceQuote || item?.evidence?.quote);
+    const rawName = summaryText(item?.name || item?.date || item?.title);
+    const rawSubtitle = summaryText(item?.subtitle || item?.title || item?.summary);
+    const rawDetail = summaryText(item?.detail || item?.summary || item?.subtitle);
+    if (!rawName && !rawSubtitle && !rawDetail && !quote) return null;
+    const name = rawName || `时间节点 ${index + 1}`;
+    const subtitle = rawSubtitle || quote.slice(0, 24);
+    const detail = rawDetail || quote;
+    const occurrence = item?.occurrence || item?.occurrences?.[0] || { chapterIndex: 0, paragraphIndex: 0 };
+    return {
+      ...item,
+      id: item?.id || `timeline-${index}-${name}`,
+      name,
+      subtitle,
+      detail,
+      occurrence,
+      occurrences: Array.isArray(item?.occurrences) && item.occurrences.length ? item.occurrences : [occurrence],
+    };
+  }).filter(Boolean).sort((a, b) => {
+    const aKey = Number.isFinite(a.sortKey) ? a.sortKey : Number.MAX_SAFE_INTEGER;
+    const bKey = Number.isFinite(b.sortKey) ? b.sortKey : Number.MAX_SAFE_INTEGER;
+    return aKey - bKey;
+  });
 }
 
 function prioritizeIndexEntries(items, activeCursor, kind) {
@@ -1518,10 +1668,16 @@ function localFormatLabel(book) {
   return `本地 ${book?.format || "EPUB"}`;
 }
 
-function SearchDialog({ query, setQuery, results, onSelect, onClose }) {
+function SearchDialog({ bookTitle, query, setQuery, results, onSelect, onClose }) {
   const inputRef = useRef(null);
-  useEffect(() => { inputRef.current?.focus(); }, []);
-  return <div className="search-backdrop" role="presentation" onMouseDown={onClose}><section className="search-dialog" role="dialog" aria-modal="true" aria-label="搜索书内内容" onMouseDown={(event) => event.stopPropagation()}><header><Search size={19} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索人物、地点、事件或任意文字" /><button onClick={onClose} title="关闭搜索"><X size={18} /></button></header>{query.trim() ? <div className="search-results">{results.length ? results.map((result) => <button key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span><small>{result.chapterTitle} · 第 {result.paragraphIndex + 1} 段</small><b>{highlightMatch(result.excerpt, query.trim())}</b></span><ChevronRight size={16} /></button>) : <div className="search-empty"><Search size={24} /><strong>书内没有找到“{query}”</strong><span>试试人物、地点或更短的关键词。</span></div>}</div> : <div className="search-empty"><BookOpen size={25} /><strong>在《长征》中查找</strong><span>输入人物、地点、事件，或直接输入一段原文。</span><div className="search-suggestions"><button onClick={() => setQuery("湘江")}>湘江</button><button onClick={() => setQuery("遵义")}>遵义</button><button onClick={() => setQuery("红军")}>红军</button></div></div>}<footer><span>所有结果都来自本地图书</span><kbd>Esc</kbd> 关闭</footer></section></div>;
+  useEffect(() => { inputRef.current?.focus(); const onKey = (event) => { if (event.key === "Escape") onClose(); }; window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey); }, [onClose]);
+  return <div className="search-backdrop reader-search-popover" role="presentation" onMouseDown={onClose}>
+    <section className="search-dialog reader-search-dialog" role="dialog" aria-modal="true" aria-label="搜索书内内容" onMouseDown={(event) => event.stopPropagation()}>
+      <header><Search size={19} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索人物、地点、事件或任意文字" /><button onClick={onClose} title="关闭搜索" aria-label="关闭搜索"><X size={18} /></button></header>
+      {query.trim() ? <div className="search-results">{results.length ? results.map((result) => <button key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span><small>{result.chapterTitle} · 第 {result.paragraphIndex + 1} 段</small><b>{highlightMatch(result.excerpt, query.trim())}</b></span><ChevronRight size={16} /></button>) : <div className="search-empty compact"><Search size={20} /><strong>没有找到“{query}”</strong><span>试试更短的关键词。</span></div>}</div> : <div className="reader-search-start"><span>在《{bookTitle}》中查找</span><div className="search-suggestions"><button onClick={() => setQuery("湘江")}>湘江</button><button onClick={() => setQuery("遵义")}>遵义</button><button onClick={() => setQuery("红军")}>红军</button></div></div>}
+      <footer><span>本地图书结果</span><kbd>Esc</kbd></footer>
+    </section>
+  </div>;
 }
 
 function highlightMatch(text, query) {
@@ -1594,14 +1750,55 @@ function AnalysisSettingsModal({ settings, setSettings, state, onAnalyze, onClos
 }
 
 function AnalysisSummaryModal({ summary, onClose }) {
+  const safeSummary = normalizeAnalysisSummary(summary);
   const cursor = summary.cursor || {};
   const checkpointLabel = cursor.scope === "full" ? `已完成全书分析 · 至第 ${Number(cursor.chapterIndex || 0) + 1} 节末` : `已分析至 第 ${Number(cursor.chapterIndex || 0) + 1} 节 · 第 ${Number(cursor.pageIndex || 0) + 1} / ${cursor.pageCount || 1} 页`;
-  return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className="analysis-summary-modal" role="dialog" aria-modal="true" aria-label="本轮阅读分析摘要" onMouseDown={(event) => event.stopPropagation()}><header><div><span>阅读记忆已更新</span><h2>本轮分析摘要</h2></div><button onClick={onClose} title="关闭"><X size={19} /></button></header><div className="analysis-checkpoint">{checkpointLabel}</div><SummaryEntitySection title="人物" value={summary.people} empty="本轮未确认新的核心人物" /><SummaryEntitySection title="地点" value={summary.places} empty="本轮未确认新的关键地点" /><section><h3>关键事件</h3><ul>{summary.events?.length ? summary.events.map((event) => <li key={event}>{event}</li>) : <li>本轮未确认新的主线事件</li>}</ul></section><footer><button className="primary-button" onClick={onClose}>继续阅读</button></footer></section></div>;
+  return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className="analysis-summary-modal" role="dialog" aria-modal="true" aria-label="本轮阅读分析摘要" onMouseDown={(event) => event.stopPropagation()}><header><div><span>阅读记忆已更新</span><h2>本轮分析摘要</h2></div><button onClick={onClose} title="关闭"><X size={19} /></button></header><div className="analysis-checkpoint">{checkpointLabel}</div><SummaryEntitySection title="人物" value={safeSummary.people} empty="本轮未确认新的核心人物" /><SummaryEntitySection title="组织" value={safeSummary.organizations} empty="本轮未确认新的关键组织" /><SummaryEntitySection title="地点" value={safeSummary.places} empty="本轮未确认新的关键地点" /><section><h3>关键事件</h3><ul>{safeSummary.events.length ? safeSummary.events.map((event) => <li key={event}>{event}</li>) : <li>本轮未确认新的主线事件</li>}</ul></section><footer><button className="primary-button" onClick={onClose}>继续阅读</button></footer></section></div>;
 }
 
 function SummaryEntitySection({ title, value, empty }) {
-  const groups = Array.isArray(value) ? { primary: value, recent: [], secondary: [] } : value || {};
-  return <section><h3>{title}</h3>{groups.primary?.length ? <p><b>主要：</b>{groups.primary.join("、")}</p> : <p>{empty}</p>}{groups.recent?.length > 0 && <p><b>最近：</b>{groups.recent.join("、")}</p>}{groups.secondary?.length > 0 && <p><b>次级：</b>{groups.secondary.join("、")}</p>}</section>;
+  const groups = normalizeSummaryGroups(value);
+  return <section><h3>{title}</h3>{groups.primary.length ? <p><b>主要：</b>{groups.primary.join("、")}</p> : <p>{empty}</p>}{groups.recent.length > 0 && <p><b>最近：</b>{groups.recent.join("、")}</p>}{groups.secondary.length > 0 && <p><b>次级：</b>{groups.secondary.join("、")}</p>}</section>;
+}
+
+function normalizeAnalysisSummary(summary = {}) {
+  return {
+    ...summary,
+    people: normalizeSummaryGroups(summary.people),
+    organizations: normalizeSummaryGroups(summary.organizations),
+    places: normalizeSummaryGroups(summary.places),
+    events: normalizeSummaryEvents(summary.events),
+  };
+}
+
+function normalizeSummaryGroups(value) {
+  const fromList = (items) => (Array.isArray(items) ? items.map(summaryText).filter(Boolean) : []);
+  if (Array.isArray(value)) return { primary: fromList(value), recent: [], secondary: [] };
+  return {
+    primary: fromList(value?.primary),
+    recent: fromList(value?.recent),
+    secondary: fromList(value?.secondary),
+  };
+}
+
+function normalizeSummaryEvents(events) {
+  return (Array.isArray(events) ? events : []).map(summaryText).filter(Boolean);
+}
+
+function summaryText(item) {
+  const clean = (value) => {
+    const text = String(value || "").trim();
+    return text && text.toLowerCase() !== "undefined" && text.toLowerCase() !== "null" ? text : "";
+  };
+  if (typeof item === "string") {
+    const text = clean(item);
+    return text && !/^undefined(?:\s*·\s*undefined)?$/i.test(text) ? text : "";
+  }
+  if (!item || typeof item !== "object") return "";
+  return [item.name || item.date || item.title, item.subtitle || item.summary || item.detail]
+    .map(clean)
+    .filter(Boolean)
+    .join(" · ");
 }
 
 function getNewReadingContent(chapters, previousCursor, currentCursor) {
