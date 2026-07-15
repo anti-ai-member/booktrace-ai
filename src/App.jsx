@@ -65,6 +65,9 @@ const PLANNED_BOOK_FORMATS = new Map([
 ]);
 const DEFAULT_CATEGORIES = ["历史纪实", "军事", "中国近现代史"];
 const DEFAULT_AI_SETTINGS = { provider: "deepseek", model: "deepseek-v4-flash", analysisMode: "read", autoPageThreshold: 5 };
+const LIBRARY_DB_NAME = "shumai-library";
+const LIBRARY_DB_VERSION = 1;
+const LIBRARY_STORE = "books";
 const READING_THEMES = [
   { id: "plain", name: "素笺", detail: "清透留白", icon: BookOpen },
   { id: "lotus", name: "荷花", detail: "淡青水色", icon: Flower2 },
@@ -96,6 +99,68 @@ function loadStored(name, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function openLibraryDb() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(LIBRARY_DB_NAME, LIBRARY_DB_VERSION);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(LIBRARY_STORE)) db.createObjectStore(LIBRARY_STORE, { keyPath: "id" });
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function loadStoredLibraryBooks() {
+  try {
+    const db = await openLibraryDb();
+    return await new Promise((resolve, reject) => {
+      const transaction = db.transaction(LIBRARY_STORE, "readonly");
+      const request = transaction.objectStore(LIBRARY_STORE).getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error);
+      transaction.oncomplete = () => db.close();
+      transaction.onerror = () => db.close();
+    });
+  } catch {
+    return [];
+  }
+}
+
+async function saveStoredLibraryBook(book) {
+  if (!book || book.local) return;
+  const db = await openLibraryDb();
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction(LIBRARY_STORE, "readwrite");
+    transaction.objectStore(LIBRARY_STORE).put(book);
+    transaction.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      db.close();
+      reject(transaction.error);
+    };
+  });
+}
+
+async function deleteStoredLibraryBook(bookId) {
+  if (!bookId) return;
+  const db = await openLibraryDb();
+  await new Promise((resolve, reject) => {
+    const transaction = db.transaction(LIBRARY_STORE, "readwrite");
+    transaction.objectStore(LIBRARY_STORE).delete(bookId);
+    transaction.oncomplete = () => {
+      db.close();
+      resolve();
+    };
+    transaction.onerror = () => {
+      db.close();
+      reject(transaction.error);
+    };
+  });
 }
 
 export function App() {
@@ -208,9 +273,14 @@ export function App() {
         if (!response.ok) throw new Error("无法打开本地 EPUB 文件");
         const parsed = await parseEpub(await response.blob());
         const builtIn = { ...parsed, id: "long-march", fingerprint: "builtin:long-march", cover: COVER_PATH, bookType: "历史纪实 / 传记", indexSchema: findBookType("历史纪实 / 传记").facets, local: true };
-        setLibraryBooks([builtIn]);
-        setBook(builtIn);
-        setChapterIndex((current) => Math.min(Math.max(current, 0), parsed.chapters.length - 1));
+        const storedBooks = await loadStoredLibraryBooks();
+        const importedBooks = storedBooks.filter((item) => item.id !== builtIn.id && !item.local);
+        const books = [builtIn, ...importedBooks];
+        const activeBookId = loadStored("shumai-active-book-id", builtIn.id);
+        const activeBook = books.find((item) => item.id === activeBookId) || builtIn;
+        setLibraryBooks(books);
+        setBook(activeBook);
+        setChapterIndex((current) => Math.min(Math.max(current, 0), activeBook.chapters.length - 1));
       } catch (error) {
         setLoadError(error.message || "解析 EPUB 时出现问题");
       } finally {
@@ -219,6 +289,14 @@ export function App() {
     }
     loadBuiltInBook();
   }, []);
+
+  useEffect(() => {
+    if (book?.id) localStorage.setItem("shumai-active-book-id", JSON.stringify(book.id));
+  }, [book?.id]);
+
+  useEffect(() => {
+    Promise.all(libraryBooks.filter((item) => !item.local).map((item) => saveStoredLibraryBook(item))).catch(() => {});
+  }, [libraryBooks]);
 
   useEffect(() => {
     function handleShortcut(event) {
@@ -286,9 +364,14 @@ export function App() {
   const progress = book ? Math.round(((chapterIndex + 1) / book.chapters.length) * 100) : 0;
   const visibleBook = activeCategory === "全部" || bookCategories.includes(activeCategory);
   const shelfBooks = useMemo(() => libraryBooks, [libraryBooks]);
+  const shelfBookStates = useMemo(() => {
+    const states = new Map();
+    libraryBooks.forEach((item) => states.set(item.id, getBookShelfState(item)));
+    return states;
+  }, [libraryBooks, readPages, book?.id, chapterIndex, pageIndex]);
   const visibleShelfBooks = shelfBooks.filter((item) => {
     const matchesType = activeType === "全部类型" || item.bookType === activeType;
-    const matchesCategory = activeCategory === "全部" || (item.id === book.id && bookCategories.includes(activeCategory));
+    const matchesCategory = activeCategory === "全部" || (item.id === book?.id && bookCategories.includes(activeCategory));
     return matchesType && matchesCategory;
   });
   const shelfLabel = activeType !== "全部类型" ? activeType : activeCategory === "全部" ? "本地书架" : activeCategory;
@@ -489,13 +572,14 @@ export function App() {
             continue;
           }
           existingFingerprints.add(fingerprint);
-          importedBooks.push({ ...parsed, id: `import-${Date.now()}-${importedBooks.length}`, fingerprint, fileName: file.name, cover: parsed.cover || "", local: false });
+          importedBooks.push({ ...parsed, id: `import:${fingerprint}`, fingerprint, fileName: file.name, cover: parsed.cover || "", local: false });
         } catch {
           failedCount += 1;
         }
       }
 
       if (importedBooks.length) {
+        await Promise.all(importedBooks.map((item) => saveStoredLibraryBook(item)));
         setLibraryBooks((items) => [...items, ...importedBooks]);
         const latest = importedBooks[importedBooks.length - 1];
         setBook(latest);
@@ -527,9 +611,15 @@ export function App() {
     setDeleteCandidate(targetBook);
   }
 
-  function confirmDeleteBook() {
+  async function confirmDeleteBook() {
     if (!deleteCandidate) return;
     const nextBooks = libraryBooks.filter((item) => item.id !== deleteCandidate.id);
+    try {
+      await deleteStoredLibraryBook(deleteCandidate.id);
+    } catch {
+      showNotice("本地书库删除失败，请稍后重试");
+      return;
+    }
     setLibraryBooks(nextBooks);
     if (book?.id === deleteCandidate.id) {
       const fallbackBook = nextBooks[0] || null;
@@ -740,7 +830,10 @@ export function App() {
         </aside>
         <section className="library-content">
           <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB；PDF、TXT、MOBI、AZW3 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
-          {visibleShelfBooks.length ? <div className="book-grid">{visibleShelfBooks.map((shelfBook) => <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || "本地 EPUB"}</p><div className="book-progress"><span><i style={{ width: `${shelfBook.id === book.id ? progress : 0}%` }} /></span><b>{shelfBook.id === book.id ? `${progress}%` : "未读"}</b><small>{shelfBook.id === book.id ? `第 ${chapterIndex + 1} / ${book.chapters.length} 节` : `${shelfBook.chapters.length} 节`}</small></div><button className="read-button" onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>)}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>你可以为《{book.title}》添加“{activeCategory}”标签。</span><button className="text-action" onClick={() => setCategoryModalOpen(true)}>管理分类</button></div>}
+          {visibleShelfBooks.length ? <div className="book-grid">{visibleShelfBooks.map((shelfBook) => {
+            const shelfState = shelfBookStates.get(shelfBook.id) || getBookShelfState(shelfBook);
+            return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || "本地 EPUB"}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
+          })}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>你可以为《{book.title}》添加“{activeCategory}”标签。</span><button className="text-action" onClick={() => setCategoryModalOpen(true)}>管理分类</button></div>}
         </section>
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
         {deleteCandidate && <DeleteBookConfirmModal book={deleteCandidate} onCancel={() => setDeleteCandidate(null)} onConfirm={confirmDeleteBook} />}
@@ -1457,11 +1550,23 @@ function analysisStorageKey(book) {
 }
 
 function readPagesStorageKey(book) {
-  return `yuezhi-read-pages:${book.title}:${book.creator || "unknown"}:${book.chapters.length}`;
+  return `yuezhi-read-pages:${storageBookIdentity(book)}`;
 }
 
 function readingPositionStorageKey(book) {
   return `yuezhi-reading-position:${book.id || book.title}:${book.creator || "unknown"}:${book.chapters.length}`;
+}
+
+function storageBookIdentity(book) {
+  return book.fingerprint || `${book.id || book.title}:${book.creator || "unknown"}:${book.chapters.length}`;
+}
+
+function getBookShelfState(book) {
+  const readPages = loadStored(readPagesStorageKey(book), []);
+  if (!readPages.length) return { hasRead: false, percent: 0, label: `${book.chapters.length} 节` };
+  const latest = [...readPages].sort((left, right) => right.chapterIndex - left.chapterIndex || right.pageIndex - left.pageIndex || right.paragraphIndex - left.paragraphIndex)[0];
+  const percent = Math.max(1, Math.min(100, Math.round(((latest.chapterIndex + 1) / book.chapters.length) * 100)));
+  return { hasRead: true, percent, label: `读到第 ${latest.chapterIndex + 1} / ${book.chapters.length} 节` };
 }
 
 function bookmarkStorageKey(book) {
