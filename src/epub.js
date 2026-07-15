@@ -34,8 +34,10 @@ export async function parseEpub(file) {
   const basePath = opfPath.split("/").slice(0, -1).join("/");
   const manifest = new Map(
     [...opf.getElementsByTagName("item")].map((item) => [item.getAttribute("id"), {
+      id: item.getAttribute("id"),
       href: item.getAttribute("href"),
       type: item.getAttribute("media-type"),
+      properties: item.getAttribute("properties") || "",
     }]),
   );
   const title = opf.getElementsByTagName("dc:title")[0]?.textContent?.trim() || "未命名书籍";
@@ -63,5 +65,19 @@ export async function parseEpub(file) {
   }
 
   if (!chapters.length) throw new Error("这本 EPUB 没有可读正文");
-  return { title, creator, publisher, chapters };
+  return { title, creator, publisher, cover: await extractCover(zip, opf, manifest, basePath), chapters };
+}
+
+async function extractCover(zip, opf, manifest, basePath) {
+  const coverMeta = [...opf.getElementsByTagName("meta")].find((item) => item.getAttribute("name") === "cover");
+  const coverId = coverMeta?.getAttribute("content");
+  const coverItem = coverId ? manifest.get(coverId) : null;
+  const fallbackItem = [...manifest.values()].find((item) => item.properties.split(/\s+/).includes("cover-image"))
+    || [...manifest.values()].find((item) => item.type?.startsWith("image/") && /cover/i.test(`${item.id || ""} ${item.href || ""}`));
+  const item = coverItem || fallbackItem;
+  if (!item?.href) return "";
+  const entry = zip.file(normalisePath(basePath, item.href));
+  if (!entry) return "";
+  const base64 = await entry.async("base64");
+  return `data:${item.type || "image/jpeg"};base64,${base64}`;
 }

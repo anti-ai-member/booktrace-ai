@@ -467,10 +467,10 @@ export function App() {
       return;
     }
     setIsLoading(true);
-    setLoadError("");
-    try {
-      const parsed = await parseEpub(file);
-      const imported = { ...parsed, id: `import-${Date.now()}`, cover: COVER_PATH, local: false };
+      setLoadError("");
+      try {
+        const parsed = await parseEpub(file);
+      const imported = { ...parsed, id: `import-${Date.now()}`, cover: parsed.cover || "", local: false };
       setLibraryBooks((items) => [...items, imported]);
       setBook(imported);
       setBookCategories([categories[0]].filter(Boolean));
