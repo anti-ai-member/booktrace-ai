@@ -407,6 +407,97 @@ body { background: var(--desk-paper); }
   padding: 8px 10px;
 }
 
+.book-card-actions {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+}
+
+.book-delete-button {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: #8a928b;
+}
+
+.book-delete-button:hover {
+  border-color: #e0c8c0;
+  background: #f7ebe7;
+  color: #9a4b3e;
+}
+
+.delete-book-modal {
+  width: min(420px, calc(100vw - 48px));
+  padding: 22px;
+}
+
+.delete-book-modal header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.delete-book-modal header span {
+  color: #9a4b3e;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.delete-book-modal h2 {
+  margin: 4px 0 0;
+  color: #302b27;
+  font-size: 20px;
+  line-height: 1.35;
+}
+
+.delete-book-modal header button {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 5px;
+  color: #777b72;
+}
+
+.delete-book-modal header button:hover {
+  background: #ebece5;
+  color: #315f4b;
+}
+
+.delete-book-modal p {
+  margin: 16px 0 0;
+  color: #687067;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.delete-book-modal footer {
+  display: flex;
+  justify-content: end;
+  gap: 8px;
+  margin-top: 22px;
+}
+
+.danger-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 9px 13px;
+  border: 1px solid #9a4b3e;
+  border-radius: 5px;
+  background: #9a4b3e;
+  color: white;
+  font-size: 13px;
+}
+
+.danger-button:hover {
+  background: #843e34;
+}
+
 @media (max-width: 1280px) {
   .book-grid {
     gap: 10px;

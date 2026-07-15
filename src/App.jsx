@@ -113,6 +113,7 @@ export function App() {
   const [facetMenuOpen, setFacetMenuOpen] = useState(false);
   const [pageTurn, setPageTurn] = useState("");
   const [categoryModalOpen, setCategoryModalOpen] = useState(false);
+  const [deleteCandidate, setDeleteCandidate] = useState(null);
   const [newCategory, setNewCategory] = useState("");
   const [chapterIndex, setChapterIndex] = useState(0);
   const [pageIndex, setPageIndex] = useState(0);
@@ -206,7 +207,7 @@ export function App() {
         const response = await fetch(BOOK_PATH);
         if (!response.ok) throw new Error("无法打开本地 EPUB 文件");
         const parsed = await parseEpub(await response.blob());
-        const builtIn = { ...parsed, id: "long-march", cover: COVER_PATH, bookType: "历史纪实 / 传记", indexSchema: findBookType("历史纪实 / 传记").facets, local: true };
+        const builtIn = { ...parsed, id: "long-march", fingerprint: "builtin:long-march", cover: COVER_PATH, bookType: "历史纪实 / 传记", indexSchema: findBookType("历史纪实 / 传记").facets, local: true };
         setLibraryBooks([builtIn]);
         setBook(builtIn);
         setChapterIndex((current) => Math.min(Math.max(current, 0), parsed.chapters.length - 1));
@@ -470,7 +471,15 @@ export function App() {
       setLoadError("");
       try {
         const parsed = await parseEpub(file);
-      const imported = { ...parsed, id: `import-${Date.now()}`, cover: parsed.cover || "", local: false };
+      const fingerprint = createBookFingerprint(parsed, file);
+      const existing = libraryBooks.find((item) => item.fingerprint === fingerprint);
+      if (existing) {
+        setBook(existing);
+        setScreen("shelf");
+        showNotice(`《${existing.title}》已在书架中`);
+        return;
+      }
+      const imported = { ...parsed, id: `import-${Date.now()}`, fingerprint, fileName: file.name, cover: parsed.cover || "", local: false };
       setLibraryBooks((items) => [...items, imported]);
       setBook(imported);
       setBookCategories([categories[0]].filter(Boolean));
@@ -483,6 +492,31 @@ export function App() {
       setIsLoading(false);
       event.target.value = "";
     }
+  }
+
+  function requestDeleteBook(targetBook) {
+    if (targetBook.local) {
+      showNotice("内置示例书不能删除");
+      return;
+    }
+    setDeleteCandidate(targetBook);
+  }
+
+  function confirmDeleteBook() {
+    if (!deleteCandidate) return;
+    const nextBooks = libraryBooks.filter((item) => item.id !== deleteCandidate.id);
+    setLibraryBooks(nextBooks);
+    if (book?.id === deleteCandidate.id) {
+      const fallbackBook = nextBooks[0] || null;
+      setBook(fallbackBook);
+      setChapterIndex(0);
+      setPageIndex(0);
+      setSelectedParagraph(null);
+      setDrawerOpen(false);
+      setScreen("shelf");
+    }
+    setDeleteCandidate(null);
+    showNotice(`已删除《${deleteCandidate.title}》`);
   }
 
   async function analyzeBook(scope = "read", isAutomatic = false) {
@@ -681,9 +715,10 @@ export function App() {
         </aside>
         <section className="library-content">
           <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB；PDF、TXT、MOBI、AZW3 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
-          {visibleShelfBooks.length ? <div className="book-grid">{visibleShelfBooks.map((shelfBook) => <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || "本地 EPUB"}</p><div className="book-progress"><span><i style={{ width: `${shelfBook.id === book.id ? progress : 0}%` }} /></span><b>{shelfBook.id === book.id ? `${progress}%` : "未读"}</b><small>{shelfBook.id === book.id ? `第 ${chapterIndex + 1} / ${book.chapters.length} 节` : `${shelfBook.chapters.length} 节`}</small></div><button className="read-button" onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>)}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>你可以为《{book.title}》添加“{activeCategory}”标签。</span><button className="text-action" onClick={() => setCategoryModalOpen(true)}>管理分类</button></div>}
+          {visibleShelfBooks.length ? <div className="book-grid">{visibleShelfBooks.map((shelfBook) => <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || "本地 EPUB"}</p><div className="book-progress"><span><i style={{ width: `${shelfBook.id === book.id ? progress : 0}%` }} /></span><b>{shelfBook.id === book.id ? `${progress}%` : "未读"}</b><small>{shelfBook.id === book.id ? `第 ${chapterIndex + 1} / ${book.chapters.length} 节` : `${shelfBook.chapters.length} 节`}</small></div><button className="read-button" onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>)}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>你可以为《{book.title}》添加“{activeCategory}”标签。</span><button className="text-action" onClick={() => setCategoryModalOpen(true)}>管理分类</button></div>}
         </section>
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
+        {deleteCandidate && <DeleteBookConfirmModal book={deleteCandidate} onCancel={() => setDeleteCandidate(null)} onConfirm={confirmDeleteBook} />}
       </main>
     );
   }
@@ -1002,6 +1037,10 @@ function BookCover({ book }) {
   return <div className="fallback-book-cover"><span>{book.bookType || "本地书籍"}</span><strong>{book.title}</strong><small>{APP_NAME}</small></div>;
 }
 
+function DeleteBookConfirmModal({ book, onCancel, onConfirm }) {
+  return <div className="modal-backdrop" role="presentation" onMouseDown={onCancel}><section className="delete-book-modal" role="dialog" aria-modal="true" aria-label="确认删除书籍" onMouseDown={(event) => event.stopPropagation()}><header><div><span>删除书籍</span><h2>确认删除《{book.title}》？</h2></div><button onClick={onCancel} title="关闭"><X size={18} /></button></header><p>这会从当前书架移除这本书。你的本地原始文件不会被删除，但本应用内与该导入项关联的入口会消失。</p><footer><button className="text-action" onClick={onCancel}>取消</button><button className="danger-button" onClick={onConfirm}>确认删除</button></footer></section></div>;
+}
+
 function FacetIndexPanel({ title, category }) {
   return <div className="facet-index"><span>{category || "阅读索引"}</span><h2>{title}</h2><p>本书将围绕“{title}”整理可追溯内容；完成模型分析后，这里会展示对应条目与原文证据。</p></div>;
 }
@@ -1261,6 +1300,19 @@ function searchBook(chapters, query) {
     });
   });
   return results.slice(0, 50);
+}
+
+function createBookFingerprint(parsed, file) {
+  const basis = [
+    parsed.title,
+    parsed.creator,
+    parsed.publisher,
+    file?.name,
+    file?.size,
+    parsed.chapters?.length,
+    parsed.chapters?.[0]?.title,
+  ].map((part) => String(part || "").trim().toLowerCase()).join("|");
+  return `epub:${basis}`;
 }
 
 function SearchDialog({ query, setQuery, results, onSelect, onClose }) {
