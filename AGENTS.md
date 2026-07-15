@@ -47,3 +47,4 @@ When implementing from a selected generated mock, treat that image as the source
 - Keep AI capabilities as the product's main differentiator, but present them as simple, reading-native assistance: inline annotations, evidence-backed indexes, and one-click contextual actions. Avoid complex AI dashboards, decorative AI panels, and multi-step flows that pull attention away from reading.
 - Product name: `书脉`; slogan: `读得清脉络，记得住来处`.
 - The home bookshelf should feel like an editorial physical bookshelf display rather than dense product cards: larger covers/book spines, subtle shelf lines, quiet labels, and hover lift, inspired by refined bookshelf browsing references while keeping three books per row on desktop.
+- The home shelf should stay cover-first and compact like a visual pinboard: default cards show little to no text, while title, author, progress, and actions appear in a hover/focus overlay.
