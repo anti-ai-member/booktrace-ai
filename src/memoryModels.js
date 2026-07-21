@@ -664,8 +664,10 @@ function preferText(primary, fallback) {
   return cleanText(primary) || cleanText(fallback) || "";
 }
 
-function cleanText(value) {
-  return String(value || "").replace(/\s+/g, " ").trim();
+export function cleanText(value) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text || /^(undefined|null|nan)$/i.test(text)) return "";
+  return text;
 }
 
 function normalizeKey(value) {

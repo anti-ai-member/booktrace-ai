@@ -92,6 +92,8 @@ Quality gate:
 
 ## Phase 4: AI Contracts
 
+Status: complete (Feature 004 verified).
+
 Goal:
 
 Make prompts and API payloads match Memory Engine architecture.

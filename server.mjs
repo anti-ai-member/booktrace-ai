@@ -78,8 +78,11 @@ app.post("/api/classify-book", async (request, response) => {
       ["human", buildClassificationPrompt(book)],
     ]);
     const parsed = parseJson(messageContent(result));
-    const profile = normaliseProfile({ category: parsed.category, facets: parsed.facets });
-    response.json({ provider, model: resolvedModel, profile, reason: String(parsed.reason || "").slice(0, 140) });
+    const profile = normaliseProfile(parsed, { strict: true });
+    if (!profile) {
+      return response.status(422).json({ error: "Model returned no usable book type" });
+    }
+    response.json({ provider, model: resolvedModel, profile, reason: displayText(parsed.reason).slice(0, 140) });
   } catch (error) {
     response.status(502).json({ error: error.message || "Book classification failed" });
   }
@@ -121,11 +124,20 @@ app.post("/api/recovery-card", async (request, response) => {
       ["human", buildRecoveryCardPrompt({ book, cursor, traceProfile, bookMemory: memory, evidence, currentText })],
     ]);
     const parsed = parseJson(messageContent(result));
+    const card = normaliseRecoveryCard(parsed, evidence, book, cursor);
+    if (!card || card.keyPoints.length < 2) {
+      return response.status(422).json({
+        error: "Recovery card failed evidence contract",
+        fallback: true,
+        model: resolvedModel,
+        thinking: useThinking,
+      });
+    }
     response.json({
       provider,
       model: resolvedModel,
       thinking: useThinking,
-      card: normaliseRecoveryCard(parsed, evidence, book, cursor),
+      card,
     });
   } catch (error) {
     response.status(502).json({ error: error.message || "Recovery card generation failed" });
@@ -232,8 +244,10 @@ Constraints:
 - keyPoints: 2-3 items, each title <= 12 Chinese chars or 5 English words, detail <= 48 Chinese chars or 24 English words.
 - prerequisites: 1-2 items, focused on what must be recalled to understand the current page.
 - question: one active-recall question. Include a "hint" string that nudges the reader without giving the full answer. The answer must be directly supported by cited evidence.
+- Every keyPoint, prerequisite, and the question MUST use a real evidenceRef from the supplied list (for example "C1"). Never invent refs. If a claim has no matching cite, omit it.
 - If a quote only mentions incidental names/dates/places, do not turn them into key points.
 - Prefer causal summaries, decisions, conflicts, concepts, unresolved problems, and turning points over raw entity mentions.
+- Never output the literal strings undefined, null, or nan in any field.
 
 Book:
 ${JSON.stringify(book)}
@@ -255,66 +269,75 @@ ${JSON.stringify(cites)}`;
 }
 
 function normaliseRecoveryCard(raw, evidence, book, cursor) {
-  const evidenceList = evidence.slice(0, 16).map((item, index) => normaliseRecoveryEvidence(item, index)).filter(Boolean);
-  const byRef = new Map(evidenceList.flatMap((item) => [[item.ref, item], [item.ref.replace(/[\[\]]/g, ""), item], [item.id, item]].filter(([key]) => key)));
-  const resolveEvidence = (ref, fallbackIndex = 0) => {
-    const key = String(ref || "").replace(/^\[/, "").replace(/\]$/, "");
-    return byRef.get(ref) || byRef.get(key) || evidenceList[fallbackIndex] || null;
-  };
-  const clean = (value, fallback = "") => {
-    const text = String(value || "").trim();
-    return text && !/^(undefined|null)$/i.test(text) ? text : fallback;
+  const evidenceList = evidence.slice(0, 16).map((item, index) => normaliseRecoveryEvidence(item, index, book)).filter(Boolean);
+  const byRef = new Map();
+  evidenceList.forEach((item) => {
+    [item.ref, item.ref?.replace(/[\[\]]/g, ""), item.id, item.cite?.id, item.cite?.label]
+      .filter(Boolean)
+      .forEach((key) => byRef.set(String(key), item));
+  });
+  const resolveEvidence = (ref) => {
+    const rawRef = String(ref || "").trim();
+    if (!rawRef) return null;
+    const key = rawRef.replace(/^\[/, "").replace(/\]$/, "");
+    return byRef.get(rawRef) || byRef.get(key) || byRef.get(`[${key}]`) || null;
   };
   const keyPoints = (Array.isArray(raw?.keyPoints) ? raw.keyPoints : [])
     .map((item, index) => ({
       id: `ai-point-${index}`,
-      title: clean(item?.title, `重点 ${index + 1}`).slice(0, 32),
-      detail: clean(item?.detail).slice(0, 120),
-      evidence: resolveEvidence(item?.evidenceRef, index),
+      title: displayText(item?.title, `重点 ${index + 1}`).slice(0, 32),
+      detail: displayText(item?.detail).slice(0, 120),
+      evidence: resolveEvidence(item?.evidenceRef),
     }))
     .filter((item) => item.detail && item.evidence)
     .slice(0, 3);
   const prerequisites = (Array.isArray(raw?.prerequisites) ? raw.prerequisites : [])
     .map((item, index) => ({
       id: `ai-prereq-${index}`,
-      text: clean(item?.text).slice(0, 120),
-      evidence: resolveEvidence(item?.evidenceRef, index + keyPoints.length),
+      text: displayText(item?.text).slice(0, 120),
+      evidence: resolveEvidence(item?.evidenceRef),
     }))
     .filter((item) => item.text && item.evidence)
     .slice(0, 2);
-  const questionEvidence = resolveEvidence(raw?.question?.evidenceRef, 0);
+  const questionEvidence = resolveEvidence(raw?.question?.evidenceRef);
   const chapterTitle = evidenceList[0]?.chapterTitle || `第 ${Number(cursor?.chapterIndex || 0) + 1} 节`;
   return {
     intensity: ["light", "medium", "deep", "fresh"].includes(raw?.intensity) ? raw.intensity : "medium",
-    absenceLabel: clean(raw?.absenceLabel, "继续阅读前"),
-    positionLabel: clean(raw?.positionLabel, `上次读到 ${chapterTitle}`),
+    absenceLabel: displayText(raw?.absenceLabel, "继续阅读前"),
+    positionLabel: displayText(raw?.positionLabel, `上次读到 ${chapterTitle}`),
     keyPoints,
     prerequisites,
     question: {
-      prompt: clean(raw?.question?.prompt, "继续前，先回想上一页的关键变化是什么？"),
-      hint: clean(raw?.question?.hint, ""),
-      answer: clean(raw?.question?.answer, evidenceList[0]?.excerpt || ""),
+      prompt: displayText(raw?.question?.prompt, "继续前，先回想上一页的关键变化是什么？"),
+      hint: displayText(raw?.question?.hint),
+      answer: displayText(raw?.question?.answer, questionEvidence?.excerpt || evidenceList[0]?.excerpt || ""),
       evidence: questionEvidence,
     },
     evidence: evidenceList.slice(0, 6),
-    sourceBook: { title: book?.title, creator: book?.creator },
+    sourceBook: { title: displayText(book?.title), creator: displayText(book?.creator) },
   };
 }
 
-function normaliseRecoveryEvidence(item, index = 0) {
+function normaliseRecoveryEvidence(item, index = 0, book = null) {
   if (!item) return null;
   const cite = item.cite || {};
   const ref = cite.label || cite.id || `[C${index + 1}]`;
-  const excerpt = String(item.quote || cite.quote || item.excerpt || "").trim().slice(0, 180);
+  const excerpt = displayText(item.quote || cite.quote || item.excerpt).slice(0, 180);
   if (!excerpt) return null;
-  const chapterIndex = Number(item.chapterIndex ?? cite.chapterIndex ?? 0);
-  const paragraphIndex = Number(item.paragraphIndex ?? cite.paragraphIndex ?? 0);
+  const chapterIndex = Number(item.chapterIndex ?? cite.chapterIndex);
+  const paragraphIndex = Number(item.paragraphIndex ?? cite.paragraphIndex);
+  if (!Number.isInteger(chapterIndex) || !Number.isInteger(paragraphIndex) || chapterIndex < 0 || paragraphIndex < 0) return null;
+  if (book?.chapters?.length) {
+    const chapter = book.chapters.find((candidate, idx) => (candidate.sourceChapterIndex ?? idx) === chapterIndex)
+      || book.chapters[chapterIndex];
+    if (!chapter || !Array.isArray(chapter.paragraphs) || paragraphIndex >= chapter.paragraphs.length) return null;
+  }
   return {
     id: item.id || cite.chunkId || `recovery-${chapterIndex}-${paragraphIndex}`,
     ref,
-    chapterIndex: Number.isFinite(chapterIndex) ? chapterIndex : 0,
-    paragraphIndex: Number.isFinite(paragraphIndex) ? paragraphIndex : 0,
-    chapterTitle: String(item.chapterTitle || cite.chapterTitle || "").trim(),
+    chapterIndex,
+    paragraphIndex,
+    chapterTitle: displayText(item.chapterTitle || cite.chapterTitle),
     excerpt,
     quote: excerpt,
     cite: {
@@ -506,12 +529,19 @@ function normaliseIndex(raw, chapters) {
     const evidence = item.evidence || {};
     const summary = cleanTraceSummary(item.summary);
     const requestedChapter = Number(evidence.chapterIndex);
-    const chapter = chapters.find((candidate, chapterIndex) => (candidate.sourceChapterIndex ?? chapterIndex) === requestedChapter) || chapters[0];
+    const chapter = chapters.find((candidate, chapterIndex) => (candidate.sourceChapterIndex ?? chapterIndex) === requestedChapter);
+    if (!chapter || evidence.chapterIndex == null || evidence.paragraphIndex == null || !Number.isInteger(requestedChapter) || requestedChapter < 0) {
+      return { name: "", weakEvidence: true };
+    }
     const chapterIndex = chapter.sourceChapterIndex ?? chapters.indexOf(chapter);
-    const paragraphIndex = clamp(evidence.paragraphIndex, 0, chapter.paragraphs.length - 1);
-    const timelineName = String(item.date || item.name || item.title || "").trim();
-    const entityName = String(item.name || item.title || "").trim();
+    const paragraphIndex = Number(evidence.paragraphIndex);
+    if (!Number.isInteger(paragraphIndex) || paragraphIndex < 0 || paragraphIndex >= (chapter.paragraphs?.length || 0)) {
+      return { name: "", weakEvidence: true };
+    }
+    const timelineName = displayText(item.date || item.name || item.title);
+    const entityName = displayText(item.name || item.title);
     const name = kind === "timeline" ? timelineName : entityName;
+    if (!name) return { name: "", weakEvidence: true };
     let quote = repairEvidenceQuote(chapter, paragraphIndex, evidence.quote, [name, item.title, summary]);
     let resolvedChapterIndex = chapterIndex;
     let resolvedParagraphIndex = paragraphIndex;
@@ -524,7 +554,7 @@ function normaliseIndex(raw, chapters) {
     return {
       id: `${kind}-${index}-${name}`,
       name,
-      subtitle: kind === "timeline" ? item.title : summary,
+      subtitle: kind === "timeline" ? displayText(item.title) : summary,
       detail: kind === "timeline" ? summary : summary || quote,
       evidenceQuote: quote,
       priority: item.priority === "primary" ? "primary" : "secondary",
@@ -535,7 +565,10 @@ function normaliseIndex(raw, chapters) {
       occurrences: [{ chapterIndex: resolvedChapterIndex, paragraphIndex: resolvedParagraphIndex }],
     };
   };
-  const timeline = (raw.timeline || []).map((item, index) => makeEntry("timeline", item, index)).filter((item) => item.name && item.name !== "undefined").sort((a, b) => a.sortKey - b.sortKey);
+  const timeline = (raw.timeline || [])
+    .map((item, index) => makeEntry("timeline", item, index))
+    .filter((item) => item.name && !item.weakEvidence)
+    .sort((a, b) => a.sortKey - b.sortKey);
   const people = [];
   const organizations = [];
   (raw.people || []).forEach((item, index) => {
@@ -558,12 +591,17 @@ function normaliseIndex(raw, chapters) {
   const relationships = (raw.relationships || []).map((item, index) => {
     const evidence = item.evidence || {};
     const requestedChapter = Number(evidence.chapterIndex);
-    const chapter = chapters.find((candidate, chapterIndex) => (candidate.sourceChapterIndex ?? chapterIndex) === requestedChapter) || chapters[0];
+    const chapter = chapters.find((candidate, chapterIndex) => (candidate.sourceChapterIndex ?? chapterIndex) === requestedChapter);
+    if (!chapter || evidence.chapterIndex == null || evidence.paragraphIndex == null || !Number.isInteger(requestedChapter) || requestedChapter < 0) return null;
     const chapterIndex = chapter.sourceChapterIndex ?? chapters.indexOf(chapter);
-    const source = String(item.source || "").trim();
-    const target = String(item.target || "").trim();
-    const relation = String(item.relation || "").trim();
+    const paragraphIndex = Number(evidence.paragraphIndex);
+    if (!Number.isInteger(paragraphIndex) || paragraphIndex < 0 || paragraphIndex >= (chapter.paragraphs?.length || 0)) return null;
+    const source = displayText(item.source);
+    const target = displayText(item.target);
+    const relation = displayText(item.relation);
     if (!source || !target || !relation || source === target) return null;
+    const quote = repairEvidenceQuote(chapter, paragraphIndex, evidence.quote, [source, target, relation]);
+    if (isWeakTraceEvidenceQuote(quote)) return null;
     return {
       id: `relationship-${index}-${source}-${target}`,
       source,
@@ -575,8 +613,8 @@ function normaliseIndex(raw, chapters) {
       importance: item.importance === "primary" ? "primary" : "secondary",
       evidence: {
         chapterIndex,
-        paragraphIndex: clamp(evidence.paragraphIndex, 0, chapter.paragraphs.length - 1),
-        quote: repairEvidenceQuote(chapter, clamp(evidence.paragraphIndex, 0, chapter.paragraphs.length - 1), evidence.quote, [source, target, relation]),
+        paragraphIndex,
+        quote,
       },
     };
   }).filter(Boolean).slice(0, 36);
@@ -589,10 +627,23 @@ function normaliseIndex(raw, chapters) {
   };
 }
 
-function normaliseProfile(profile) {
-  const matched = BOOK_TYPES.find((type) => type.name === profile?.category) || BOOK_TYPES[0];
-  const facets = Array.isArray(profile?.facets) ? profile.facets.filter((facet) => matched.facets.includes(facet)).slice(0, 6) : matched.facets.slice(0, 6);
+function normaliseProfile(profile, { strict = false } = {}) {
+  const matched = BOOK_TYPES.find((type) => type.name === profile?.category);
+  if (!matched) {
+    if (strict) return null;
+    const fallback = BOOK_TYPES[0];
+    return { category: fallback.name, facets: fallback.facets.slice(0, 6) };
+  }
+  const facets = Array.isArray(profile?.facets)
+    ? profile.facets.filter((facet) => matched.facets.includes(facet)).slice(0, 6)
+    : matched.facets.slice(0, 6);
   return { category: matched.name, facets: facets.length ? facets : matched.facets.slice(0, 6) };
+}
+
+function displayText(value, fallback = "") {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text || /^(undefined|null|nan)$/i.test(text)) return fallback;
+  return text;
 }
 
 function clamp(value, min, max) {

@@ -549,7 +549,7 @@ export function App() {
     [analysisRecord?.bookMemory, analysisRecord?.traceMemory, aiIndex, book?.id, book?.title],
   );
   const bookIndex = useMemo(
-    () => normalizeReadingIndex(readingIndexFromBookMemory(bookMemory)),
+    () => normalizeReadingIndex(readingIndexFromBookMemory(bookMemory), book),
     [bookMemory],
   );
   const activeTraceProfile = useMemo(() => resolveTraceProfile(bookProfile?.category || book?.bookType, bookProfile?.facets || book?.indexSchema || []), [bookProfile, book?.bookType, book?.indexSchema]);
@@ -1030,7 +1030,7 @@ export function App() {
         traceProfile: result.traceProfile || traceProfile,
         supportingEvidence,
       });
-      const nextIndex = normalizeReadingIndex(result.index || readingIndexFromBookMemory(nextBookMemory));
+      const nextIndex = normalizeReadingIndex(result.index || readingIndexFromBookMemory(nextBookMemory), book);
       setAiIndex(nextIndex);
       setBookProfile(result.profile);
       setBook((current) => current ? { ...current, bookType: result.profile.category, indexSchema: result.profile.facets } : current);
@@ -1912,10 +1912,10 @@ function TimelineList({ items, activeChapter, activeCursor, onItem }) {
     {rest.length > 0 && <details className="secondary-entities timeline-secondary"><summary>展开其余时间 <span>{rest.length}</span></summary><div>{rest.map((item) => <button className="entity-row compact" key={item.id} onClick={() => onItem(item)}><div className="entity-row-heading"><b>{item.name}</b></div><span>{item.subtitle}</span></button>)}</div></details>}
   </div>;
 }
-function normalizeReadingIndex(index = {}) {
+function normalizeReadingIndex(index = {}, book = null) {
   const people = [];
   const organizations = [];
-  const withEvidence = (items) => (Array.isArray(items) ? items : []).filter(hasIndexEvidence);
+  const withEvidence = (items) => (Array.isArray(items) ? items : []).filter((item) => hasIndexEvidence(item, book));
   withEvidence(index.people).forEach((item) => {
     const name = summaryText(item?.name);
     if (!name) return;
@@ -1936,11 +1936,16 @@ function normalizeReadingIndex(index = {}) {
   };
 }
 
-function hasIndexEvidence(item) {
+function hasIndexEvidence(item, book = null) {
   const evidence = item?.evidence || item?.occurrence || item?.occurrences?.[0];
-  const chapterIndex = Number(evidence?.chapterIndex);
-  const paragraphIndex = Number(evidence?.paragraphIndex);
-  return Number.isInteger(chapterIndex) && Number.isInteger(paragraphIndex);
+  if (evidence?.chapterIndex == null || evidence?.paragraphIndex == null) return false;
+  const chapterIndex = Number(evidence.chapterIndex);
+  const paragraphIndex = Number(evidence.paragraphIndex);
+  if (!Number.isInteger(chapterIndex) || !Number.isInteger(paragraphIndex) || chapterIndex < 0 || paragraphIndex < 0) return false;
+  if (!book?.chapters?.length) return true;
+  const chapter = book.chapters.find((candidate, index) => (candidate.sourceChapterIndex ?? index) === chapterIndex)
+    || book.chapters[chapterIndex];
+  return Boolean(chapter && Array.isArray(chapter.paragraphs) && paragraphIndex < chapter.paragraphs.length);
 }
 
 function contextualRelationships(relationships = [], context = {}) {
@@ -2238,38 +2243,39 @@ function normalizeSummaryEvents(events) {
 function normalizeRecoveryCard(card, fallback = null) {
   if (!card || typeof card !== "object") return fallback;
   const evidence = normalizeRecoveryEvidenceList(card.evidence?.length ? card.evidence : fallback?.evidence);
-  const evidenceAt = (item, index) => normalizeRecoveryEvidence(item?.evidence || evidence[index] || evidence[0]);
+  const resolveItemEvidence = (item) => normalizeRecoveryEvidence(item?.evidence);
   const keyPoints = (Array.isArray(card.keyPoints) ? card.keyPoints : [])
     .map((item, index) => ({
       id: item?.id || `ai-point-${index}`,
-      memoryKey: item?.memoryKey || evidenceAt(item, index)?.memoryKey || fallback?.keyPoints?.[index]?.memoryKey,
+      memoryKey: item?.memoryKey || resolveItemEvidence(item)?.memoryKey || fallback?.keyPoints?.[index]?.memoryKey,
       title: summaryText(item?.title) || fallback?.keyPoints?.[index]?.title || `关键点 ${index + 1}`,
-      detail: summaryText(item?.detail) || fallback?.keyPoints?.[index]?.detail || "",
-      evidence: evidenceAt(item, index),
+      detail: summaryText(item?.detail) || "",
+      evidence: resolveItemEvidence(item),
     }))
     .filter((item) => item.detail && item.evidence)
     .slice(0, 3);
+  if (keyPoints.length < 2) return fallback;
   const prerequisites = (Array.isArray(card.prerequisites) ? card.prerequisites : [])
     .map((item, index) => ({
       id: item?.id || `ai-prereq-${index}`,
-      memoryKey: item?.memoryKey || evidenceAt(item, index + keyPoints.length)?.memoryKey || fallback?.prerequisites?.[index]?.memoryKey,
-      text: summaryText(item?.text) || fallback?.prerequisites?.[index]?.text || "",
-      evidence: evidenceAt(item, index + keyPoints.length),
+      memoryKey: item?.memoryKey || resolveItemEvidence(item)?.memoryKey || fallback?.prerequisites?.[index]?.memoryKey,
+      text: summaryText(item?.text) || "",
+      evidence: resolveItemEvidence(item),
     }))
     .filter((item) => item.text && item.evidence)
     .slice(0, 2);
-  const questionEvidence = normalizeRecoveryEvidence(card.question?.evidence || evidence[0]);
+  const questionEvidence = resolveItemEvidence(card.question) || normalizeRecoveryEvidence(fallback?.question?.evidence);
   return {
     intensity: ["light", "medium", "deep", "fresh"].includes(card.intensity) ? card.intensity : fallback?.intensity || "medium",
     absenceLabel: summaryText(card.absenceLabel) || fallback?.absenceLabel || "继续阅读前",
     positionLabel: summaryText(card.positionLabel) || fallback?.positionLabel || "上次阅读位置",
-    keyPoints: keyPoints.length ? keyPoints : fallback?.keyPoints || [],
+    keyPoints,
     prerequisites: prerequisites.length ? prerequisites : fallback?.prerequisites || [],
     question: {
       memoryKey: card.question?.memoryKey || questionEvidence?.memoryKey || fallback?.question?.memoryKey,
       prompt: summaryText(card.question?.prompt) || fallback?.question?.prompt || "继续前，先回想上一阶段的主线变化是什么？",
       answer: summaryText(card.question?.answer) || fallback?.question?.answer || "",
-      evidence: questionEvidence || fallback?.question?.evidence || evidence[0],
+      evidence: questionEvidence || fallback?.question?.evidence || null,
     },
     evidence,
   };
@@ -2284,14 +2290,15 @@ function normalizeRecoveryEvidence(item) {
   const cite = item.cite || {};
   const excerpt = summaryText(item.excerpt || item.quote || cite.quote);
   if (!excerpt) return null;
-  const chapterIndex = Number(item.chapterIndex ?? cite.chapterIndex ?? 0);
-  const paragraphIndex = Number(item.paragraphIndex ?? cite.paragraphIndex ?? 0);
+  const chapterIndex = Number(item.chapterIndex ?? cite.chapterIndex);
+  const paragraphIndex = Number(item.paragraphIndex ?? cite.paragraphIndex);
+  if (!Number.isInteger(chapterIndex) || !Number.isInteger(paragraphIndex) || chapterIndex < 0 || paragraphIndex < 0) return null;
   return {
     ...item,
     id: item.id || cite.id || `recovery-${chapterIndex}-${paragraphIndex}`,
     memoryKey: item.memoryKey || recoveryMemoryKey("evidence", excerpt, { chapterIndex, paragraphIndex }),
-    chapterIndex: Number.isFinite(chapterIndex) ? chapterIndex : 0,
-    paragraphIndex: Number.isFinite(paragraphIndex) ? paragraphIndex : 0,
+    chapterIndex,
+    paragraphIndex,
     chapterTitle: summaryText(item.chapterTitle || cite.chapterTitle || cite.source) || "原文",
     excerpt,
     quote: excerpt,
@@ -3017,7 +3024,7 @@ function hydrateAnalysisRecord(storedRecord, book = null) {
     }, { bookId: book?.id || book?.title || "book", cursor: storedRecord.cursor }),
     { bookId: book?.id || book?.title || "book", cursor: storedRecord.cursor, profile: storedRecord.profile, traceProfile: storedRecord.traceProfile },
   );
-  const index = normalizeReadingIndex(storedRecord.index || readingIndexFromBookMemory(bookMemory));
+  const index = normalizeReadingIndex(storedRecord.index || readingIndexFromBookMemory(bookMemory), book);
   return {
     ...storedRecord,
     bookMemory,
