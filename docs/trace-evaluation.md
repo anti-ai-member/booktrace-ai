@@ -44,6 +44,10 @@ node scripts/trace-eval.mjs --book "books/长征 (王树增著).epub" --pages 30
 - `jsonFormat`: required arrays exist so the UI can render safely.
 - `nonRedundancy`: repeated names and duplicate entries reduce the score.
 - `priorityCalibration`: primary items should stay within the Trace Profile caps.
+- `schemaValidity`: index arrays and optional bookMemory buckets keep expected shapes.
+- `noUndefined`: names and display strings must not contain literal `undefined` / `null` / `nan`.
+- `noiseRate`: share of birth/publish/weak-quote noise among output entries (lower is better; overall uses `100 - noiseRate`).
+- `recoveryFit`: Context Builder recovery plan checks (first-page suppress, ≤3 anchors, ≤2 prerequisites, no undefined labels).
 
 ## Heuristic Quality Scores
 

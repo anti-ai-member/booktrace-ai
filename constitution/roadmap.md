@@ -114,6 +114,8 @@ Quality gate:
 
 ## Phase 5: Reader UX Simplification
 
+Status: complete (Feature 005 verified).
+
 Goal:
 
 Keep AI abilities visible but reading-native.
@@ -132,6 +134,8 @@ Quality gate:
 - UI follows `docs/product-ui-ux-spec.md`.
 
 ## Phase 6: Evaluation System
+
+Status: complete (Feature 006 verified).
 
 Goal:
 

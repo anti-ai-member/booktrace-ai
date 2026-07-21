@@ -306,6 +306,7 @@ export function App() {
   const [analysisSettings, setAnalysisSettings] = useState(() => ({ ...DEFAULT_AI_SETTINGS, ...loadStored("yuezhi-ai-settings", DEFAULT_AI_SETTINGS) }));
   const [readingTheme, setReadingTheme] = useState(() => loadStored("yuezhi-reading-theme", "plain"));
   const [analysisSummaryOpen, setAnalysisSummaryOpen] = useState(false);
+  const [selectionAssist, setSelectionAssist] = useState(null);
   const [relationshipOpen, setRelationshipOpen] = useState(false);
   const [organizerOpen, setOrganizerOpen] = useState(null);
   const [readingProgress, setReadingProgress] = useState(() => ({ ...createReadingProgress(), ...loadStored("yuezhi-reading-progress", createReadingProgress()) }));
@@ -699,7 +700,6 @@ export function App() {
   function selectParagraph(index) {
     if (window.getSelection()?.toString().trim()) return;
     setSelectedParagraph(index);
-    setDrawerOpen(true);
   }
 
   function selectChapter(index) {
@@ -755,12 +755,34 @@ export function App() {
   }
 
   function openIndexEntry(entry) {
+    const position = entry.occurrence || entry.occurrences?.[0];
+    if (!position || !Number.isInteger(position.chapterIndex) || !Number.isInteger(position.paragraphIndex)) {
+      showNotice("这条索引还没有可跳转的原文证据");
+      return;
+    }
     recordProgress({ evidenceJumps: 1, xp: 1 });
-    setChapterIndex(entry.occurrence.chapterIndex);
+    setChapterIndex(position.chapterIndex);
     setPageIndex(0);
-    setSelectedParagraph(entry.occurrence.paragraphIndex);
-    setDrawerOpen(true);
-    requestAnimationFrame(() => requestAnimationFrame(() => goToParagraph(entry.occurrence.paragraphIndex)));
+    setSelectedParagraph(position.paragraphIndex);
+    setDrawerOpen(false);
+    const related = (bookIndex.relationships || []).filter((item) => (
+      item.source === entry.name || item.target === entry.name
+    ));
+    if (related.length) {
+      const usable = contextualRelationships(related, {
+        chapterIndex: position.chapterIndex,
+        selectedParagraph: position.paragraphIndex,
+        pageParagraphs: [{ paragraphIndex: position.paragraphIndex }],
+        index: bookIndex,
+      });
+      if (usable.length) {
+        setOrganizerOpen(null);
+        setSidebarCollapsed(false);
+        setRelationshipOpen(true);
+        setActivePanel("目录");
+      }
+    }
+    requestAnimationFrame(() => requestAnimationFrame(() => goToParagraph(position.paragraphIndex)));
     showNotice(`已定位到“${entry.name}”的原文证据`);
   }
 
@@ -952,7 +974,9 @@ export function App() {
     if (!newChapters.length) {
       setAnalysisState({ status: "done", message: "当前阅读位置没有新增内容可分析" });
       setTraceJob({ status: "done", message: "没有新增已读内容" });
-      if (!isAutomatic && analysisRecord?.summary) setAnalysisSummaryOpen(true);
+      if (!isAutomatic && analysisRecord?.summary) {
+        showNotice("阅读记忆已更新");
+      }
       return;
     }
     const traceProfile = traceProfileForPrompt(activeTraceProfile);
@@ -1111,10 +1135,8 @@ export function App() {
 
   function closeDrawerOnBlank(event) {
     setSelectionBloom(null);
-    if (!drawerOpen) return;
     const target = event.target;
     if (target === event.currentTarget || target.classList.contains("page-track")) {
-      setDrawerOpen(false);
       setSelectedParagraph(null);
     }
   }
@@ -1146,8 +1168,22 @@ export function App() {
       return;
     }
     if (action === "source") {
-      setDrawerOpen(true);
-      showNotice("已打开出处与上下文");
+      const cites = selectedParagraph !== null ? locateEvidence(memoryEvidenceStore, {
+        selectedText: selectionBloom?.fullText || chapter.paragraphs[selectedParagraph] || "",
+        scopeCursor: evidenceScopeCursor,
+        currentCursor: { chapterIndex, paragraphIndex: selectedParagraph },
+        traceIndex: bookIndex,
+        topK: 5,
+      }) : [];
+      const best = cites[0];
+      if (best) {
+        openSearchResult(best);
+        showNotice("已跳转到相关出处");
+      } else {
+        setActivePanel("阅读索引");
+        setSidebarCollapsed(false);
+        showNotice("暂无直接出处，可从阅读索引继续查找");
+      }
     } else if (action === "relation") {
       if (!contextRelationships.length) {
         showNotice("当前页附近还没有可靠关系证据");
@@ -1160,9 +1196,22 @@ export function App() {
       setRelationshipOpen(true);
       showNotice("已打开上下文关系");
     } else if (action === "recall") {
-      showNotice("回忆功能将基于已读 Trace 展开");
+      openCurrentRecoveryCard();
     } else if (action === "question") {
-      showNotice("解惑功能将接入选中文本提问");
+      setSelectionAssist({
+        text: selectionBloom?.fullText || "",
+        cites: selectedParagraph !== null ? locateEvidence(memoryEvidenceStore, {
+          selectedText: selectionBloom?.fullText || chapter.paragraphs[selectedParagraph] || "",
+          scopeCursor: evidenceScopeCursor,
+          currentCursor: { chapterIndex, paragraphIndex: selectedParagraph },
+          traceIndex: bookIndex,
+          topK: 4,
+        }).slice(0, 3) : [],
+      });
+      setActivePanel("解惑");
+      setSidebarCollapsed(false);
+      setRelationshipOpen(false);
+      showNotice("已打开选文解惑");
     } else if (action === "favorite") {
       toggleBookmark();
     }
@@ -1306,16 +1355,6 @@ export function App() {
     );
   }
 
-  const contextualParagraphs = chapter.paragraphs.slice(Math.max(0, (selectedParagraph ?? 0) - 1), Math.min(chapter.paragraphs.length, (selectedParagraph ?? 0) + 2));
-  const contextCites = selectedParagraph !== null ? locateEvidence(memoryEvidenceStore, {
-    selectedText: chapter.paragraphs[selectedParagraph] || "",
-    scopeCursor: evidenceScopeCursor,
-    currentCursor: { chapterIndex, paragraphIndex: selectedParagraph },
-    traceIndex: bookIndex,
-    topK: 5,
-  }).filter((item) => !(item.chapterIndex === chapterIndex && item.paragraphIndex === selectedParagraph)).slice(0, 3) : [];
-  const selectedIndexEntries = [...bookIndex.people, ...(bookIndex.organizations || []), ...bookIndex.timeline, ...bookIndex.places]
-    .filter((entry) => entry.occurrences.some((occurrence) => occurrence.chapterIndex === chapterIndex && occurrence.paragraphIndex === selectedParagraph));
   const currentPageRead = isPageRead(chapterIndex, pageIndex);
   const contextRelationships = contextualRelationships(bookIndex.relationships || [], {
     chapterIndex,
@@ -1353,7 +1392,8 @@ export function App() {
           {activePanel === "组织" && <EntityIndexList title="组织" kind="organization" items={bookIndex.organizations || []} icon={<Network size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠组织实体。" />}
           {activePanel === "时间线" && <TimelineList items={bookIndex.timeline} activeChapter={chapterIndex} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} />}
           {activePanel === "地点" && <EntityIndexList title="地点" kind="place" items={bookIndex.places} icon={<MapPin size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠地点实体。" />}
-          {activePanel !== "目录" && activePanel !== "主题" && activePanel !== "AI 阅读" && activePanel !== "阅读索引" && activePanel !== "图形组织器" && activePanel !== "书签" && activePanel !== "笔记" && activePanel !== "人物" && activePanel !== "组织" && activePanel !== "时间线" && activePanel !== "地点" && <FacetIndexPanel title={activePanel} category={bookProfile?.category} />}
+          {activePanel === "解惑" && <SelectionAssistPanel assist={selectionAssist} onEvidence={openSearchResult} onClose={() => { setSelectionAssist(null); setActivePanel("目录"); }} />}
+          {activePanel !== "目录" && activePanel !== "主题" && activePanel !== "AI 阅读" && activePanel !== "阅读索引" && activePanel !== "图形组织器" && activePanel !== "书签" && activePanel !== "笔记" && activePanel !== "人物" && activePanel !== "组织" && activePanel !== "时间线" && activePanel !== "地点" && activePanel !== "解惑" && <FacetIndexPanel title={activePanel} category={bookProfile?.category} />}
         </div>
         <div className="side-book-meta"><span>共 {book.chapters.length} 节</span><span>{localFormatLabel(book)}</span></div>
       </aside>
@@ -1376,16 +1416,13 @@ export function App() {
         <header className="chapter-toolbar"><button className="chapter-step" disabled={chapterIndex === 0} onClick={() => selectChapter(chapterIndex - 1)} title="上一章" aria-label="上一章"><ChevronsLeft size={18} /></button><span>{chapter.title}</span><button className="chapter-step" disabled={chapterIndex === book.chapters.length - 1} onClick={() => selectChapter(chapterIndex + 1)} title="下一章" aria-label="下一章"><ChevronsRight size={18} /></button></header>
         <article className="epub-page">
           <div className="page-title-row"><h1>{chapter.title}</h1><span>{hasPriorReadingContext && <button className="page-recall" onClick={openCurrentRecoveryCard} title="主动回忆当前页之前的内容" aria-label="主动回忆"><History size={15} /></button>}{pageIndex + 1} / {pageCount} 页 {currentPageRead && <b className="read-page-tag">已读</b>}<button className={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "page-bookmark active" : "page-bookmark"} onClick={toggleBookmark} title={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "取消书签" : "添加书签"} aria-label="切换书签"><Bookmark size={16} /></button></span></div>
-          <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}><div className="page-track" ref={pageTrackRef} style={{ "--page-width": `${pageWidth}px` }}>{currentPageParagraphs.map(({ text, paragraphIndex, segmentIndex }) => <p className={selectedParagraph === paragraphIndex ? "is-selected" : ""} id={`paragraph-${paragraphIndex}`} key={`${chapter.id}-${paragraphIndex}-${segmentIndex}`} onClick={() => selectParagraph(paragraphIndex)}>{text}{selectedParagraph === paragraphIndex && <span className="selection-tools" role="toolbar" aria-label="段落阅读辅助"><button onClick={(event) => { event.stopPropagation(); setDrawerOpen(true); }}><Clock3 size={14} /> 前文</button><button onClick={(event) => { event.stopPropagation(); setActivePanel("人物"); }}><Network size={14} /> 出处</button></span>}</p>)}</div></div>
+          <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}><div className="page-track" ref={pageTrackRef} style={{ "--page-width": `${pageWidth}px` }}>{currentPageParagraphs.map(({ text, paragraphIndex, segmentIndex }) => <p className={selectedParagraph === paragraphIndex ? "is-selected" : ""} id={`paragraph-${paragraphIndex}`} key={`${chapter.id}-${paragraphIndex}-${segmentIndex}`} onClick={() => selectParagraph(paragraphIndex)}>{text}</p>)}</div></div>
         </article>
         <footer className="reader-footer"><button className="page-step" disabled={pageIndex === 0} onClick={() => turnPage(-1)} title="上一页" aria-label="上一页"><ChevronLeft size={17} /></button><span>第 {pageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button className="page-step" disabled={pageIndex === pageCount - 1} onClick={() => turnPage(1)} title="下一页" aria-label="下一页"><ChevronRight size={17} /></button></footer>
       </section>
-      {drawerOpen && <section className="context-drawer"><div className="drawer-handle" /><header className="drawer-header"><div><span className="eyebrow">阅读上下文</span><strong>{chapter.title} · 第 {(selectedParagraph ?? 0) + 1} 段</strong></div><button onClick={() => setDrawerOpen(false)} title="收起阅读上下文"><X size={18} /></button></header><div className="context-grid"><section><h2><Sparkles size={17} /> 本地阅读提示</h2><p>这段内容位于《{book.title}》的“{chapter.title}”。选择其他段落后，可在此保留它与当前章节的上下文。</p>{selectedIndexEntries.length > 0 && <div className="context-entities">{selectedIndexEntries.map((entry) => <button key={entry.id} onClick={() => openIndexEntry(entry)}>{entry.name}</button>)}</div>}<span className="local-note">实体与日期均从本地原文识别，点击可回到其首个证据位置。</span></section><section><h2><FileText size={17} /> ContextCite</h2>{contextCites.length ? contextCites.map((item) => <button className="context-cite" key={item.id} onClick={() => openSearchResult(item)}><small>{item.cite.label} {item.cite.source}</small><span>{item.cite.quote}</span><em>{item.matchSources.join(" · ")}</em></button>) : <p className="context-empty">暂无可追溯的相关证据。</p>}</section><section><h2><Clock3 size={17} /> 相邻原文</h2>{contextualParagraphs.map((paragraph, index) => <button className="context-excerpt" key={paragraph} onClick={() => jumpToParagraph(Math.max(0, (selectedParagraph ?? 0) - 1) + index)}>{paragraph.slice(0, 86)}{paragraph.length > 86 ? "…" : ""}</button>)}</section><section><h2><FileText size={17} /> 出处</h2><dl className="source-data"><div><dt>书名</dt><dd>{book.title}</dd></div><div><dt>章节</dt><dd>{chapter.title}</dd></div><div><dt>位置</dt><dd>第 {(selectedParagraph ?? 0) + 1} 段</dd></div><div><dt>版本</dt><dd>{book.publisher || localFormatLabel(book)}</dd></div></dl><button className="source-jump" onClick={() => jumpToParagraph(selectedParagraph ?? 0)}>回到原文 <ChevronRight size={15} /></button></section></div></section>}
       {searchOpen && <ReaderSearchOverlay bookTitle={book.title} query={searchQuery} setQuery={setSearchQuery} results={searchResults} onSelect={openSearchResult} onClose={() => setSearchOpen(false)} />}
-      {!drawerOpen && selectedParagraph !== null && <button className="open-context" onClick={() => setDrawerOpen(true)}><Lightbulb size={17} /> 打开阅读上下文</button>}
       {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} relationAvailable={contextRelationships.length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
       {noteComposerOpen && <NoteComposer draft={noteDraft} setDraft={setNoteDraft} selection={selectionBloom?.text || ""} onClose={() => setNoteComposerOpen(false)} onSave={saveNote} />}
-      {analysisSummaryOpen && analysisRecord?.summary && <AnalysisSummaryModal summary={analysisRecord.summary} onClose={() => setAnalysisSummaryOpen(false)} />}
       {relationshipOpen && <RelationshipWorkspace relationships={contextRelationships} onEvidence={openRelationshipEvidence} onClose={() => { setRelationshipOpen(false); setActivePanel("目录"); }} />}
       {organizerOpen && <OrganizerWorkspace type={organizerOpen} suggestions={organizerSuggestions} index={bookIndex} traceMemory={bookMemory} onEvidence={openSearchResult} onClose={() => { setOrganizerOpen(null); setActivePanel("目录"); }} />}
       {notice && <div className="toast" role="status">{notice}</div>}
@@ -1622,6 +1659,31 @@ function SelectionBloom({ selection, theme, relationAvailable = true, onAction, 
       <button className="bloom-core" type="button" onClick={onClose} title="收起辅助选项" aria-label="收起辅助选项"><span>{selection.text}</span><X size={13} /></button>
     </div>
   </div>;
+}
+
+function SelectionAssistPanel({ assist, onEvidence, onClose }) {
+  const text = summaryText(assist?.text);
+  const cites = Array.isArray(assist?.cites) ? assist.cites : [];
+  return <section className="selection-assist-panel">
+    <header className="reader-ai-hero">
+      <i><Lightbulb size={20} /></i>
+      <div>
+        <strong>选文解惑</strong>
+        <span>先看选中原文，再按需跳回证据。</span>
+      </div>
+      <button type="button" className="icon-button" onClick={onClose} title="关闭解惑" aria-label="关闭解惑"><X size={16} /></button>
+    </header>
+    {text ? <blockquote className="selection-assist-quote">{text}</blockquote> : <p className="reader-panel-empty">还没有选中文本。</p>}
+    <div className="selection-assist-cites">
+      <h3>相关出处</h3>
+      {cites.length ? cites.map((item) => (
+        <button type="button" key={item.id || `${item.chapterIndex}-${item.paragraphIndex}`} onClick={() => onEvidence(item)}>
+          <small>{item.cite?.label || "出处"} · {item.chapterTitle || `第 ${(item.chapterIndex || 0) + 1} 节`}</small>
+          <span>{summaryText(item.excerpt || item.quote || item.cite?.quote)}</span>
+        </button>
+      )) : <p className="reader-panel-empty">暂无直接相关的原文证据。</p>}
+    </div>
+  </section>;
 }
 
 function ReaderThemePanel({ theme, onChange }) {

@@ -13,11 +13,11 @@
       "pageIndex": 29,
       "pageCount": 30
     },
-    "generatedAt": "2026-07-20T11:55:58.017Z",
+    "generatedAt": "2026-07-21T11:16:07.091Z",
     "evaluationBasis": "Objective checks plus Agentic-style dimensions: task success, groundedness, relevance, completeness, concision, safety/no-spoiler, and user usefulness."
   },
   "scores": {
-    "overall": 72,
+    "overall": 76,
     "evidenceGrounding": 100,
     "scopeSafety": 100,
     "noSpoiler": 100,
@@ -25,7 +25,27 @@
     "coverage": 0,
     "priorityCalibration": 100,
     "nonRedundancy": 100,
-    "jsonFormat": 100
+    "jsonFormat": 100,
+    "schemaValidity": 100,
+    "noUndefined": 100,
+    "noiseRate": 0,
+    "recoveryFit": 100
+  },
+  "recovery": {
+    "score": 100,
+    "checks": [
+      {
+        "id": "firstPageSuppressed",
+        "pass": true
+      },
+      {
+        "id": "midSuppressedOk",
+        "pass": true
+      }
+    ],
+    "firstPageSuppressed": true,
+    "midKeyPoints": 0,
+    "midPrerequisites": 0
   },
   "counts": {
     "paragraphs": 146,
@@ -38,6 +58,7 @@
   "summary": [
     "候选池 80 个，ContextCite 证据 16 条，模型输出 0 条。",
     "证据有效率 100，相关性 0，覆盖率 0，优先级校准 100。",
+    "schema 100，noUndefined 100，noiseRate 0，recoveryFit 100。",
     "未发现证据越界或明显无效证据。"
   ],
   "topCandidates": [
@@ -977,122 +998,6 @@
     },
     "traceMemory": null
   },
-  "typeSmoke": {
-    "passed": true,
-    "cases": [
-      {
-        "id": "science",
-        "profile": "science",
-        "category": "科普 / 自然科学",
-        "expectedMatched": [
-          "concepts",
-          "definitions",
-          "mechanisms"
-        ],
-        "candidateTypes": [
-          "concept",
-          "event"
-        ],
-        "candidates": [
-          {
-            "type": "concept",
-            "name": "限制因子原理",
-            "score": 5
-          },
-          {
-            "type": "event",
-            "name": "限制因子原理解释了为什么二氧化碳或温度成为瓶颈时，增加光照不再提高效率",
-            "score": 4
-          }
-        ],
-        "passed": true,
-        "forbiddenFound": []
-      },
-      {
-        "id": "business",
-        "profile": "business",
-        "category": "商业 / 管理",
-        "expectedMatched": [
-          "frameworks",
-          "cases",
-          "metrics"
-        ],
-        "candidateTypes": [
-          "concept"
-        ],
-        "candidates": [
-          {
-            "type": "concept",
-            "name": "一家企业采用三层增长框架",
-            "score": 3
-          },
-          {
-            "type": "concept",
-            "name": "毛利率",
-            "score": 3
-          }
-        ],
-        "passed": true,
-        "forbiddenFound": []
-      },
-      {
-        "id": "fiction",
-        "profile": "fiction",
-        "category": "小说 / 文学",
-        "expectedMatched": [
-          "people",
-          "relationships",
-          "plot"
-        ],
-        "candidateTypes": [
-          "event"
-        ],
-        "candidates": [
-          {
-            "type": "event",
-            "name": "林嘉把密信藏了起来，因为它证明陈珂背叛了城防军",
-            "score": 4
-          }
-        ],
-        "passed": true,
-        "forbiddenFound": []
-      },
-      {
-        "id": "technology",
-        "profile": "technology",
-        "category": "技术 / 编程",
-        "expectedMatched": [
-          "concepts",
-          "apis",
-          "flows"
-        ],
-        "candidateTypes": [
-          "concept",
-          "event"
-        ],
-        "candidates": [
-          {
-            "type": "concept",
-            "name": "重试策略",
-            "score": 5
-          },
-          {
-            "type": "event",
-            "name": "重试策略记录失败任务、退避时间和应该恢复处理的检查点",
-            "score": 4
-          },
-          {
-            "type": "concept",
-            "name": "后台任务队列",
-            "score": 3
-          }
-        ],
-        "passed": true,
-        "forbiddenFound": []
-      }
-    ],
-    "criteria": "Each major book type resolves to its own memory anchors and does not force people/place candidates for concept-led nonfiction fixtures."
-  },
   "pass": {
     "passed": true,
     "reasons": [],
@@ -1102,6 +1007,9 @@
       "scopeSafety": "100",
       "noSpoiler": "100",
       "relevance": ">= 75",
+      "noUndefined": "100 when live",
+      "schemaValidity": ">= 90 when live",
+      "recoveryFit": ">= 80",
       "judgeDimensions": ">= 3 when --judge is used"
     }
   }

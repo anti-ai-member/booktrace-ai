@@ -5,6 +5,8 @@ import JSZip from "jszip";
 import { ChatOpenAI } from "@langchain/openai";
 import { buildMemoryCandidates, buildMemoryEvidenceStore, locateEvidence } from "../src/memoryEngine.js";
 import { resolveTraceProfile, traceProfileForPrompt } from "../src/traceProfiles.js";
+import { buildRecoveryPlan } from "../src/contextBuilder.js";
+import { bookMemoryFromLegacy, cleanText, normalizeBookMemory } from "../src/memoryModels.js";
 
 const DEFAULT_BOOK_HINT = "长征";
 const DEFAULT_REPORT = "reports/trace-eval-long-march-30p.json";
@@ -110,15 +112,22 @@ function evaluateTrace({ book, scoped, traceProfile, candidates, supportingEvide
   const coverageScore = scoreCandidateCoverage(entries, candidates);
   const formatScore = scoreFormat(result);
   const noSpoilerScore = evidenceChecks.some((item) => !item.inScope) ? 0 : 100;
+  const schemaValidity = scoreSchemaValidity(result);
+  const noUndefined = scoreNoUndefined(result, entries);
+  const noiseRate = scoreNoiseRate(entries, sourceMap);
+  const recovery = evaluateRecoveryCard({ book, scoped, result });
   const overall = Math.round(
-    (0.2 * evidenceScore)
-    + (0.14 * relevanceScore)
-    + (0.14 * coverageScore)
-    + (0.12 * priorityScore)
-    + (0.12 * noSpoilerScore)
-    + (0.1 * redundancyScore)
-    + (0.1 * formatScore)
-    + (0.08 * scopeScore)
+    (0.16 * evidenceScore)
+    + (0.12 * relevanceScore)
+    + (0.12 * coverageScore)
+    + (0.1 * priorityScore)
+    + (0.1 * noSpoilerScore)
+    + (0.08 * redundancyScore)
+    + (0.08 * formatScore)
+    + (0.06 * scopeScore)
+    + (0.06 * schemaValidity)
+    + (0.06 * noUndefined)
+    + (0.06 * (100 - noiseRate))
   );
 
   const failures = evidenceChecks.filter((item) => !item.valid || !item.inScope);
@@ -142,7 +151,12 @@ function evaluateTrace({ book, scoped, traceProfile, candidates, supportingEvide
       priorityCalibration: priorityScore,
       nonRedundancy: redundancyScore,
       jsonFormat: formatScore,
+      schemaValidity,
+      noUndefined,
+      noiseRate,
+      recoveryFit: recovery.score,
     },
+    recovery,
     counts: {
       paragraphs: scoped.chapters.reduce((sum, chapter) => sum + chapter.paragraphs.length, 0),
       candidates: candidates.length,
@@ -154,6 +168,7 @@ function evaluateTrace({ book, scoped, traceProfile, candidates, supportingEvide
     summary: [
       `候选池 ${candidates.length} 个，ContextCite 证据 ${supportingEvidence.length} 条，模型输出 ${entries.length} 条。`,
       `证据有效率 ${evidenceScore}，相关性 ${relevanceScore}，覆盖率 ${coverageScore}，优先级校准 ${priorityScore}。`,
+      `schema ${schemaValidity}，noUndefined ${noUndefined}，noiseRate ${noiseRate}，recoveryFit ${recovery.score}。`,
       failures.length ? `发现 ${failures.length} 条证据或范围问题，请看 failures。` : "未发现证据越界或明显无效证据。",
     ],
     topCandidates: candidates.slice(0, 20),
@@ -282,6 +297,9 @@ function buildPassStatus(report) {
   if (outputMode && report.scores.scopeSafety !== 100) reasons.push(`scopeSafety ${report.scores.scopeSafety} != 100`);
   if (outputMode && report.scores.noSpoiler !== 100) reasons.push(`noSpoiler ${report.scores.noSpoiler} != 100`);
   if (outputMode && report.scores.relevance < 75) reasons.push(`relevance ${report.scores.relevance} < 75`);
+  if (outputMode && report.scores.noUndefined < 100) reasons.push(`noUndefined ${report.scores.noUndefined} < 100`);
+  if (outputMode && report.scores.schemaValidity < 90) reasons.push(`schemaValidity ${report.scores.schemaValidity} < 90`);
+  if (report.recovery && report.recovery.score < 80) reasons.push(`recoveryFit ${report.recovery.score} < 80`);
   if (report.judge) {
     Object.entries(report.judge.scores)
       .filter(([, score]) => score < 3)
@@ -297,6 +315,9 @@ function buildPassStatus(report) {
       scopeSafety: "100",
       noSpoiler: "100",
       relevance: ">= 75",
+      noUndefined: "100 when live",
+      schemaValidity: ">= 90 when live",
+      recoveryFit: ">= 80",
       judgeDimensions: ">= 3 when --judge is used",
     },
   };
@@ -413,6 +434,97 @@ function scoreFormat(result) {
   const required = ["people", "organizations", "places", "timeline", "relationships"];
   const present = required.filter((key) => Array.isArray(index[key])).length;
   return Math.round((present / required.length) * 100);
+}
+
+function scoreSchemaValidity(result) {
+  const index = result.index || {};
+  const memory = result.bookMemory || result.traceMemory || {};
+  let checks = 0;
+  let pass = 0;
+  ["people", "organizations", "places", "timeline", "relationships"].forEach((key) => {
+    checks += 1;
+    if (Array.isArray(index[key])) pass += 1;
+  });
+  if (memory && typeof memory === "object") {
+    ["entities", "timeline", "topics", "arguments", "episodic", "relationships"].forEach((key) => {
+      checks += 1;
+      if (!memory[key] || Array.isArray(memory[key])) pass += 1;
+    });
+  }
+  return checks ? Math.round((pass / checks) * 100) : 100;
+}
+
+function scoreNoUndefined(result, entries) {
+  const texts = [
+    ...entries.flatMap((entry) => [entry.name, entry.summary, entry.detail, entry.title, entry.source, entry.target, entry.relation]),
+    result.profile?.category,
+    ...(result.profile?.facets || []),
+  ].map((value) => String(value ?? "").trim()).filter(Boolean);
+  if (!texts.length) return 100;
+  const undefinedHits = texts.filter((text) => /^(undefined|null|nan)$/i.test(text) || text.includes("undefined"));
+  return Math.round(((texts.length - undefinedHits.length) / texts.length) * 100);
+}
+
+function scoreNoiseRate(entries, sourceMap) {
+  if (!entries.length) return 0;
+  const noisy = entries.filter((entry) => {
+    const text = `${entry.name || ""} ${entry.summary || ""}`;
+    const quote = entry.evidence?.quote || entry.evidenceQuote || "";
+    const birthNoise = /出生|生于|籍贯|祖籍|\d{1,3}岁/.test(text);
+    const publishNoise = /出版社|版权|目录|ISBN/.test(text);
+    const weakQuote = quote && ![...sourceMap.values()].some((paragraph) => paragraph.includes(String(quote).slice(0, 12)));
+    return birthNoise || publishNoise || weakQuote;
+  }).length;
+  return Math.round((noisy / entries.length) * 100);
+}
+
+function evaluateRecoveryCard({ book, scoped, result }) {
+  const firstPageCursor = { chapterIndex: 0, paragraphIndex: 0, pageIndex: 0, pageCount: scoped.pages.length || 1 };
+  const midCursor = scoped.cursor || firstPageCursor;
+  const bookMemory = normalizeBookMemory(
+    result.bookMemory || bookMemoryFromLegacy({ index: result.index, traceMemory: result.traceMemory }),
+    { bookId: book.id || book.title || "book", cursor: midCursor },
+  );
+  const firstPlan = buildRecoveryPlan({
+    bookMemory,
+    cursor: firstPageCursor,
+    currentText: [],
+    reader: {},
+    book,
+  });
+  const midPlan = buildRecoveryPlan({
+    bookMemory,
+    cursor: midCursor,
+    currentText: scoped.chapters.slice(-1).flatMap((chapter) => chapter.paragraphs.slice(-3).map(paragraphText)),
+    reader: {},
+    book,
+  });
+  const checks = [];
+  checks.push({ id: "firstPageSuppressed", pass: Boolean(firstPlan?.suppressed) });
+  if (!midPlan?.suppressed) {
+    checks.push({ id: "anchorsAtMost3", pass: (midPlan.keyPoints || []).length <= 3 });
+    checks.push({ id: "anchorsAtLeast0", pass: (midPlan.keyPoints || []).length >= 0 });
+    checks.push({ id: "prereqsAtMost2", pass: (midPlan.prerequisites || []).length <= 2 });
+    const labels = [
+      midPlan.absenceLabel,
+      midPlan.positionLabel,
+      ...(midPlan.keyPoints || []).flatMap((item) => [item.title, item.detail]),
+      ...(midPlan.prerequisites || []).map((item) => item.text),
+      midPlan.question?.prompt,
+      midPlan.question?.answer,
+    ].map((value) => String(value ?? ""));
+    checks.push({ id: "noUndefinedLabels", pass: labels.every((text) => !/^(undefined|null|nan)$/i.test(text.trim()) && !text.includes("undefined")) });
+  } else {
+    checks.push({ id: "midSuppressedOk", pass: true });
+  }
+  const passed = checks.filter((item) => item.pass).length;
+  return {
+    score: checks.length ? Math.round((passed / checks.length) * 100) : 100,
+    checks,
+    firstPageSuppressed: Boolean(firstPlan?.suppressed),
+    midKeyPoints: midPlan?.suppressed ? 0 : (midPlan?.keyPoints || []).length,
+    midPrerequisites: midPlan?.suppressed ? 0 : (midPlan?.prerequisites || []).length,
+  };
 }
 
 function buildSourceMap(chapters) {
