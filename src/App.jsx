@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import { Background, Controls, ReactFlow } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import dagre from "dagre";
 import {
   ArrowLeft,
+  ArrowRight,
   BookOpen,
   Bookmark,
   Bot,
@@ -12,13 +14,18 @@ import {
   ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
   Clock3,
+  CircleHelp,
   Coffee,
+  Eye,
   FileText,
   Flower2,
   FolderPlus,
   History,
   Lightbulb,
+  Quote,
   ListFilter,
   MapPin,
   Minus,
@@ -40,15 +47,33 @@ import {
 } from "lucide-react";
 import { parseEpub } from "./epub.js";
 import { BOOK_TYPES, findBookType } from "./bookTaxonomy.js";
+import { buildMemoryCandidates, buildMemoryEvidenceStore, locateEvidence } from "./memoryEngine.js";
+import {
+  bookMemoryFromLegacy,
+  collectMemoryAnchors,
+  compatibilityTraceMemory,
+  hasBookMemoryContent,
+  normalizeBookMemory,
+  readingIndexFromBookMemory,
+  readerForgettingScore,
+  updateReaderMemory,
+} from "./memoryModels.js";
+import { buildRecoveryPlan } from "./contextBuilder.js";
+import { resolveTraceProfile, traceProfileForPrompt } from "./traceProfiles.js";
 import { UNIVERSAL_SKILLS, createReadingProgress, domainProgress, earnedBadges, getDomainConfig, resolveSkillDomain, unlockedSpecialSkills } from "./skillSystem.js";
 import { TalentConstellation } from "./TalentConstellation.jsx";
 
+const BUILT_IN_BOOK_ID = "long-march";
+const BUILT_IN_CACHE_VERSION = "long-march-v1";
 const BOOK_PATH = "/books/long-march.epub";
 const COVER_PATH = "/books/long-march-cover.jpeg";
 const APP_NAME = "书脉";
 const APP_SLOGAN = "读得清脉络，记得住来处";
 const SUPPORTED_IMPORT_ACCEPT = ".epub,.pdf,.txt,.html,.htm,.rtf,.doc,.docx,.mobi,.azw,.azw3,.fb2,.djvu,.cbz,.cbr,application/epub+zip,application/pdf,text/plain,text/html";
 const READABLE_IMPORT_FORMATS = new Set(["epub", "pdf"]);
+const TRACE_ANALYSIS_VERSION = "trace-v5";
+const PAGE_COLUMN_GAP = 64;
+const RECOVERY_CARD_MIN_ABSENCE_MS = 12 * 60 * 60 * 1000;
 const PLANNED_BOOK_FORMATS = new Map([
   ["pdf", "PDF"],
   ["txt", "TXT"],
@@ -67,9 +92,15 @@ const PLANNED_BOOK_FORMATS = new Map([
 ]);
 const DEFAULT_CATEGORIES = ["历史纪实", "军事", "中国近现代史"];
 const DEFAULT_AI_SETTINGS = { provider: "deepseek", model: "deepseek-v4-flash", analysisMode: "read", autoPageThreshold: 5 };
+/** Continued-reading recovery cards default to DeepSeek Pro with thinking mode. */
+const RECOVERY_MODEL_BY_PROVIDER = {
+  deepseek: "deepseek-v4-pro",
+  openai: "gpt-4.1-mini",
+};
 const LIBRARY_DB_NAME = "shumai-library";
 const LIBRARY_DB_VERSION = 1;
 const LIBRARY_STORE = "books";
+const EMPTY_READING_INDEX = { people: [], organizations: [], places: [], timeline: [], relationships: [] };
 const READING_THEMES = [
   { id: "plain", name: "素笺", detail: "清透留白", icon: BookOpen },
   { id: "lotus", name: "荷花", detail: "淡青水色", icon: Flower2 },
@@ -103,6 +134,86 @@ function loadStored(name, fallback) {
   }
 }
 
+function yieldToBrowser() {
+  return new Promise((resolve) => {
+    if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+      window.requestIdleCallback(resolve, { timeout: 120 });
+      return;
+    }
+    requestAnimationFrame(() => setTimeout(resolve, 0));
+  });
+}
+
+async function buildMemoryCandidatesAsync(chapters = [], traceProfile = null, onProgress) {
+  const merged = new Map();
+  const mergeCandidate = (candidate) => {
+    const id = candidate.id || `${candidate.type}:${candidate.name}`;
+    const current = merged.get(id);
+    if (!current) {
+      merged.set(id, {
+        ...candidate,
+        occurrences: [...(candidate.occurrences || [])],
+        contexts: [...(candidate.contexts || [])],
+      });
+      return;
+    }
+    current.count += candidate.count || 1;
+    current.impactHint = Math.max(current.impactHint || 0, candidate.impactHint || 0);
+    current.occurrences = [...current.occurrences, ...(candidate.occurrences || [])].slice(0, 5);
+    current.contexts = [...current.contexts, ...(candidate.contexts || [])].slice(0, 3);
+  };
+
+  for (let chapterIndex = 0; chapterIndex < chapters.length; chapterIndex += 1) {
+    const chapter = chapters[chapterIndex];
+    const paragraphs = chapter.paragraphs || [];
+    const batchSize = paragraphs.length > 120 ? 80 : Math.max(1, paragraphs.length);
+    for (let offset = 0; offset < paragraphs.length; offset += batchSize) {
+      const partialChapter = {
+        ...chapter,
+        paragraphs: paragraphs.slice(offset, offset + batchSize).map((paragraph, paragraphOffset) => (
+          typeof paragraph === "string"
+            ? { text: paragraph, paragraphIndex: offset + paragraphOffset }
+            : paragraph
+        )),
+      };
+      buildMemoryCandidates([partialChapter], traceProfile).forEach(mergeCandidate);
+      onProgress?.(merged.size);
+      await yieldToBrowser();
+    }
+    if (!paragraphs.length) await yieldToBrowser();
+  }
+
+  return [...merged.values()]
+    .map((item) => ({
+      ...item,
+      occurrences: (item.occurrences || []).slice(0, 5),
+      contexts: (item.contexts || []).slice(0, 3),
+    }))
+    .sort((left, right) => (right.impactHint || 0) - (left.impactHint || 0) || (right.count || 0) - (left.count || 0))
+    .slice(0, 80);
+}
+
+async function parseEpubInWorker(fileOrBlob) {
+  if (typeof Worker === "undefined") return parseEpub(fileOrBlob);
+  const buffer = await fileOrBlob.arrayBuffer();
+  return new Promise((resolve, reject) => {
+    const id = `epub-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const worker = new Worker(new URL("./epubWorker.js", import.meta.url), { type: "module" });
+    const cleanup = () => worker.terminate();
+    worker.onmessage = (event) => {
+      if (event.data?.id !== id) return;
+      cleanup();
+      if (event.data.ok) resolve(event.data.parsed);
+      else reject(new Error(event.data.error || "EPUB 解析失败"));
+    };
+    worker.onerror = (event) => {
+      cleanup();
+      reject(new Error(event.message || "EPUB Worker 解析失败"));
+    };
+    worker.postMessage({ id, buffer }, [buffer]);
+  });
+}
+
 function openLibraryDb() {
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(LIBRARY_DB_NAME, LIBRARY_DB_VERSION);
@@ -132,7 +243,7 @@ async function loadStoredLibraryBooks() {
 }
 
 async function saveStoredLibraryBook(book) {
-  if (!book || book.local) return;
+  if (!book || (book.local && !book.builtIn)) return;
   const db = await openLibraryDb();
   await new Promise((resolve, reject) => {
     const transaction = db.transaction(LIBRARY_STORE, "readwrite");
@@ -169,7 +280,6 @@ export function App() {
   const [screen, setScreen] = useState("shelf");
   const [book, setBook] = useState(null);
   const [libraryBooks, setLibraryBooks] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [categories, setCategories] = useState(() => loadStored("yuezhi-categories", DEFAULT_CATEGORIES));
   const [bookCategories, setBookCategories] = useState(() => loadStored("yuezhi-book-categories", DEFAULT_CATEGORIES));
@@ -177,7 +287,6 @@ export function App() {
   const [activeType, setActiveType] = useState("全部类型");
   const [typeBrowserExpanded, setTypeBrowserExpanded] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
-  const [facetMenuOpen, setFacetMenuOpen] = useState(false);
   const [pageTurn, setPageTurn] = useState("");
   const [categoryModalOpen, setCategoryModalOpen] = useState(false);
   const [deleteCandidate, setDeleteCandidate] = useState(null);
@@ -195,15 +304,16 @@ export function App() {
   const [shelfSearchOpen, setShelfSearchOpen] = useState(false);
   const [shelfSearchQuery, setShelfSearchQuery] = useState("");
   const [analysisSettings, setAnalysisSettings] = useState(() => ({ ...DEFAULT_AI_SETTINGS, ...loadStored("yuezhi-ai-settings", DEFAULT_AI_SETTINGS) }));
-  const [analysisSettingsOpen, setAnalysisSettingsOpen] = useState(false);
-  const [themeSettingsOpen, setThemeSettingsOpen] = useState(false);
   const [readingTheme, setReadingTheme] = useState(() => loadStored("yuezhi-reading-theme", "plain"));
   const [analysisSummaryOpen, setAnalysisSummaryOpen] = useState(false);
   const [relationshipOpen, setRelationshipOpen] = useState(false);
+  const [organizerOpen, setOrganizerOpen] = useState(null);
   const [readingProgress, setReadingProgress] = useState(() => ({ ...createReadingProgress(), ...loadStored("yuezhi-reading-progress", createReadingProgress()) }));
   const [aiIndex, setAiIndex] = useState(null);
+  const [memoryEvidenceStore, setMemoryEvidenceStore] = useState(null);
   const [bookProfile, setBookProfile] = useState(null);
   const [analysisRecord, setAnalysisRecord] = useState(null);
+  const [recoveryCard, setRecoveryCard] = useState(null);
   const [importStatus, setImportStatus] = useState(null);
   const [readPages, setReadPages] = useState([]);
   const [bookmarks, setBookmarks] = useState([]);
@@ -211,11 +321,13 @@ export function App() {
   const [noteComposerOpen, setNoteComposerOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState("");
   const [analysisState, setAnalysisState] = useState({ status: "idle", message: "尚未使用大模型分析" });
+  const [traceJob, setTraceJob] = useState({ status: "idle", message: "AI Trace 空闲" });
   const [notice, setNotice] = useState("");
   const inputRef = useRef(null);
   const pageCopyRef = useRef(null);
   const pageTrackRef = useRef(null);
   const readingPositionRestoreRef = useRef(null);
+  const recoveryCardJobRef = useRef(0);
   const readingStartedAtRef = useRef(Date.now());
 
   useEffect(() => { localStorage.setItem("yuezhi-categories", JSON.stringify(categories)); }, [categories]);
@@ -223,8 +335,7 @@ export function App() {
   useEffect(() => {
     if (!book) return;
     const storageKey = readingPositionStorageKey(book);
-    readingPositionRestoreRef.current = storageKey;
-    const saved = loadStored(storageKey, loadStored("yuezhi-reading-position", { chapterIndex: 0, pageIndex: 0 }));
+    const saved = loadStored(storageKey, { chapterIndex: 0, pageIndex: 0 });
     setChapterIndex(Math.min(Math.max(saved.chapterIndex || 0, 0), book.chapters.length - 1));
     setPageIndex(Math.max(saved.pageIndex || 0, 0));
   }, [book?.id, book?.title, book?.creator, book?.chapters.length]);
@@ -232,26 +343,32 @@ export function App() {
   useEffect(() => {
     if (!book) return;
     const storageKey = readingPositionStorageKey(book);
-    if (readingPositionRestoreRef.current === storageKey) {
-      readingPositionRestoreRef.current = null;
-      return;
-    }
-    localStorage.setItem(storageKey, JSON.stringify({ chapterIndex, pageIndex }));
+    localStorage.setItem(storageKey, JSON.stringify({ chapterIndex, pageIndex, updatedAt: Date.now() }));
   }, [book, chapterIndex, pageIndex]);
   useEffect(() => { localStorage.setItem("yuezhi-ai-settings", JSON.stringify(analysisSettings)); }, [analysisSettings]);
   useEffect(() => { localStorage.setItem("yuezhi-reading-theme", JSON.stringify(readingTheme)); }, [readingTheme]);
   useEffect(() => { localStorage.setItem("yuezhi-reading-progress", JSON.stringify(readingProgress)); }, [readingProgress]);
 
+  useEffect(() => () => {
+    recoveryCardJobRef.current += 1;
+  }, []);
+
+  useEffect(() => {
+    clearLegacyAnalysisStorage();
+  }, []);
+
   useEffect(() => {
     if (!book) return;
     const storageKey = analysisStorageKey(book);
-    const storedRecord = loadStored(storageKey, loadStored(`yuezhi-analysis:${book.title}`, null));
-    const record = storedRecord ? { ...storedRecord, summary: normalizeAnalysisSummary(storedRecord.summary) } : null;
+    const storedRecord = loadStored(storageKey, null);
+    const record = storedRecord ? hydrateAnalysisRecord(storedRecord, book) : null;
     setReadPages(loadStored(readPagesStorageKey(book), []));
     setAnalysisRecord(record);
+    setRecoveryCard(record?.recoveryCard || null);
     setAiIndex(record?.index || null);
     setBookProfile(record?.profile || (book.bookType ? { category: book.bookType, facets: book.indexSchema || findBookType(book.bookType).facets } : null));
     setAnalysisState(record ? { status: "done", message: "已加载上次增量分析结果" } : { status: "idle", message: "尚未使用大模型分析" });
+    setTraceJob(record ? { status: "done", message: "已加载上次 Trace" } : { status: "idle", message: "AI Trace 空闲" });
     if (record) localStorage.setItem(storageKey, JSON.stringify(record));
   }, [book?.title, book?.creator, book?.chapters.length]);
 
@@ -266,31 +383,47 @@ export function App() {
   }, [book?.id, book?.title, book?.creator, book?.chapters.length]);
 
   useEffect(() => {
-    if (analysisSettings.analysisMode !== "auto" || analysisState.status === "loading" || !book) return;
+    if (analysisSettings.analysisMode !== "auto" || analysisState.status === "loading" || traceJob.status === "running" || !book) return;
     const latestRead = getLatestReadCursor();
     const unreadSinceAnalysis = countReadPagesAfter(readPages, analysisRecord?.cursor);
-    if (latestRead && unreadSinceAnalysis >= analysisSettings.autoPageThreshold) analyzeBook("read", true);
-  }, [readPages, analysisSettings.analysisMode, analysisSettings.autoPageThreshold, analysisRecord, analysisState.status, book]);
+    if (latestRead && unreadSinceAnalysis >= analysisSettings.autoPageThreshold) {
+      setTraceJob({ status: "queued", message: "AI Trace 已排队" });
+      const timer = window.setTimeout(() => analyzeBook("read", true), 120);
+      return () => window.clearTimeout(timer);
+    }
+  }, [readPages, analysisSettings.analysisMode, analysisSettings.autoPageThreshold, analysisRecord, analysisState.status, traceJob.status, book]);
 
   useEffect(() => {
     async function loadBuiltInBook() {
       try {
+        const storedBooks = await loadStoredLibraryBooks();
+        const importedBooks = storedBooks.filter((item) => !item.local);
+        const cachedBuiltIn = storedBooks.find((item) => item.id === BUILT_IN_BOOK_ID && item.builtInCacheVersion === BUILT_IN_CACHE_VERSION) || null;
+        const activeBookId = loadStored("shumai-active-book-id", "");
+        const cachedBooks = cachedBuiltIn ? [cachedBuiltIn, ...importedBooks] : importedBooks;
+        const activeCachedBook = cachedBooks.find((item) => item.id === activeBookId) || cachedBuiltIn || importedBooks[0] || null;
+        setLibraryBooks(cachedBooks);
+        if (activeCachedBook) {
+          setBook(activeCachedBook);
+          setChapterIndex((current) => Math.min(Math.max(current, 0), activeCachedBook.chapters.length - 1));
+        }
+        if (cachedBuiltIn) {
+          return;
+        }
+        await yieldToBrowser();
+
         const response = await fetch(BOOK_PATH);
         if (!response.ok) throw new Error("无法打开本地 EPUB 文件");
-        const parsed = await parseEpub(await response.blob());
-        const builtIn = { ...parsed, id: "long-march", fingerprint: "builtin:long-march", cover: COVER_PATH, bookType: "历史纪实 / 传记", indexSchema: findBookType("历史纪实 / 传记").facets, local: true };
-        const storedBooks = await loadStoredLibraryBooks();
-        const importedBooks = storedBooks.filter((item) => item.id !== builtIn.id && !item.local);
+        const parsed = await parseEpubInWorker(await response.blob());
+        const builtIn = { ...parsed, id: BUILT_IN_BOOK_ID, fingerprint: "builtin:long-march", cover: COVER_PATH, bookType: "历史纪实 / 传记", indexSchema: findBookType("历史纪实 / 传记").facets, local: true, builtIn: true, builtInCacheVersion: BUILT_IN_CACHE_VERSION };
+        await saveStoredLibraryBook(builtIn);
         const books = [builtIn, ...importedBooks];
-        const activeBookId = loadStored("shumai-active-book-id", builtIn.id);
         const activeBook = books.find((item) => item.id === activeBookId) || builtIn;
         setLibraryBooks(books);
-        setBook(activeBook);
+        setBook((current) => current || activeBook);
         setChapterIndex((current) => Math.min(Math.max(current, 0), activeBook.chapters.length - 1));
       } catch (error) {
         setLoadError(error.message || "解析 EPUB 时出现问题");
-      } finally {
-        setIsLoading(false);
       }
     }
     loadBuiltInBook();
@@ -335,17 +468,25 @@ export function App() {
     };
   }, [selectionBloom]);
 
+  useEffect(() => {
+    if (!recoveryCard) return;
+    setDrawerOpen(false);
+    setSelectedParagraph(null);
+    setSelectionBloom(null);
+  }, [recoveryCard]);
+
   const chapter = book?.chapters[chapterIndex];
+  const chapterPage = useMemo(() => paginateChapterWindow(chapter, pageIndex, pageWidth), [chapter, pageIndex, pageWidth]);
+  const visiblePageIndex = Math.min(pageIndex, Math.max(0, chapterPage.pageCount - 1));
+  const currentPageParagraphs = chapterPage.items || [];
+  const hasPriorReadingContext = visiblePageIndex > 0;
   useEffect(() => {
     function updatePageCount() {
       const viewport = pageCopyRef.current;
       if (!viewport) return;
-      const gap = 64;
-      const step = viewport.clientWidth + gap;
-      setPageWidth(viewport.clientWidth);
-      const count = Math.max(1, Math.ceil((viewport.scrollWidth + gap) / step));
-      setPageCount(count);
-      setPageIndex((index) => Math.min(index, count - 1));
+      const width = Math.round(viewport.clientWidth);
+      if (width <= 0) return;
+      setPageWidth(width);
     }
 
     const frame = requestAnimationFrame(updatePageCount);
@@ -355,11 +496,18 @@ export function App() {
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [chapter, pageWidth, screen]);
+  }, [chapter, screen]);
+
+  useEffect(() => {
+    const nextCount = Math.max(1, chapterPage.pageCount);
+    setPageCount(nextCount);
+    setPageIndex((index) => Math.min(index, nextCount - 1));
+  }, [chapterPage.pageCount]);
 
   useEffect(() => {
     const viewport = pageCopyRef.current;
-    if (viewport) viewport.scrollLeft = pageIndex * (viewport.clientWidth + 64);
+    if (!viewport || viewport.clientWidth <= 0) return;
+    viewport.scrollLeft = 0;
   }, [pageIndex, pageWidth]);
 
   useEffect(() => {
@@ -394,17 +542,53 @@ export function App() {
     return [...typeItems, ...categoryItems].slice(0, 6);
   }, [shelfBooks, categories, bookCategories]);
   const shelfLabel = activeType !== "全部类型" ? activeType : activeCategory === "全部" ? "本地书架" : activeCategory;
-  const searchResults = useMemo(() => searchBook(book?.chapters || [], searchQuery), [book, searchQuery]);
-  const fallbackIndex = useMemo(() => buildReadingIndex(book?.chapters || []), [book]);
-  const bookIndex = useMemo(() => normalizeReadingIndex(aiIndex || fallbackIndex), [aiIndex, fallbackIndex]);
+  const bookMemory = useMemo(
+    () => (analysisRecord?.bookMemory
+      ? normalizeBookMemory(analysisRecord.bookMemory)
+      : bookMemoryFromLegacy({ index: aiIndex, traceMemory: analysisRecord?.traceMemory }, { bookId: book?.id || book?.title || "book" })),
+    [analysisRecord?.bookMemory, analysisRecord?.traceMemory, aiIndex, book?.id, book?.title],
+  );
+  const bookIndex = useMemo(
+    () => normalizeReadingIndex(readingIndexFromBookMemory(bookMemory)),
+    [bookMemory],
+  );
+  const activeTraceProfile = useMemo(() => resolveTraceProfile(bookProfile?.category || book?.bookType, bookProfile?.facets || book?.indexSchema || []), [bookProfile, book?.bookType, book?.indexSchema]);
+  const currentEvidenceCursor = {
+    chapterIndex,
+    paragraphIndex: selectedParagraph ?? (chapter?.paragraphs?.length ? chapter.paragraphs.length - 1 : 0),
+  };
+  // Search/evidence may use the current open page even before it is marked read on leave.
+  const evidenceScopeCursor = laterCursor(getLatestReadCursor(), currentEvidenceCursor);
+  const searchResults = useMemo(() => locateEvidence(memoryEvidenceStore, {
+    query: searchQuery,
+    scopeCursor: evidenceScopeCursor,
+    currentCursor: { chapterIndex, paragraphIndex: selectedParagraph ?? 0 },
+    traceIndex: bookIndex,
+    topK: 12,
+  }), [memoryEvidenceStore, searchQuery, evidenceScopeCursor?.chapterIndex, evidenceScopeCursor?.paragraphIndex, chapterIndex, selectedParagraph, bookIndex]);
+
+  useEffect(() => {
+    let cancelled = false;
+    setMemoryEvidenceStore(null);
+    if (!book?.chapters?.length) return undefined;
+    const timer = window.setTimeout(async () => {
+      await yieldToBrowser();
+      if (cancelled) return;
+      // Build from read-bounded paragraphs even before AI Trace has filled the index.
+      const nextStore = buildMemoryEvidenceStore(book, bookIndex);
+      if (!cancelled) setMemoryEvidenceStore(nextStore);
+    }, 1200);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [book?.id, bookIndex]);
+
   const activeSkillDomain = resolveSkillDomain(book?.bookType, bookCategories);
   const activeSkillConfig = getDomainConfig(activeSkillDomain);
   const activeDomainProgress = domainProgress(readingProgress, activeSkillDomain);
   const activeSpecialSkills = unlockedSpecialSkills(readingProgress, activeSkillDomain);
-
-  useEffect(() => {
-    if (activePanel === "关系" && (bookIndex.relationships || []).length) setRelationshipOpen(true);
-  }, [activePanel, bookIndex]);
+  const organizerSuggestions = useMemo(() => suggestTraceOrganizers(bookIndex, bookMemory, activeTraceProfile), [bookIndex, bookMemory, activeTraceProfile]);
 
   useEffect(() => {
     if (screen !== "reader" || !book) return undefined;
@@ -446,6 +630,19 @@ export function App() {
     });
   }
 
+  function recordRecoveryInteraction(action, card = recoveryCard) {
+    if (!book) return;
+    const key = `shumai-recovery-metrics:${storageBookIdentity(book)}`;
+    const current = loadStored(key, { shown: 0, continued: 0, skipped: 0, evidence: 0, hint: 0, answer: 0, remembered: 0, missed: 0, updatedAt: null });
+    const next = {
+      ...current,
+      [action]: Number(current[action] || 0) + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    localStorage.setItem(key, JSON.stringify(next));
+    updateRecoveryMemoryState(book, card, action);
+  }
+
   function settleReadingTime() {
     if (screen !== "reader" || document.visibilityState !== "visible") return;
     const elapsedSeconds = Math.min(120, Math.floor((Date.now() - readingStartedAtRef.current) / 1000));
@@ -463,14 +660,40 @@ export function App() {
   function openShelfBook(nextBook) {
     const storageKey = readingPositionStorageKey(nextBook);
     const saved = loadStored(storageKey, { chapterIndex: 0, pageIndex: 0 });
-    readingPositionRestoreRef.current = storageKey;
-    setBook(nextBook);
-    setChapterIndex(Math.min(Math.max(saved.chapterIndex || 0, 0), nextBook.chapters.length - 1));
-    setPageIndex(Math.max(saved.pageIndex || 0, 0));
-    setScreen("reader");
+    const lastActivity = loadStored(readingActivityStorageKey(nextBook), null);
+    recoveryCardJobRef.current += 1;
+    const jobId = recoveryCardJobRef.current;
+    const sameBook = book && storageBookIdentity(book) === storageBookIdentity(nextBook);
+    const commitReaderOpen = () => {
+      if (!sameBook) setBook(nextBook);
+      setChapterIndex(Math.min(Math.max(saved.chapterIndex || 0, 0), nextBook.chapters.length - 1));
+      setPageIndex(Math.max(saved.pageIndex || 0, 0));
+      setScreen("reader");
+    };
+    if (sameBook) flushSync(commitReaderOpen);
+    else commitReaderOpen();
     setActivePanel("目录");
     setSelectedParagraph(null);
     setDrawerOpen(false);
+    setRecoveryCard(null);
+    scheduleRecoveryCardBuild(nextBook, { ...saved, pageWidth }, lastActivity, jobId);
+  }
+
+  function scheduleRecoveryCardBuild(nextBook, saved, lastActivity, jobId) {
+    const lastActivityTime = Number(lastActivity || 0);
+    if (lastActivityTime && Date.now() - lastActivityTime < RECOVERY_CARD_MIN_ABSENCE_MS) return;
+    const run = () => {
+      if (recoveryCardJobRef.current !== jobId) return;
+      const storedRecord = hydrateAnalysisRecord(loadStored(analysisStorageKey(nextBook), null), nextBook);
+      const memoryState = loadStored(recoveryMemoryStorageKey(nextBook), {});
+      const nextRecoveryCard = buildTraceRecoveryCard(nextBook, storedRecord?.bookMemory || storedRecord?.index, saved, lastActivity, storedRecord?.bookMemory || storedRecord?.traceMemory, memoryState) || buildRecoveryCard(nextBook, [], saved, lastActivity, memoryState);
+      if (recoveryCardJobRef.current === jobId) setRecoveryCard(nextRecoveryCard);
+    };
+    if (typeof window !== "undefined" && "requestIdleCallback" in window) {
+      window.requestIdleCallback(run, { timeout: 1800 });
+      return;
+    }
+    window.setTimeout(run, 600);
   }
 
   function selectParagraph(index) {
@@ -496,33 +719,39 @@ export function App() {
     setDrawerOpen(false);
   }
 
+  function openCurrentRecoveryCard() {
+    if (!hasPriorReadingContext) {
+      showNotice("第一页还没有前文可回忆");
+      return;
+    }
+    const cursor = { ...getReadCursor(), pageWidth };
+    const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
+    const card = buildTraceRecoveryCard(book, bookMemory, cursor, null, bookMemory, memoryState) || buildRecoveryCard(book, [], cursor, null, memoryState) || buildRecoveryCard(book, readPages, cursor, null, memoryState);
+    if (!card) {
+      showNotice("当前页之前还没有足够内容可回忆");
+      return;
+    }
+    setRecoveryCard(card);
+  }
+
   function openSearchResult(result) {
     setChapterIndex(result.chapterIndex);
-    setPageIndex(0);
+    setPageIndex(findPageForParagraphInChapter(book.chapters[result.chapterIndex], result.paragraphIndex, pageWidth));
     setSelectedParagraph(result.paragraphIndex);
     setDrawerOpen(false);
     setSearchOpen(false);
-    requestAnimationFrame(() => requestAnimationFrame(() => {
-      const viewport = pageCopyRef.current;
-      const target = document.getElementById(`paragraph-${result.paragraphIndex}`);
-      if (!viewport || !target) return;
-      setPageIndex(Math.round(target.offsetLeft / (viewport.clientWidth + 64)));
-    }));
     showNotice(`已定位到《${book.title}》· ${result.chapterTitle}`);
   }
 
   function jumpToParagraph(index) {
+    setPageIndex(findPageForParagraphInChapter(chapter, index, pageWidth));
     setSelectedParagraph(index);
     setDrawerOpen(false);
-    window.setTimeout(() => goToParagraph(index), 30);
     showNotice(`已回到本章第 ${index + 1} 段`);
   }
 
   function goToParagraph(index) {
-    const viewport = pageCopyRef.current;
-    const target = document.getElementById(`paragraph-${index}`);
-    if (!viewport || !target) return;
-    setPageIndex(Math.round(target.offsetLeft / (viewport.clientWidth + 64)));
+    setPageIndex(findPageForParagraphInChapter(chapter, index, pageWidth));
   }
 
   function openIndexEntry(entry) {
@@ -678,7 +907,7 @@ export function App() {
       const { parsePdf } = await import("./pdf.js");
       return parsePdf(file);
     }
-    return parseEpub(file);
+    return parseEpubInWorker(file);
   }
 
   function requestDeleteBook(targetBook) {
@@ -716,48 +945,168 @@ export function App() {
     const cursor = scope === "full" ? getFullBookCursor(book) : getLatestReadCursor();
     if (!cursor && scope === "read") {
       setAnalysisState({ status: "idle", message: "请先完整读完至少一页，再进行分析" });
+      setTraceJob({ status: "idle", message: "等待已读页" });
       return;
     }
     const newChapters = scope === "full" ? getFullBookContent(book.chapters) : getNewReadingContent(book.chapters, analysisRecord?.cursor, cursor);
     if (!newChapters.length) {
       setAnalysisState({ status: "done", message: "当前阅读位置没有新增内容可分析" });
+      setTraceJob({ status: "done", message: "没有新增已读内容" });
       if (!isAutomatic && analysisRecord?.summary) setAnalysisSummaryOpen(true);
       return;
     }
-    setAnalysisState({ status: "loading", message: "正在分析主线人物、地点与事件…" });
+    const traceProfile = traceProfileForPrompt(activeTraceProfile);
+    setTraceJob({ status: "running", message: "正在抽取候选锚点" });
+    setAnalysisState({ status: "loading", message: "AI Trace 正在整理已读内容…" });
     try {
+      await yieldToBrowser();
+      const candidates = await buildMemoryCandidatesAsync(newChapters, traceProfile, (count) => {
+        setTraceJob({ status: "running", message: `已整理候选锚点 ${count} 个` });
+      });
+      setTraceJob({ status: "running", message: `候选锚点 ${candidates.length} 个，正在检索证据` });
+      const candidateQuery = [
+        book.title,
+        book.creator,
+        traceProfile.category,
+        ...candidates.slice(0, 18).map((item) => item.name),
+        ...newChapters
+          .flatMap((chapter) => (chapter.paragraphs || []).slice(0, 2).map((item) => typeof item === "object" ? item.text : item))
+          .slice(0, 6),
+      ].filter(Boolean).join(" ");
+      await yieldToBrowser();
+      const supportingEvidence = locateEvidence(memoryEvidenceStore, {
+        query: candidateQuery,
+        scopeCursor: cursor,
+        currentCursor: cursor,
+        traceIndex: bookIndex,
+        topK: scope === "full" ? 18 : 12,
+      }).map((item) => ({
+        cite: item.cite,
+        chapterIndex: item.chapterIndex,
+        paragraphIndex: item.paragraphIndex,
+        chapterTitle: item.chapterTitle,
+        quote: item.cite?.quote || item.excerpt,
+        score: Number(item.score.toFixed(3)),
+        matchSources: item.matchSources,
+      }));
+      setTraceJob({ status: "running", message: "正在让模型判断主线相关性" });
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ provider: analysisSettings.provider, model: analysisSettings.model, scope, previousIndex: scope === "full" ? null : analysisRecord?.index, cursor, book: { title: book.title, creator: book.creator, chapters: newChapters } }),
+        body: JSON.stringify({
+          provider: analysisSettings.provider,
+          model: analysisSettings.model,
+          scope,
+          previousBookMemory: scope === "full" ? null : analysisRecord?.bookMemory || null,
+          previousIndex: scope === "full" ? null : analysisRecord?.index,
+          previousTraceMemory: scope === "full" ? null : analysisRecord?.traceMemory,
+          cursor,
+          traceProfile,
+          candidates,
+          supportingEvidence,
+          book: {
+            id: book.id,
+            title: book.title,
+            creator: book.creator,
+            bookType: bookProfile?.category || book.bookType,
+            indexSchema: bookProfile?.facets || book.indexSchema,
+            chapters: newChapters,
+          },
+        }),
       });
+      await yieldToBrowser();
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "分析服务暂不可用");
-      setAiIndex(result.index);
+      const nextBookMemory = normalizeBookMemory(result.bookMemory || {
+        index: result.index,
+        traceMemory: result.traceMemory,
+        cursor,
+        profile: result.profile,
+        traceProfile: result.traceProfile || traceProfile,
+      }, {
+        bookId: book.id || book.title || "book",
+        cursor,
+        profile: result.profile,
+        traceProfile: result.traceProfile || traceProfile,
+        supportingEvidence,
+      });
+      const nextIndex = normalizeReadingIndex(result.index || readingIndexFromBookMemory(nextBookMemory));
+      setAiIndex(nextIndex);
       setBookProfile(result.profile);
       setBook((current) => current ? { ...current, bookType: result.profile.category, indexSchema: result.profile.facets } : current);
       setLibraryBooks((items) => items.map((item) => item.id === book.id ? { ...item, bookType: result.profile.category, indexSchema: result.profile.facets } : item));
-      const record = { index: result.index, profile: result.profile, summary: normalizeAnalysisSummary(result.summary), cursor, updatedAt: new Date().toISOString() };
+      let nextRecoveryCard = null;
+      if (!isAutomatic) {
+        setTraceJob({ status: "running", message: "正在生成续读恢复卡" });
+        nextRecoveryCard = await requestModelRecoveryCard({
+          cursor,
+          traceProfile: result.traceProfile || traceProfile,
+          bookMemory: nextBookMemory,
+          supportingEvidence,
+          currentChapters: newChapters,
+        });
+      }
+      const record = {
+        bookMemory: nextBookMemory,
+        index: nextIndex,
+        profile: result.profile,
+        traceProfile: result.traceProfile || traceProfile,
+        traceMemory: result.traceMemory || compatibilityTraceMemory(nextBookMemory),
+        recoveryCard: nextRecoveryCard,
+        summary: normalizeAnalysisSummary(result.summary),
+        cursor,
+        updatedAt: new Date().toISOString(),
+      };
       setAnalysisRecord(record);
       localStorage.setItem(analysisStorageKey(book), JSON.stringify(record));
-      setAnalysisState({ status: "done", message: `已由 ${result.model} 提取主线索引` });
-      setAnalysisSettingsOpen(false);
-      if (isAutomatic) showNotice("已根据新增已读内容自动更新索引");
-      else setAnalysisSummaryOpen(true);
-      if (!isAutomatic) showNotice("本书索引已更新为大模型分析结果");
+      if (nextRecoveryCard) setRecoveryCard(nextRecoveryCard);
+      setAnalysisState({ status: "done", message: `已由 ${result.model} 更新续读恢复材料` });
+      setTraceJob({ status: "done", message: `恢复材料已更新到第 ${cursor.pageIndex + 1} 页` });
+      showNotice(isAutomatic ? "已根据新增已读内容自动准备恢复材料" : "续读恢复材料已更新");
     } catch (error) {
       setAnalysisState({ status: "error", message: error.message || "大模型分析失败" });
+      setTraceJob({ status: "error", message: error.message || "AI Trace 失败" });
+    }
+  }
+
+  async function requestModelRecoveryCard({ cursor, traceProfile, bookMemory, traceMemory, supportingEvidence, currentChapters }) {
+    const localFallback = buildRecoveryCard(book, readPages, cursor, null);
+    if (!supportingEvidence?.length) return localFallback;
+    try {
+      const response = await fetch("/api/recovery-card", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: analysisSettings.provider,
+          model: RECOVERY_MODEL_BY_PROVIDER[analysisSettings.provider] || RECOVERY_MODEL_BY_PROVIDER.deepseek,
+          thinking: analysisSettings.provider === "deepseek",
+          book: {
+            id: book.id,
+            title: book.title,
+            creator: book.creator,
+            bookType: bookProfile?.category || book.bookType,
+          },
+          cursor,
+          traceProfile,
+          bookMemory: bookMemory || null,
+          traceMemory: traceMemory || (bookMemory ? compatibilityTraceMemory(bookMemory) : null),
+          evidence: supportingEvidence,
+          currentText: flattenRecoverySource(currentChapters).slice(-10),
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Recovery card failed");
+      return normalizeRecoveryCard(result.card, localFallback);
+    } catch (error) {
+      console.warn("Recovery card fallback:", error);
+      return localFallback;
     }
   }
 
   function getReadCursor() {
-    const viewport = pageCopyRef.current;
-    const pageBoundary = viewport ? (pageIndex + 1) * (viewport.clientWidth + 64) : Number.POSITIVE_INFINITY;
-    const paragraphIndices = [...document.querySelectorAll(".page-track p[id^='paragraph-']")]
-      .filter((element) => element.offsetLeft < pageBoundary)
-      .map((element) => Number(element.id.replace("paragraph-", "")))
-      .filter(Number.isInteger);
-    return { chapterIndex, paragraphIndex: paragraphIndices.length ? Math.max(...paragraphIndices) : 0, pageIndex, pageCount };
+    const page = currentPageParagraphs || [];
+    const paragraphIndices = page.map((item) => item.paragraphIndex).filter(Number.isInteger);
+    return { chapterIndex, paragraphIndex: paragraphIndices.length ? Math.max(...paragraphIndices) : 0, pageIndex: visiblePageIndex, pageCount };
   }
 
   function closeDrawerOnBlank(event) {
@@ -777,19 +1126,47 @@ export function App() {
     const range = selection.getRangeAt(0);
     const rect = range.getBoundingClientRect();
     if (!rect.width && !rect.height) return;
-    const horizontalPadding = 142;
+    const paragraphElement = range.commonAncestorContainer?.nodeType === Node.ELEMENT_NODE
+      ? range.commonAncestorContainer.closest?.("p[id^='paragraph-']")
+      : range.commonAncestorContainer?.parentElement?.closest?.("p[id^='paragraph-']");
+    const paragraphId = paragraphElement?.id?.replace("paragraph-", "");
+    const paragraphIndexFromSelection = Number(paragraphId);
+    if (Number.isInteger(paragraphIndexFromSelection)) setSelectedParagraph(paragraphIndexFromSelection);
+    const horizontalPadding = 190;
     const x = Math.min(Math.max(rect.left + rect.width / 2, horizontalPadding), window.innerWidth - horizontalPadding);
-    const y = Math.min(rect.bottom + 18, window.innerHeight - 112);
-    setSelectionBloom({ text: text.length > 26 ? `${text.slice(0, 26)}…` : text, fullText: text, x, y });
+    const canFloatAbove = rect.top > 84;
+    const y = canFloatAbove ? rect.top - 18 : Math.min(rect.bottom + 58, window.innerHeight - 76);
+    setSelectionBloom({ text: text.length > 20 ? `${text.slice(0, 20)}…` : text, fullText: text, x, y, placement: canFloatAbove ? "above" : "below" });
   }
 
   function handleBloomAction(action) {
-    if (action !== "note") {
-      setSelectionBloom(null);
+    if (action === "note") {
+      setNoteDraft("");
+      setNoteComposerOpen(true);
       return;
     }
-    setNoteDraft("");
-    setNoteComposerOpen(true);
+    if (action === "source") {
+      setDrawerOpen(true);
+      showNotice("已打开出处与上下文");
+    } else if (action === "relation") {
+      if (!contextRelationships.length) {
+        showNotice("当前页附近还没有可靠关系证据");
+        setSelectionBloom(null);
+        return;
+      }
+      setActivePanel("目录");
+      setSidebarCollapsed(false);
+      setOrganizerOpen(null);
+      setRelationshipOpen(true);
+      showNotice("已打开上下文关系");
+    } else if (action === "recall") {
+      showNotice("回忆功能将基于已读 Trace 展开");
+    } else if (action === "question") {
+      showNotice("解惑功能将接入选中文本提问");
+    } else if (action === "favorite") {
+      toggleBookmark();
+    }
+    setSelectionBloom(null);
   }
 
   function saveNote() {
@@ -829,6 +1206,7 @@ export function App() {
     settleReadingTime();
     const cursor = getReadCursor();
     const pageId = `${cursor.chapterIndex}:${cursor.pageIndex}`;
+    localStorage.setItem(readingActivityStorageKey(book), JSON.stringify(Date.now()));
     const wasRead = readPages.some((page) => `${page.chapterIndex}:${page.pageIndex}` === pageId);
     if (!wasRead) recordProgress({ pages: 1, xp: 8 });
     setReadPages((pages) => {
@@ -878,12 +1256,12 @@ export function App() {
     });
   }
 
-  if (isLoading) {
-    return <main className="loading-screen"><div className="loader-mark"><BookOpen size={26} /></div><strong>正在解析《长征》</strong><span>书籍只在此浏览器中处理</span><div className="loading-line"><i /></div></main>;
+  if (loadError && !book && !libraryBooks.length && screen !== "shelf") {
+    return <main className="loading-screen"><div className="loader-mark"><FileText size={26} /></div><strong>无法打开这本书</strong><span>{loadError}</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 选择书籍文件</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
   }
 
-  if (loadError || !book) {
-    return <main className="loading-screen"><div className="loader-mark"><FileText size={26} /></div><strong>无法打开这本书</strong><span>{loadError}</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 选择书籍文件</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
+  if (!book && screen !== "shelf") {
+    return <main className="loading-screen"><div className="loader-mark"><BookOpen size={26} /></div><strong>书架还没有可阅读的书</strong><span>请先导入一本 EPUB 或 PDF。</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 导入书籍</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
   }
 
   if (screen === "skills") {
@@ -917,8 +1295,8 @@ export function App() {
           <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB、PDF；TXT、MOBI、AZW3 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
           {searchedShelfBooks.length ? <div className="book-grid">{searchedShelfBooks.map((shelfBook) => {
             const shelfState = shelfBookStates.get(shelfBook.id) || getBookShelfState(shelfBook);
-            return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || localFormatLabel(shelfBook)}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
-          })}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>你可以为《{book.title}》添加“{activeCategory}”标签。</span><button className="text-action" onClick={() => setCategoryModalOpen(true)}>管理分类</button></div>}
+            return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || localFormatLabel(shelfBook)}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onPointerDown={(event) => { if (event.button === 0) openShelfBook(shelfBook); }} onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
+          })}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>导入一本 EPUB 或 PDF 后就可以开始阅读。</span><button className="text-action" onClick={() => inputRef.current?.click()}>导入书籍</button></div>}
         </section>
         {shelfSearchOpen && <div className="library-search-panel"><div className="search-panel-head"><h2>{shelfSearchText ? "搜索结果" : "书架上的热门"}</h2><button onClick={() => setShelfSearchOpen(false)} aria-label="关闭搜索"><X size={20} /></button></div><div className="search-suggestion-grid">{(shelfSearchText ? searchedShelfBooks : shelfBooks).slice(0, 6).map((item) => <button className="search-suggestion-card" key={item.id} onClick={() => { setShelfSearchOpen(false); openShelfBook(item); }}><BookCover book={item} /><span>{item.title}</span><small>{item.bookType || localFormatLabel(item)}</small></button>)}{!shelfSearchText && shelfSearchSuggestions.map((item) => <button className="search-suggestion-card type-result" key={item.label} onClick={() => { setActiveType(item.label); setShelfSearchOpen(false); }}><i /><span>{item.label}</span><small>{item.count} 本</small></button>)}</div></div>}
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
@@ -929,13 +1307,25 @@ export function App() {
   }
 
   const contextualParagraphs = chapter.paragraphs.slice(Math.max(0, (selectedParagraph ?? 0) - 1), Math.min(chapter.paragraphs.length, (selectedParagraph ?? 0) + 2));
+  const contextCites = selectedParagraph !== null ? locateEvidence(memoryEvidenceStore, {
+    selectedText: chapter.paragraphs[selectedParagraph] || "",
+    scopeCursor: evidenceScopeCursor,
+    currentCursor: { chapterIndex, paragraphIndex: selectedParagraph },
+    traceIndex: bookIndex,
+    topK: 5,
+  }).filter((item) => !(item.chapterIndex === chapterIndex && item.paragraphIndex === selectedParagraph)).slice(0, 3) : [];
   const selectedIndexEntries = [...bookIndex.people, ...(bookIndex.organizations || []), ...bookIndex.timeline, ...bookIndex.places]
     .filter((entry) => entry.occurrences.some((occurrence) => occurrence.chapterIndex === chapterIndex && occurrence.paragraphIndex === selectedParagraph));
   const currentPageRead = isPageRead(chapterIndex, pageIndex);
-  const relationshipAvailable = (bookIndex.relationships || []).length > 0 && activeSpecialSkills.some(([name]) => /关系|指挥/.test(name));
-  const readerTabs = ["目录", ...new Set([...(bookProfile?.facets || ["人物", "时间线", "地点"]).slice(0, 6), ...(relationshipAvailable ? ["关系"] : [])])];
+  const contextRelationships = contextualRelationships(bookIndex.relationships || [], {
+    chapterIndex,
+    pageParagraphs: currentPageParagraphs,
+    selectedParagraph,
+    index: bookIndex,
+  });
+  const readerTabs = ["目录", ...new Set([...(bookProfile?.facets || []).slice(0, 6)])];
   return (
-    <main className={`reader-shell theme-${readingTheme}${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}`}>
+    <main className={`reader-shell theme-${readingTheme}${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen || organizerOpen ? " relationship-open" : ""}`}>
       <header className="reader-topbar">
         <div className="book-title" title={`${book.title} · ${book.creator}`}><BookOpen size={17} /><span>{book.title}</span><small>{book.creator}</small>{bookProfile && <small>{bookProfile.category}</small>}</div>
         <label className={searchOpen ? "reader-search-box active" : "reader-search-box"} role="search" aria-label="搜索书内内容" title="搜索书内内容">
@@ -944,58 +1334,63 @@ export function App() {
           <kbd>Ctrl K</kbd>
         </label>
         <div className="reader-status">
-          <div className="reader-progress" title={`阅读进度 ${progress}%`}><i><b style={{ width: `${progress}%` }} /></i><span>{progress}%</span></div>
-          <span title="本地阅读 · 无剧透"><ShieldCheck size={16} /> 本地阅读 · 无剧透</span>
+          <TraceStatusPill job={traceJob} />
+          <div className="reader-progress" title={`阅读进度 ${progress}%`} aria-label={`阅读进度 ${progress}%`}><i><b style={{ width: `${progress}%` }} /></i><span>{progress}%</span></div>
+          <span title="本地阅读 · 无剧透" aria-label="本地阅读 · 无剧透"><ShieldCheck size={16} /></span>
         </div>
       </header>
       <aside className="reader-sidebar">
-        <nav className="reader-tabs"><button className="back-to-shelf" title="返回书架" aria-label="返回书架" onClick={() => setScreen("shelf")}><ArrowLeft size={20} /><span>书架</span></button><button className={activePanel === "主题" ? "active theme-toolbar-trigger" : "theme-toolbar-trigger"} onClick={() => { setActivePanel("主题"); setFacetMenuOpen(false); setSidebarCollapsed(false); }} title="阅读主题" aria-label="阅读主题"><Palette size={20} /><span>主题</span></button><button className={activePanel === "目录" ? "active directory-tab" : "directory-tab"} title="目录" aria-label="目录" onClick={() => { setActivePanel("目录"); setFacetMenuOpen(false); setSidebarCollapsed(false); }}><ListFilter size={20} /><span>目录</span></button><button className={activePanel === "书签" ? "active reader-rail-button" : "reader-rail-button"} title="书签" aria-label={`书签（${bookmarks.length}）`} onClick={() => { setActivePanel("书签"); setFacetMenuOpen(false); setSidebarCollapsed(false); }}><Bookmark size={20} /><span>书签</span></button><button className={activePanel === "笔记" ? "active reader-rail-button" : "reader-rail-button"} title="笔记" aria-label={`笔记（${notes.length}）`} onClick={() => { setActivePanel("笔记"); setFacetMenuOpen(false); setSidebarCollapsed(false); }}><FileText size={20} /><span>笔记</span></button><div className="facet-picker"><button className={activePanel === "阅读索引" || readerTabs.includes(activePanel) && activePanel !== "目录" ? "facet-trigger active" : "facet-trigger"} title="阅读索引" aria-label="阅读索引" onClick={() => { setActivePanel("阅读索引"); setFacetMenuOpen(false); setSidebarCollapsed(false); }}><Sparkles size={18} /><span>阅读索引</span></button></div><button className={activePanel === "AI 阅读" ? "active analysis-settings-trigger ai-rail-trigger" : "analysis-settings-trigger ai-rail-trigger"} onClick={() => { setActivePanel("AI 阅读"); setFacetMenuOpen(false); setSidebarCollapsed(false); }} title="AI 阅读设置" aria-label="AI 阅读设置"><Bot size={21} /> <span>{analysisState.status === "done" ? "AI 索引" : "AI 阅读"}</span></button><button className="analysis-settings-trigger rail-toggle" onClick={() => setSidebarCollapsed((value) => !value)} title={sidebarCollapsed ? "展开阅读索引" : "收起阅读索引"} aria-label={sidebarCollapsed ? "展开阅读索引" : "收起阅读索引"}>{sidebarCollapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}</button></nav>
+        <nav className="reader-tabs"><button className="back-to-shelf" title="返回书架" aria-label="返回书架" onClick={() => setScreen("shelf")}><ArrowLeft size={20} /><span>书架</span></button><button className={activePanel === "主题" ? "active theme-toolbar-trigger" : "theme-toolbar-trigger"} onClick={() => { setActivePanel("主题"); setSidebarCollapsed(false); }} title="阅读主题" aria-label="阅读主题"><Palette size={20} /><span>主题</span></button><button className={activePanel === "目录" ? "active directory-tab" : "directory-tab"} title="目录" aria-label="目录" onClick={() => { setActivePanel("目录"); setSidebarCollapsed(false); }}><ListFilter size={20} /><span>目录</span></button><button className={activePanel === "书签" ? "active reader-rail-button" : "reader-rail-button"} title="书签" aria-label={`书签（${bookmarks.length}）`} onClick={() => { setActivePanel("书签"); setSidebarCollapsed(false); }}><Bookmark size={20} /><span>书签</span></button><button className={activePanel === "笔记" ? "active reader-rail-button" : "reader-rail-button"} title="笔记" aria-label={`笔记（${notes.length}）`} onClick={() => { setActivePanel("笔记"); setSidebarCollapsed(false); }}><FileText size={20} /><span>笔记</span></button>{readerTabs.length > 1 && <div className="facet-picker"><button className={activePanel === "阅读索引" || readerTabs.includes(activePanel) && activePanel !== "目录" ? "facet-trigger active" : "facet-trigger"} title="按需图谱" aria-label="按需图谱" onClick={() => { setActivePanel("阅读索引"); setSidebarCollapsed(false); }}><Sparkles size={18} /><span>按需图谱</span></button></div>}<button className={activePanel === "AI 阅读" ? "active analysis-settings-trigger ai-rail-trigger" : "analysis-settings-trigger ai-rail-trigger"} onClick={() => { setActivePanel("AI 阅读"); setSidebarCollapsed(false); }} title="续读恢复" aria-label="续读恢复"><Bot size={21} /> <span>续读恢复</span></button><button className="analysis-settings-trigger rail-toggle" onClick={() => setSidebarCollapsed((value) => !value)} title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>{sidebarCollapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}</button></nav>
         <div className="reader-side-content">
           {activePanel === "目录" && <div className="toc-list">{book.chapters.map((item, index) => <button className={index === chapterIndex ? "toc-row active" : "toc-row"} key={item.id} onClick={() => selectChapter(index)}><span>{index + 1}</span>{item.title}</button>)}</div>}
           {activePanel === "主题" && <ReaderThemePanel theme={readingTheme} onChange={setReadingTheme} />}
           {activePanel === "AI 阅读" && <ReaderAnalysisPanel settings={analysisSettings} setSettings={setAnalysisSettings} state={analysisState} onAnalyze={analyzeBook} />}
           {activePanel === "阅读索引" && <ReaderIndexPicker tabs={readerTabs.filter((tab) => tab !== "目录")} activePanel={activePanel} onSelect={(tab) => { setActivePanel(tab); setSidebarCollapsed(false); }} />}
+          {activePanel === "图形组织器" && <OrganizerPicker suggestions={organizerSuggestions.filter((item) => item.type !== "relationship")} active={organizerOpen || ""} onSelect={(type) => { setSidebarCollapsed(false); setRelationshipOpen(false); setOrganizerOpen(type); }} />}
           {activePanel === "书签" && <BookmarkList items={bookmarks} onOpen={openBookmark} onRemove={removeBookmark} />}
           {activePanel === "笔记" && <NoteList items={notes} onOpen={openNote} onRemove={removeNote} />}
           {activePanel === "人物" && <EntityIndexList title="人物" kind="person" items={bookIndex.people} icon={<Network size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠人物实体。" />}
           {activePanel === "组织" && <EntityIndexList title="组织" kind="organization" items={bookIndex.organizations || []} icon={<Network size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠组织实体。" />}
           {activePanel === "时间线" && <TimelineList items={bookIndex.timeline} activeChapter={chapterIndex} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} />}
           {activePanel === "地点" && <EntityIndexList title="地点" kind="place" items={bookIndex.places} icon={<MapPin size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠地点实体。" />}
-          {activePanel !== "目录" && activePanel !== "主题" && activePanel !== "AI 阅读" && activePanel !== "阅读索引" && activePanel !== "书签" && activePanel !== "笔记" && activePanel !== "人物" && activePanel !== "组织" && activePanel !== "时间线" && activePanel !== "地点" && <FacetIndexPanel title={activePanel} category={bookProfile?.category} />}
+          {activePanel !== "目录" && activePanel !== "主题" && activePanel !== "AI 阅读" && activePanel !== "阅读索引" && activePanel !== "图形组织器" && activePanel !== "书签" && activePanel !== "笔记" && activePanel !== "人物" && activePanel !== "组织" && activePanel !== "时间线" && activePanel !== "地点" && <FacetIndexPanel title={activePanel} category={bookProfile?.category} />}
         </div>
         <div className="side-book-meta"><span>共 {book.chapters.length} 节</span><span>{localFormatLabel(book)}</span></div>
       </aside>
       <section className="reading-stage">
-        <header className="chapter-toolbar"><button disabled={chapterIndex === 0} onClick={() => selectChapter(chapterIndex - 1)}><ChevronLeft size={18} /></button><span>{chapter.title}</span><button disabled={chapterIndex === book.chapters.length - 1} onClick={() => selectChapter(chapterIndex + 1)}><ChevronRight size={18} /></button></header>
+        {recoveryCard && <div className="recall-sheet-overlay" role="presentation">
+          <RecoveryCard
+            card={recoveryCard}
+            onTrack={recordRecoveryInteraction}
+            onClose={(action = "continue") => {
+              recordRecoveryInteraction(action, recoveryCard);
+              setRecoveryCard(null);
+            }}
+            onEvidence={(evidence) => {
+              recordRecoveryInteraction("evidence", recoveryCard);
+              setRecoveryCard(null);
+              openSearchResult(evidence);
+            }}
+          />
+        </div>}
+        <header className="chapter-toolbar"><button className="chapter-step" disabled={chapterIndex === 0} onClick={() => selectChapter(chapterIndex - 1)} title="上一章" aria-label="上一章"><ChevronsLeft size={18} /></button><span>{chapter.title}</span><button className="chapter-step" disabled={chapterIndex === book.chapters.length - 1} onClick={() => selectChapter(chapterIndex + 1)} title="下一章" aria-label="下一章"><ChevronsRight size={18} /></button></header>
         <article className="epub-page">
-          <div className="page-title-row"><h1>{chapter.title}</h1><span>{pageIndex + 1} / {pageCount} 页 {currentPageRead && <b className="read-page-tag">已读</b>}<button className={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "page-bookmark active" : "page-bookmark"} onClick={toggleBookmark} title={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "取消书签" : "添加书签"} aria-label="切换书签"><Bookmark size={16} /></button></span></div>
-          <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}><div className="page-track" ref={pageTrackRef} style={{ "--page-width": `${pageWidth}px` }}>{chapter.paragraphs.map((text, paragraphIndex) => <p className={selectedParagraph === paragraphIndex ? "is-selected" : ""} id={`paragraph-${paragraphIndex}`} key={`${chapter.id}-${paragraphIndex}`} onClick={() => selectParagraph(paragraphIndex)}>{text}{selectedParagraph === paragraphIndex && <span className="selection-tools" role="toolbar" aria-label="段落阅读辅助"><button onClick={(event) => { event.stopPropagation(); setDrawerOpen(true); }}><Clock3 size={14} /> 前文</button><button onClick={(event) => { event.stopPropagation(); setActivePanel("人物"); }}><Network size={14} /> 出处</button></span>}</p>)}</div></div>
+          <div className="page-title-row"><h1>{chapter.title}</h1><span>{hasPriorReadingContext && <button className="page-recall" onClick={openCurrentRecoveryCard} title="主动回忆当前页之前的内容" aria-label="主动回忆"><History size={15} /></button>}{pageIndex + 1} / {pageCount} 页 {currentPageRead && <b className="read-page-tag">已读</b>}<button className={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "page-bookmark active" : "page-bookmark"} onClick={toggleBookmark} title={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "取消书签" : "添加书签"} aria-label="切换书签"><Bookmark size={16} /></button></span></div>
+          <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}><div className="page-track" ref={pageTrackRef} style={{ "--page-width": `${pageWidth}px` }}>{currentPageParagraphs.map(({ text, paragraphIndex, segmentIndex }) => <p className={selectedParagraph === paragraphIndex ? "is-selected" : ""} id={`paragraph-${paragraphIndex}`} key={`${chapter.id}-${paragraphIndex}-${segmentIndex}`} onClick={() => selectParagraph(paragraphIndex)}>{text}{selectedParagraph === paragraphIndex && <span className="selection-tools" role="toolbar" aria-label="段落阅读辅助"><button onClick={(event) => { event.stopPropagation(); setDrawerOpen(true); }}><Clock3 size={14} /> 前文</button><button onClick={(event) => { event.stopPropagation(); setActivePanel("人物"); }}><Network size={14} /> 出处</button></span>}</p>)}</div></div>
         </article>
-        <footer className="reader-footer"><button disabled={pageIndex === 0} onClick={() => turnPage(-1)}><ChevronLeft size={17} /> 上一页</button><span>第 {pageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button disabled={pageIndex === pageCount - 1} onClick={() => turnPage(1)}>下一页 <ChevronRight size={17} /></button></footer>
+        <footer className="reader-footer"><button className="page-step" disabled={pageIndex === 0} onClick={() => turnPage(-1)} title="上一页" aria-label="上一页"><ChevronLeft size={17} /></button><span>第 {pageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button className="page-step" disabled={pageIndex === pageCount - 1} onClick={() => turnPage(1)} title="下一页" aria-label="下一页"><ChevronRight size={17} /></button></footer>
       </section>
-      {drawerOpen && <section className="context-drawer"><div className="drawer-handle" /><header className="drawer-header"><div><span className="eyebrow">阅读上下文</span><strong>{chapter.title} · 第 {(selectedParagraph ?? 0) + 1} 段</strong></div><button onClick={() => setDrawerOpen(false)} title="收起阅读上下文"><X size={18} /></button></header><div className="context-grid"><section><h2><Sparkles size={17} /> 本地阅读提示</h2><p>这段内容位于《{book.title}》的“{chapter.title}”。选择其他段落后，可在此保留它与当前章节的上下文。</p>{selectedIndexEntries.length > 0 && <div className="context-entities">{selectedIndexEntries.map((entry) => <button key={entry.id} onClick={() => openIndexEntry(entry)}>{entry.name}</button>)}</div>}<span className="local-note">实体与日期均从本地原文识别，点击可回到其首个证据位置。</span></section><section><h2><Clock3 size={17} /> 相邻原文</h2>{contextualParagraphs.map((paragraph, index) => <button className="context-excerpt" key={paragraph} onClick={() => jumpToParagraph(Math.max(0, (selectedParagraph ?? 0) - 1) + index)}>{paragraph.slice(0, 86)}{paragraph.length > 86 ? "…" : ""}</button>)}</section><section><h2><FileText size={17} /> 出处</h2><dl className="source-data"><div><dt>书名</dt><dd>{book.title}</dd></div><div><dt>章节</dt><dd>{chapter.title}</dd></div><div><dt>位置</dt><dd>第 {(selectedParagraph ?? 0) + 1} 段</dd></div><div><dt>版本</dt><dd>{book.publisher || localFormatLabel(book)}</dd></div></dl><button className="source-jump" onClick={() => jumpToParagraph(selectedParagraph ?? 0)}>回到原文 <ChevronRight size={15} /></button></section></div></section>}
+      {drawerOpen && <section className="context-drawer"><div className="drawer-handle" /><header className="drawer-header"><div><span className="eyebrow">阅读上下文</span><strong>{chapter.title} · 第 {(selectedParagraph ?? 0) + 1} 段</strong></div><button onClick={() => setDrawerOpen(false)} title="收起阅读上下文"><X size={18} /></button></header><div className="context-grid"><section><h2><Sparkles size={17} /> 本地阅读提示</h2><p>这段内容位于《{book.title}》的“{chapter.title}”。选择其他段落后，可在此保留它与当前章节的上下文。</p>{selectedIndexEntries.length > 0 && <div className="context-entities">{selectedIndexEntries.map((entry) => <button key={entry.id} onClick={() => openIndexEntry(entry)}>{entry.name}</button>)}</div>}<span className="local-note">实体与日期均从本地原文识别，点击可回到其首个证据位置。</span></section><section><h2><FileText size={17} /> ContextCite</h2>{contextCites.length ? contextCites.map((item) => <button className="context-cite" key={item.id} onClick={() => openSearchResult(item)}><small>{item.cite.label} {item.cite.source}</small><span>{item.cite.quote}</span><em>{item.matchSources.join(" · ")}</em></button>) : <p className="context-empty">暂无可追溯的相关证据。</p>}</section><section><h2><Clock3 size={17} /> 相邻原文</h2>{contextualParagraphs.map((paragraph, index) => <button className="context-excerpt" key={paragraph} onClick={() => jumpToParagraph(Math.max(0, (selectedParagraph ?? 0) - 1) + index)}>{paragraph.slice(0, 86)}{paragraph.length > 86 ? "…" : ""}</button>)}</section><section><h2><FileText size={17} /> 出处</h2><dl className="source-data"><div><dt>书名</dt><dd>{book.title}</dd></div><div><dt>章节</dt><dd>{chapter.title}</dd></div><div><dt>位置</dt><dd>第 {(selectedParagraph ?? 0) + 1} 段</dd></div><div><dt>版本</dt><dd>{book.publisher || localFormatLabel(book)}</dd></div></dl><button className="source-jump" onClick={() => jumpToParagraph(selectedParagraph ?? 0)}>回到原文 <ChevronRight size={15} /></button></section></div></section>}
       {searchOpen && <ReaderSearchOverlay bookTitle={book.title} query={searchQuery} setQuery={setSearchQuery} results={searchResults} onSelect={openSearchResult} onClose={() => setSearchOpen(false)} />}
       {!drawerOpen && selectedParagraph !== null && <button className="open-context" onClick={() => setDrawerOpen(true)}><Lightbulb size={17} /> 打开阅读上下文</button>}
-      {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
+      {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} relationAvailable={contextRelationships.length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
       {noteComposerOpen && <NoteComposer draft={noteDraft} setDraft={setNoteDraft} selection={selectionBloom?.text || ""} onClose={() => setNoteComposerOpen(false)} onSave={saveNote} />}
       {analysisSummaryOpen && analysisRecord?.summary && <AnalysisSummaryModal summary={analysisRecord.summary} onClose={() => setAnalysisSummaryOpen(false)} />}
-      {relationshipOpen && <RelationshipWorkspace relationships={bookIndex.relationships || []} onEvidence={openRelationshipEvidence} onClose={() => { setRelationshipOpen(false); setActivePanel("目录"); }} />}
+      {relationshipOpen && <RelationshipWorkspace relationships={contextRelationships} onEvidence={openRelationshipEvidence} onClose={() => { setRelationshipOpen(false); setActivePanel("目录"); }} />}
+      {organizerOpen && <OrganizerWorkspace type={organizerOpen} suggestions={organizerSuggestions} index={bookIndex} traceMemory={bookMemory} onEvidence={openSearchResult} onClose={() => { setOrganizerOpen(null); setActivePanel("目录"); }} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </main>
   );
-}
-
-function ReadingThemeModal({ theme, onChange, onClose }) {
-  return <div className="modal-backdrop theme-modal-backdrop" role="presentation" onMouseDown={onClose}>
-    <section className="theme-modal" role="dialog" aria-modal="true" aria-label="阅读主题" onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><span>阅读环境</span><h2>选择主题</h2></div><button onClick={onClose} title="关闭"><X size={19} /></button></header>
-      <p>主题仅调整纸色、强调色与阅读区边缘的极淡纹样，正文始终保持清晰。</p>
-      <div className="theme-grid">
-        {READING_THEMES.map((item) => { const Icon = item.icon; return <button className={theme === item.id ? "active" : ""} key={item.id} onClick={() => onChange(item.id)}><i className={`theme-swatch ${item.id}`}><Icon size={19} /></i><span><b>{item.name}</b><small>{item.detail}</small></span><Check size={15} /></button>; })}
-      </div>
-      <footer><button className="primary-button" onClick={onClose}>完成</button></footer>
-    </section>
-  </div>;
 }
 
 function LegacySkillTreeScreen({ book, config, domain, progress, domainProgress: current, onBack }) {
@@ -1156,6 +1551,10 @@ function formatReadingTime(seconds) {
 function RelationshipWorkspace({ relationships, onEvidence, onClose }) {
   const [view, setView] = useState("graph");
   const [selectedName, setSelectedName] = useState(relationships[0]?.source || "");
+  useEffect(() => {
+    setSelectedName(relationships[0]?.source || "");
+    setView("graph");
+  }, [relationships]);
   const visibleRelationships = useMemo(() => view === "organization"
     ? relationships.filter((item) => item.relationKind === "command" || item.relationKind === "belongs")
     : relationships, [relationships, view]);
@@ -1163,11 +1562,11 @@ function RelationshipWorkspace({ relationships, onEvidence, onClose }) {
   const selectedRelationship = visibleRelationships.find((item) => item.source === selectedName || item.target === selectedName) || visibleRelationships[0];
   const entities = useMemo(() => uniqueRelationshipEntities(visibleRelationships), [visibleRelationships]);
 
-  return <section className="relationship-workspace" aria-label="关系图谱">
-    <header className="relationship-header"><div><span>阅读图谱</span><h2>关系</h2><small>{visibleRelationships.length} 条可追溯关系</small></div><button onClick={onClose} title="关闭关系图谱"><X size={18} /></button></header>
-    <div className="relationship-view-switch" role="tablist"><button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>关系图</button><button className={view === "organization" ? "active" : ""} onClick={() => setView("organization")}>组织架构</button><button className={view === "matrix" ? "active" : ""} onClick={() => setView("matrix")}>关系矩阵</button></div>
+  return <section className="relationship-workspace context-relationship-workspace" aria-label="上下文关系">
+    <header className="relationship-header"><div><span>当前页辅助</span><h2>上下文关系</h2><small>{visibleRelationships.length} 条可追溯关系</small></div><button onClick={onClose} title="关闭上下文关系"><X size={18} /></button></header>
+    <div className="relationship-view-switch" role="tablist"><button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>局部关系</button>{relationships.length >= 3 && <button className={view === "organization" ? "active" : ""} onClick={() => setView("organization")}>组织层级</button>}{relationships.length >= 4 && <button className={view === "matrix" ? "active" : ""} onClick={() => setView("matrix")}>矩阵</button>}</div>
     <div className="relationship-canvas">
-      {view === "matrix" ? <RelationshipMatrix entities={entities} relationships={visibleRelationships} onSelect={setSelectedName} /> : visibleRelationships.length ? <ReactFlow nodes={graph.nodes} edges={graph.edges} fitView nodesDraggable={false} nodesConnectable={false} elementsSelectable onNodeClick={(_event, node) => setSelectedName(node.data.entityName)} onEdgeClick={(_event, edge) => setSelectedName(edge.data.relationship.source)}><Background gap={18} size={1} color="#e3ebe2" /><Controls showInteractive={false} /></ReactFlow> : <div className="relationship-empty">当前已读内容中，没有足以建立组织层级的可靠关系。</div>}
+      {view === "matrix" ? <RelationshipMatrix entities={entities} relationships={visibleRelationships} onSelect={setSelectedName} /> : visibleRelationships.length ? <ReactFlow nodes={graph.nodes} edges={graph.edges} fitView nodesDraggable={false} nodesConnectable={false} elementsSelectable onNodeClick={(_event, node) => setSelectedName(node.data.entityName)} onEdgeClick={(_event, edge) => setSelectedName(edge.data.relationship.source)}><Background gap={18} size={1} color="#e3ebe2" /><Controls showInteractive={false} /></ReactFlow> : <div className="relationship-empty">当前页附近还没有可靠关系证据。选中人物或组织后再查看，会更准确。</div>}
     </div>
     {selectedRelationship && <footer className="relationship-detail"><div><span>{selectedRelationship.source} <i>·</i> {selectedRelationship.relation} <i>·</i> {selectedRelationship.target}</span><small>第 {selectedRelationship.evidence.chapterIndex + 1} 节 · 原文证据</small></div><button onClick={() => onEvidence(selectedRelationship)}>查看原文 <ChevronRight size={15} /></button></footer>}
   </section>;
@@ -1208,19 +1607,20 @@ function relationshipNodeColor(type) {
   return type === "organization" ? "#b89066" : type === "event" ? "#8e789d" : "#5b9070";
 }
 
-function SelectionBloom({ selection, theme, onAction, onClose }) {
+function SelectionBloom({ selection, theme, relationAvailable = true, onAction, onClose }) {
   const actions = [
     { id: "question", label: "解惑", icon: Sparkles, className: "question" },
     { id: "recall", label: "回忆", icon: History, className: "recall" },
-    { id: "note", label: "笔记", icon: FileText, className: "note" },
-    { id: "people", label: "人物", icon: Network, className: "people" },
-    { id: "timeline", label: "时间线", icon: Clock3, className: "timeline" },
-    { id: "source", label: "出处", icon: Bookmark, className: "source" },
-  ];
-  return <div className={`selection-bloom theme-${theme}`} style={{ left: selection.x, top: selection.y }} role="dialog" aria-label="选中文本辅助" onMouseDown={(event) => event.stopPropagation()}>
-    <div className="bloom-stem" />
-    {actions.map((action, index) => { const Icon = action.icon; return <button className={`bloom-petal ${action.className}`} style={{ "--petal-index": index }} key={action.label} type="button" onClick={() => onAction(action.id)}><Icon size={15} /><span>{action.label}</span></button>; })}
-    <button className="bloom-core" type="button" onClick={onClose} title="收起辅助选项"><i /><span>{selection.text}</span></button>
+    { id: "source", label: "出处", icon: FileText, className: "source" },
+    relationAvailable && { id: "relation", label: "关系", icon: Network, className: "relation" },
+    { id: "note", label: "笔记", icon: Lightbulb, className: "note" },
+    { id: "favorite", label: "收藏", icon: Bookmark, className: "favorite" },
+  ].filter(Boolean);
+  return <div className={`selection-bloom selection-popover theme-${theme} ${selection.placement || "above"}`} style={{ left: selection.x, top: selection.y }} role="dialog" aria-label="选中文本辅助" onMouseDown={(event) => event.stopPropagation()}>
+    <div className="selection-popover-bar" role="toolbar" aria-label={`针对“${selection.text}”的阅读操作`}>
+      {actions.map((action, index) => { const Icon = action.icon; return <button className={`bloom-petal ${action.className}`} style={{ "--petal-index": index }} key={action.label} type="button" onClick={() => onAction(action.id)} title={action.label} aria-label={action.label}><Icon size={17} /><span>{action.label}</span></button>; })}
+      <button className="bloom-core" type="button" onClick={onClose} title="收起辅助选项" aria-label="收起辅助选项"><span>{selection.text}</span><X size={13} /></button>
+    </div>
   </div>;
 }
 
@@ -1228,6 +1628,13 @@ function ReaderThemePanel({ theme, onChange }) {
   return <section className="reader-theme-panel reader-panel-list">
     {READING_THEMES.map((item) => { const Icon = item.icon; return <button className={theme === item.id ? "active" : ""} key={item.id} onClick={() => onChange(item.id)}><Icon size={17} /><span>{item.name}</span><small>{item.detail}</small></button>; })}
   </section>;
+}
+
+function TraceStatusPill({ job }) {
+  if (!job || job.status === "idle") return null;
+  const label = job.status === "queued" ? "排队中" : job.status === "running" ? "Trace 中" : job.status === "error" ? "Trace 异常" : "已同步";
+  const title = job.message || label;
+  return <span className={`trace-status-pill ${job.status}`} title={title} aria-label={title} role="status"><Bot size={16} /><i className="trace-status-dot" aria-hidden="true" /></span>;
 }
 
 function ReaderAnalysisPanel({ settings, setSettings, state, onAnalyze }) {
@@ -1241,23 +1648,136 @@ function ReaderAnalysisPanel({ settings, setSettings, state, onAnalyze }) {
   const adjustThreshold = (amount) => setSettings((current) => ({ ...current, autoPageThreshold: Math.max(1, Math.min(50, Number(current.autoPageThreshold || 5) + amount)) }));
   const toggleAuto = () => setSettings((current) => ({ ...current, analysisMode: current.analysisMode === "auto" ? "read" : "auto" }));
   return <section className="reader-analysis-panel">
-    <header className="reader-ai-hero"><i><Bot size={22} /></i><div><strong>AI 阅读</strong><span>提取已读范围内的人物、地点、时间线与关系。</span></div></header>
+    <header className="reader-ai-hero"><i><Bot size={22} /></i><div><strong>续读恢复</strong><span>整理已读范围的前文关键点、当前页前置理解和证据。</span></div></header>
     <div className="reader-panel-actions">
-      <button className="active" disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "read" })); onAnalyze("read"); }}><Sparkles size={17} /><span>{isAnalyzing ? "正在分析" : "分析已读"}</span><small>只处理已读范围</small></button>
-      <button disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "full" })); onAnalyze("full"); }}><BookOpen size={17} /><span>全书分析</span><small>较慢，重建索引</small></button>
+      <button className="active" disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "read" })); onAnalyze("read"); }}><Sparkles size={17} /><span>{isAnalyzing ? "正在整理" : "更新恢复卡"}</span><small>只处理已读范围</small></button>
+      <button disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "full" })); onAnalyze("full"); }}><BookOpen size={17} /><span>重建材料</span><small>较慢，用于纠偏</small></button>
     </div>
-    <div className={`reader-panel-state ${state.status}`}>{state.message || "AI 索引会围绕人物、地点、时间线和关系整理已读内容。"}</div>
+    <div className={`reader-panel-state ${state.status}`}>{state.message || "续读恢复会优先帮助你回到前文情境，而不是展示更多索引。"}</div>
     <section className="reader-auto-card">
-      <label className="reader-auto-row"><input type="checkbox" checked={settings.analysisMode === "auto"} onChange={toggleAuto} /><span>自动更新索引</span></label>
+      <label className="reader-auto-row"><input type="checkbox" checked={settings.analysisMode === "auto"} onChange={toggleAuto} /><span>自动准备恢复卡</span></label>
       <div className="reader-stepper"><span>每读</span><button title="减少页数" onClick={() => adjustThreshold(-1)}><Minus size={14} /></button><b>{settings.autoPageThreshold}</b><button title="增加页数" onClick={() => adjustThreshold(1)}><Plus size={14} /></button><span>页</span></div>
     </section>
     <button className="reader-panel-toggle" onClick={() => setAdvancedOpen((value) => !value)}><span>模型设置</span><ChevronDown size={14} /></button>
     {advancedOpen && <div className="reader-model-panel">
       <div className="reader-provider-row"><button className={settings.provider === "deepseek" ? "active" : ""} onClick={() => updateProvider("deepseek")}>DeepSeek</button><button className={settings.provider === "openai" ? "active" : ""} onClick={() => updateProvider("openai")}>OpenAI</button></div>
-      <label>模型名称<input value={settings.model} onChange={(event) => setSettings((current) => ({ ...current, model: event.target.value }))} placeholder="deepseek-v4-flash" /></label>
-      <small>API Key 只从本机 .env 读取。</small>
+      <label>分析模型<input value={settings.model} onChange={(event) => setSettings((current) => ({ ...current, model: event.target.value }))} placeholder="deepseek-v4-flash" /></label>
+      {settings.provider === "deepseek" && <div className="reader-model-chips" role="group" aria-label="常用 DeepSeek 模型">
+        <button type="button" className={settings.model === "deepseek-v4-flash" ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, model: "deepseek-v4-flash" }))}>v4-flash</button>
+        <button type="button" className={settings.model === "deepseek-v4-pro" ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, model: "deepseek-v4-pro" }))}>v4-pro</button>
+      </div>}
+      <small>回忆卡固定用 deepseek-v4-pro，并开启 thinking。分析可用 flash 或 pro。API Key 只从本机 .env 读取。</small>
     </div>}
   </section>;
+}
+
+function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
+  const [hintOpen, setHintOpen] = useState(false);
+  const [answerOpen, setAnswerOpen] = useState(false);
+  const [evidenceOpen, setEvidenceOpen] = useState(false);
+  const keyPoints = Array.isArray(card.keyPoints) ? card.keyPoints.slice(0, 3) : [];
+  const prerequisites = Array.isArray(card.prerequisites) ? card.prerequisites.slice(0, 2) : [];
+  const evidence = Array.isArray(card.evidence) ? card.evidence : [];
+  useEffect(() => {
+    onTrack?.("shown", card);
+  }, [onTrack]);
+  const hint = card.question?.hint || buildRecoveryQuestionHint(card.question?.evidence || evidence[0]);
+  return <aside className={`recall-sheet ${card.intensity === "deep" ? "deep" : ""}`} role="dialog" aria-modal="true" aria-label="续读恢复卡">
+    <header className="recall-sheet-head">
+      <div className="recall-sheet-title">
+        <span>{card.absenceLabel || "继续阅读前"}</span>
+        <strong>记忆浮现</strong>
+      </div>
+      <button type="button" className="recall-icon" onClick={() => onClose("skipped")} title="跳过续读恢复" aria-label="跳过续读恢复"><X size={18} /></button>
+    </header>
+
+    <div className="recall-sheet-position"><History size={14} /><span>{card.positionLabel || "上次阅读位置"}</span></div>
+
+    <div className="recall-sheet-body">
+      <section className="recall-sheet-question" aria-label="主动回忆">
+        <p className="recall-sheet-kicker">先想一件事</p>
+        <p className="recall-sheet-prompt">{card.question?.prompt}</p>
+        {hintOpen && !answerOpen && <div className="recall-sheet-hint">{hint}</div>}
+        {answerOpen ? (
+          <button type="button" className="recall-sheet-answer" onClick={() => card.question?.evidence && onEvidence(card.question.evidence)} title="跳转到答案出处" aria-label="跳转到答案出处">
+            {card.question?.answer}
+          </button>
+        ) : (
+          <div className="recall-sheet-actions">
+            <button type="button" className={hintOpen ? "recall-icon active" : "recall-icon"} onClick={() => { onTrack?.("hint", card); setHintOpen(true); }} title="查看提示" aria-label="查看提示"><Lightbulb size={16} /></button>
+            <button type="button" className="recall-icon" onClick={() => { onTrack?.("answer", card); setAnswerOpen(true); }} title="查看答案" aria-label="查看答案"><Eye size={16} /></button>
+          </div>
+        )}
+      </section>
+
+      {keyPoints.length > 0 && <section className="recall-sheet-anchors" aria-label="前文关键点">
+        <h2>前文关键点</h2>
+        <ol className="recall-sheet-steps">
+          {keyPoints.map((item, index) => (
+            <li key={item.id}>
+              <button type="button" onClick={() => item.evidence && onEvidence(item.evidence)} title={item.title} aria-label={item.title}>
+                <span className="recall-sheet-step-num" aria-hidden="true">{index + 1}</span>
+                <span className="recall-sheet-step-copy">
+                  <b>{item.title}</b>
+                  <span>{item.detail}</span>
+                </span>
+              </button>
+            </li>
+          ))}
+        </ol>
+      </section>}
+
+      {prerequisites.length > 0 && <section className="recall-sheet-prereqs" aria-label="当前页前置">
+        <h2>理解当前页前</h2>
+        <ul>
+          {prerequisites.map((item) => (
+            <li key={item.id}>
+              <button type="button" onClick={() => item.evidence && onEvidence(item.evidence)} title={item.text} aria-label={item.text}>
+                <Lightbulb size={14} />
+                <span>{item.text}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      </section>}
+
+      {evidenceOpen && <section className="recall-sheet-evidence" aria-label="原文证据">
+        <h2>原文证据</h2>
+        <div>
+          {evidence.slice(0, 4).map((item) => (
+            <button type="button" key={item.id} onClick={() => onEvidence(item)} title="跳转到原文" aria-label={`跳转到${item.chapterTitle}第${item.paragraphIndex + 1}段`}>
+              <small>{item.chapterTitle} · 第 {item.paragraphIndex + 1} 段</small>
+              <span>{item.excerpt}</span>
+            </button>
+          ))}
+        </div>
+      </section>}
+    </div>
+
+    <footer className="recall-sheet-footer">
+      <div className="recall-sheet-footer-tools">
+        <button
+          type="button"
+          className={evidenceOpen ? "recall-icon active" : "recall-icon"}
+          onClick={() => { onTrack?.("evidence", card); setEvidenceOpen((value) => !value); }}
+          title={evidenceOpen ? "收起证据" : "展开证据"}
+          aria-label={evidenceOpen ? "收起证据" : "展开证据"}
+          aria-pressed={evidenceOpen}
+        >
+          <Quote size={16} />
+        </button>
+        <button type="button" className="recall-icon" onClick={() => onTrack?.("remembered", card)} title="想起来了" aria-label="想起来了"><Check size={16} /></button>
+        <button type="button" className="recall-icon" onClick={() => onTrack?.("missed", card)} title="还没想起" aria-label="还没想起"><CircleHelp size={16} /></button>
+      </div>
+      <button type="button" className="recall-icon recall-continue" onClick={() => onClose("continued")} title="继续阅读" aria-label="继续阅读"><BookOpen size={17} /></button>
+    </footer>
+  </aside>;
+}
+
+function buildRecoveryQuestionHint(evidence) {
+  const excerpt = cleanRecoveryText(evidence?.excerpt || evidence?.quote || "");
+  if (!excerpt) return "先从上一段主线变化开始想，不必回忆所有细节。";
+  return `提示：回到这条线索——${recoveryPointTitle(excerpt, 0)}。`;
 }
 
 function ReaderSearchOverlay({ bookTitle, query, setQuery, results, onSelect, onClose }) {
@@ -1265,7 +1785,7 @@ function ReaderSearchOverlay({ bookTitle, query, setQuery, results, onSelect, on
   const hasQuery = query.trim();
   return <div className="library-search-panel reader-search-panel-overlay">
     <div className="search-panel-head"><h2>{hasQuery ? "搜索结果" : `在《${bookTitle}》中查找`}</h2><button onClick={onClose} aria-label="关闭搜索"><X size={20} /></button></div>
-    {hasQuery ? <div className="search-suggestion-grid reader-search-result-grid">{results.length ? results.map((result) => <button className="search-suggestion-card reader-search-result-card" key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span>{result.chapterTitle}</span><small>第 {result.paragraphIndex + 1} 段</small><b>{highlightMatch(result.excerpt, query.trim())}</b></button>) : <div className="reader-search-empty"><Search size={22} /><strong>没有找到“{query}”</strong><span>试试更短的关键词。</span></div>}</div> : <div className="search-suggestion-grid">{suggestions.map((item) => <button className="search-suggestion-card type-result" key={item} onClick={() => setQuery(item)}><i /><span>{item}</span><small>常用检索词</small></button>)}</div>}
+    {hasQuery ? <div className="search-suggestion-grid reader-search-result-grid">{results.length ? results.map((result) => <button className="search-suggestion-card reader-search-result-card" key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span>{result.cite?.label || ""} {result.chapterTitle}</span><small>第 {result.paragraphIndex + 1} 段 · {(result.matchSources || ["keyword"]).join(" · ")}</small><b>{highlightMatch(result.excerpt, query.trim())}</b></button>) : <div className="reader-search-empty"><Search size={22} /><strong>没有找到“{query}”</strong><span>试试更短的关键词。</span></div>}</div> : <div className="search-suggestion-grid">{suggestions.map((item) => <button className="search-suggestion-card type-result" key={item} onClick={() => setQuery(item)}><i /><span>{item}</span><small>常用检索词</small></button>)}</div>}
   </div>;
 }
 
@@ -1284,6 +1804,36 @@ function ReaderIndexPicker({ tabs, activePanel, onSelect }) {
   </section>;
 }
 
+function OrganizerPicker({ suggestions, active, onSelect }) {
+  return <section className="reader-index-picker organizer-picker">
+    {suggestions.length ? suggestions.map((item) => <button className={active === item.type ? "active" : ""} key={item.type} onClick={() => onSelect(item.type)}>
+      <span>{item.label}</span>
+      <small>{item.reason}</small>
+    </button>) : <p className="panel-empty">当前已读内容还不需要图形组织器。</p>}
+  </section>;
+}
+
+function OrganizerWorkspace({ type, suggestions, index, traceMemory, onEvidence, onClose }) {
+  const suggestion = suggestions.find((item) => item.type === type) || suggestions[0] || { label: "图形组织器", reason: "整理可回忆结构" };
+  const items = organizerItemsForType(type, index, traceMemory);
+  return <section className="relationship-workspace organizer-workspace" aria-label={suggestion.label}>
+    <header className="relationship-header"><div><span>阅读图谱</span><h2>{suggestion.label}</h2><small>{suggestion.reason}</small></div><button onClick={onClose} title="关闭图形组织器"><X size={18} /></button></header>
+    <div className="organizer-canvas">
+      <div className={`organizer-chain organizer-${type}`}>
+        {items.map((item, index) => <article key={`${type}-${item.title}-${index}`}>
+          <i>{index + 1}</i>
+          <div>
+            <strong>{item.title}</strong>
+            <span>{item.detail}</span>
+            {item.evidence && <button onClick={() => onEvidence(item.evidence)}>查看原文 <ChevronRight size={14} /></button>}
+          </div>
+        </article>)}
+      </div>
+      {!items.length && <div className="relationship-empty">当前已读范围还没有足够可靠证据生成这个图形组织器。</div>}
+    </div>
+  </section>;
+}
+
 function BookmarkList({ items, onOpen, onRemove }) {
   return <section className="bookmark-list">
     <header><span><Bookmark size={14} /> 书签</span><small>{items.length}</small></header>
@@ -1294,7 +1844,7 @@ function BookmarkList({ items, onOpen, onRemove }) {
 function NoteList({ items, onOpen, onRemove }) {
   return <section className="bookmark-list note-list">
     <header><span><FileText size={14} /> 笔记</span><small>{items.length}</small></header>
-    {items.length ? <div>{[...items].sort((left, right) => right.createdAt - left.createdAt).map((item) => <article key={item.id}><button onClick={() => onOpen(item)}><b>{item.content}</b><span>{item.chapterTitle} · 第 {item.pageIndex + 1} 页</span></button><button className="remove-bookmark" onClick={() => onRemove(item.id)} title="删除笔记" aria-label={`删除 ${item.chapterTitle} 的笔记`}><X size={14} /></button></article>)}</div> : <p>选中文字后，可在莲花菜单中添加笔记。</p>}
+    {items.length ? <div>{[...items].sort((left, right) => right.createdAt - left.createdAt).map((item) => <article key={item.id}><button onClick={() => onOpen(item)}><b>{item.content}</b><span>{item.chapterTitle} · 第 {item.pageIndex + 1} 页</span></button><button className="remove-bookmark" onClick={() => onRemove(item.id)} title="删除笔记" aria-label={`删除 ${item.chapterTitle} 的笔记`}><X size={14} /></button></article>)}</div> : <p>选中文字后，可在辅助工具盘中添加笔记。</p>}
   </section>;
 }
 
@@ -1362,34 +1912,124 @@ function TimelineList({ items, activeChapter, activeCursor, onItem }) {
     {rest.length > 0 && <details className="secondary-entities timeline-secondary"><summary>展开其余时间 <span>{rest.length}</span></summary><div>{rest.map((item) => <button className="entity-row compact" key={item.id} onClick={() => onItem(item)}><div className="entity-row-heading"><b>{item.name}</b></div><span>{item.subtitle}</span></button>)}</div></details>}
   </div>;
 }
-
 function normalizeReadingIndex(index = {}) {
   const people = [];
   const organizations = [];
-  (Array.isArray(index.people) ? index.people : []).forEach((item) => {
-    if (!summaryText(item?.name)) return;
-    if (isOrganizationName(item.name)) organizations.push({ ...item, attributes: [] });
-    else people.push(item);
+  const withEvidence = (items) => (Array.isArray(items) ? items : []).filter(hasIndexEvidence);
+  withEvidence(index.people).forEach((item) => {
+    const name = summaryText(item?.name);
+    if (!name) return;
+    if (isOrganizationName(name)) organizations.push({ ...item, name, attributes: [] });
+    else if (isReliablePersonName(name)) people.push({ ...item, name });
   });
-  (Array.isArray(index.organizations) ? index.organizations : []).forEach((item) => {
-    if (summaryText(item?.name)) organizations.push({ ...item, attributes: [] });
+  withEvidence(index.organizations).forEach((item) => {
+    const name = summaryText(item?.name);
+    if (name) organizations.push({ ...item, name, attributes: [] });
   });
   const uniqueByName = (items) => Array.from(new Map(items.map((item) => [item.name, item])).values());
   return {
     people: uniqueByName(people),
     organizations: uniqueByName(organizations),
-    places: Array.isArray(index.places) ? index.places.filter((item) => summaryText(item?.name)) : [],
-    timeline: normalizeTimelineItems(index.timeline),
-    relationships: Array.isArray(index.relationships) ? index.relationships : [],
+    places: withEvidence(index.places).filter((item) => summaryText(item?.name)),
+    timeline: normalizeTimelineItems(withEvidence(index.timeline)),
+    relationships: withEvidence(index.relationships).filter((item) => summaryText(item?.source) && summaryText(item?.target) && summaryText(item?.relation)),
   };
+}
+
+function hasIndexEvidence(item) {
+  const evidence = item?.evidence || item?.occurrence || item?.occurrences?.[0];
+  const chapterIndex = Number(evidence?.chapterIndex);
+  const paragraphIndex = Number(evidence?.paragraphIndex);
+  return Number.isInteger(chapterIndex) && Number.isInteger(paragraphIndex);
+}
+
+function contextualRelationships(relationships = [], context = {}) {
+  const pageParagraphIndexes = (context.pageParagraphs || [])
+    .map((item) => item.paragraphIndex)
+    .filter(Number.isInteger);
+  const minParagraph = pageParagraphIndexes.length ? Math.min(...pageParagraphIndexes) : Number(context.selectedParagraph || 0);
+  const maxParagraph = pageParagraphIndexes.length ? Math.max(...pageParagraphIndexes) : Number(context.selectedParagraph || 0);
+  const entityNamesOnPage = new Set(["people", "organizations"]
+    .flatMap((key) => context.index?.[key] || [])
+    .filter((entry) => (entry.occurrences || []).some((occurrence) => (
+      occurrence.chapterIndex === context.chapterIndex
+      && occurrence.paragraphIndex >= minParagraph - 2
+      && occurrence.paragraphIndex <= maxParagraph + 2
+    )))
+    .map((entry) => entry.name)
+    .filter(Boolean));
+
+  return (relationships || [])
+    .filter(hasIndexEvidence)
+    .map((relationship) => {
+      const evidence = relationship.evidence || relationship.occurrence || relationship.occurrences?.[0] || {};
+      return { ...relationship, evidence };
+    })
+    .filter((relationship) => {
+      const evidence = relationship.evidence || {};
+      if (Number(evidence.chapterIndex) > Number(context.chapterIndex)) return false;
+      const sameChapter = Number(evidence.chapterIndex) === Number(context.chapterIndex);
+      const nearPage = sameChapter
+        && Number(evidence.paragraphIndex) >= minParagraph - 8
+        && Number(evidence.paragraphIndex) <= maxParagraph + 8;
+      const endpointOnPage = entityNamesOnPage.has(relationship.source) || entityNamesOnPage.has(relationship.target);
+      return nearPage || endpointOnPage;
+    })
+    .sort((left, right) => {
+      const leftPrimary = left.importance === "primary" ? 1 : 0;
+      const rightPrimary = right.importance === "primary" ? 1 : 0;
+      const leftDistance = Math.abs(Number(left.evidence?.paragraphIndex || 0) - maxParagraph);
+      const rightDistance = Math.abs(Number(right.evidence?.paragraphIndex || 0) - maxParagraph);
+      return rightPrimary - leftPrimary || leftDistance - rightDistance;
+    })
+    .slice(0, 5);
+}
+
+function hasReadingIndexContent(index = {}) {
+  return ["people", "organizations", "places", "timeline", "relationships"].some((key) => Array.isArray(index[key]) && index[key].length > 0);
+}
+
+function isReliablePersonName(value) {
+  const name = summaryText(value);
+  if (!/^[\u4e00-\u9fff]{2,4}$/.test(name)) return false;
+  if (COMMON_NON_PERSON_TERMS.has(name)) return false;
+  if (/^(他们|她们|我们|你们|自己|这里|那里|这个|那个|一种|一个|一些|有人|没有|可以|已经|正在|需要|由于|因为|所以|但是|如果|后来|同时)/.test(name)) return false;
+  if (/(知道|就是|报告|原文|证据|内容|地方|时候|方面|情况|问题|会议|命令|路线|战斗|政治|军事|历史)$/.test(name)) return false;
+  return true;
 }
 
 function isOrganizationName(value) {
   const name = summaryText(value);
-  return /(军团|方面军|集团军|红军|白军|桂军|黔军|川军|滇军|湘军|部队|纵队|支队|机枪连|警卫连|侦察连|运输队|工作队|先头部队|师|旅|团|营|党|政府|委员会|军委|机关|总部|司令部|同盟|联盟|公司|学校|大学|学院|研究所|协会|组织)$/.test(name)
-    || /^(红|白|桂|黔|川|滇|湘|粤|中央|南京|国民党|共产党|中共).*(军|党|政府|军委|委员会|机关|总部|司令部)$/.test(name);
+  return /(军团|方面军|集团军|红军|白军|桂军|黔军|川军|滇军|湘军|部队|纵队|支队|机关|总部|司令部|委员会|政府|军委|联军|联盟|公司|学校|大学|学院|协会|组织)$/.test(name)
+    || /^(红|白|桂|黔|川|滇|湘|中央|南京|国民党|共产党|中共).*(军|党|政府|军委|委员会|机关|总部|司令部)$/.test(name);
 }
 
+const COMMON_NON_PERSON_TERMS = new Set([
+  "他们知",
+  "他知",
+  "也就是",
+  "报告",
+  "原文",
+  "证据",
+  "红军",
+  "白军",
+  "部队",
+  "军团",
+  "方面",
+  "地方",
+  "情况",
+  "问题",
+  "会议",
+  "命令",
+  "地图",
+  "路线",
+  "战斗",
+  "侦察",
+  "政治",
+  "军事",
+  "群众",
+  "历史",
+]);
 function normalizeTimelineItems(items = []) {
   return (Array.isArray(items) ? items : []).map((item, index) => {
     const quote = summaryText(item?.evidenceQuote || item?.evidence?.quote);
@@ -1472,147 +2112,12 @@ function compareEntryPosition(left, right) {
   return (leftPosition.chapterIndex ?? 0) - (rightPosition.chapterIndex ?? 0) || (leftPosition.paragraphIndex ?? 0) - (rightPosition.paragraphIndex ?? 0);
 }
 
-function buildReadingIndex(chapters) {
-  const personEntries = buildEntityEntries("person", chapters);
-  const placeEntries = buildEntityEntries("place", chapters);
-  const timeline = [];
-  const seenDates = new Set();
-
-  chapters.forEach((chapter, chapterIndex) => {
-    if (isNonNarrativeChapter(chapter.title)) return;
-    chapter.paragraphs.forEach((paragraph, paragraphIndex) => {
-      if (isPublicationMetadata(paragraph)) return;
-      const matches = paragraph.matchAll(/(?:(?:[12]\d{3}|[零〇一二三四五六七八九]{4})年(?:(?:\d{1,2}|[一二三四五六七八九十]{1,3})月(?:(?:\d{1,2}|[一二三四五六七八九十]{1,3})[日号])?)?)/g);
-      [...matches].forEach((match) => {
-        const name = match[0];
-        if (seenDates.has(name) || timeline.length >= 60) return;
-        seenDates.add(name);
-        timeline.push({
-          id: `time-${name}`,
-          name,
-          sortKey: parseTimelineDate(name),
-          subtitle: chapter.title,
-          detail: evidenceSnippet(paragraph, name),
-          priority: isMajorTimelineParagraph(paragraph, chapter.title) ? "primary" : "secondary",
-          historicalWeight: isMajorTimelineParagraph(paragraph, chapter.title) ? "major" : "minor",
-          occurrence: { chapterIndex, paragraphIndex },
-          occurrences: [{ chapterIndex, paragraphIndex }],
-        });
-      });
-    });
-  });
-
-  timeline.sort((left, right) => left.sortKey - right.sortKey || left.occurrence.chapterIndex - right.occurrence.chapterIndex || left.occurrence.paragraphIndex - right.occurrence.paragraphIndex);
-  return { people: personEntries, places: placeEntries, timeline };
-}
-
-function buildEntityEntries(type, chapters) {
-  const candidates = new Map();
-  chapters.forEach((chapter, chapterIndex) => chapter.paragraphs.forEach((paragraph, paragraphIndex) => {
-    extractEntityCandidates(type, paragraph).forEach((name) => {
-      const occurrences = candidates.get(name) || [];
-      occurrences.push({ chapterIndex, paragraphIndex, paragraph, chapterTitle: chapter.title });
-      candidates.set(name, occurrences);
-    });
-  }));
-
-  const names = new Set(candidates.keys());
-  return [...candidates.entries()]
-    .filter(([, occurrences]) => occurrences.length >= 2)
-    .map(([name, occurrences]) => {
-      const first = occurrences[0];
-      const coMentioned = type === "person"
-        ? extractEntityCandidates("person", first.paragraph).filter((candidate) => candidate !== name && names.has(candidate)).slice(0, 3)
-        : [];
-      return {
-        id: `${type}-${name}`,
-        name,
-        subtitle: type === "person" ? `人物实体 · ${occurrences.length} 处` : `地点实体 · ${occurrences.length} 处`,
-        detail: type === "place"
-          ? describePlaceEntity(name, occurrences)
-          : coMentioned.length ? `同段提及：${coMentioned.join("、")}` : `${first.chapterTitle} · 原文证据`,
-        priority: classifyEntityPriority(type, occurrences),
-        importanceScore: scoreEntityImportance(type, occurrences),
-        occurrence: first,
-        occurrences,
-      };
-    })
-    .sort((left, right) => right.occurrences.length - left.occurrences.length || left.name.localeCompare(right.name, "zh-CN"))
-    .slice(0, 40);
-}
-
-function classifyEntityPriority(type, occurrences) {
-  return scoreEntityImportance(type, occurrences) >= 3 ? "primary" : "secondary";
-}
-
-function scoreEntityImportance(type, occurrences) {
-  const text = occurrences.map((occurrence) => `${occurrence.chapterTitle || ""} ${occurrence.paragraph || ""}`).join("\n");
-  const keywordPattern = type === "place"
-    ? /(战役|会战|突破|渡|占领|抵达|进入|离开|转移|集结|会师|根据地|要地|路线|行军|驻扎|包围|封锁|进攻|撤退|牺牲|胜利|失败|会议|决策|命令)/
-    : /(主席|司令|军长|政委|书记|将军|领导|指挥|命令|率领|决定|部署|会见|会议|谈判|牺牲|被俘|冲突|协作|反对|支持|关键|核心)/;
-  const spread = new Set(occurrences.map((occurrence) => occurrence.chapterIndex)).size;
-  let score = 0;
-  if (occurrences.length >= 4) score += 2;
-  else if (occurrences.length >= 2) score += 1;
-  if (spread >= 2) score += 1;
-  if (keywordPattern.test(text)) score += 2;
-  return score;
-}
-
-function isMajorTimelineParagraph(paragraph, chapterTitle = "") {
-  return /(战役|会战|会议|决定|命令|突破|转折|开始|结束|胜利|失败|牺牲|会师|渡江|渡河|进攻|撤退|包围|封锁|占领|抵达|转移|长征|红军)/.test(`${chapterTitle} ${paragraph}`);
-}
-
-function describePlaceEntity(name, occurrences) {
-  const chapterTitles = [...new Set(occurrences.map((occurrence) => occurrence.chapterTitle).filter(Boolean))].slice(0, 2);
-  const chapterText = chapterTitles.length ? `，集中出现在${chapterTitles.join("、")}等已读章节` : "";
-  return `${name}是已读内容中反复出现的地点${chapterText}，可作为理解行动路径和事件发生空间的线索。`;
-}
-
-function evidenceSnippet(paragraph, keyword) {
-  const index = paragraph.indexOf(keyword);
-  const start = Math.max(0, index - 18);
-  const end = Math.min(paragraph.length, index + keyword.length + 32);
-  return `${start ? "…" : ""}${paragraph.slice(start, end)}${end < paragraph.length ? "…" : ""}`;
-}
-
-function extractEntityCandidates(type, paragraph) {
-  const pattern = type === "person"
-    ? /(?:^|[，。；：“”])([\u4e00-\u9fff]{2,3})(?=(?:同志|先生|女士|主席|将军|司令|书记|教授|说|道|表示|认为|回忆|指出|写道|问道|回答))/g
-    : /(?:在|到达|抵达|进入|离开|来自|前往|穿过|经过|位于|返回)([\u4e00-\u9fff]{2,8}(?:省|市|县|镇|村|乡|州|国|岛|山|河|江|湖|桥|关|口|岭|湾|原|谷|城))/g;
-  const candidates = new Set();
-  [...paragraph.matchAll(pattern)].forEach((match) => {
-    const candidate = match[1].trim();
-    if (candidate.length >= 2 && !/^(我们|他们|你们|这里|那里|自己|中国|中央|红军|部队)$/.test(candidate)) candidates.add(candidate);
-  });
-  return [...candidates];
-}
-
 function isNonNarrativeChapter(title) {
   return /^(序|序言|前言|引言|代序|后记|跋|再版序|出版说明|版权页|目录)/.test(title.trim());
 }
 
 function isPublicationMetadata(paragraph) {
-  return /(ISBN|版权所有|版权|版次|印刷|出版(?:社|日期|发行|信息)?|责任编辑|装帧|开本|定价|字数|第\s*\d+\s*版|第\s*\d+\s*次印刷|本书由)/i.test(paragraph);
-}
-
-function parseTimelineDate(value) {
-  const arabic = value.match(/(\d{4})年(?:(\d{1,2})月)?(?:(\d{1,2})[日号])?/);
-  if (arabic) return Date.UTC(Number(arabic[1]), Number(arabic[2] || 1) - 1, Number(arabic[3] || 1));
-
-  const chinese = value.match(/([零〇一二三四五六七八九]{4})年(?:([一二三四五六七八九十]+)月)?(?:([一二三四五六七八九十]+)[日号])?/);
-  if (!chinese) return Number.MAX_SAFE_INTEGER;
-  const year = [...chinese[1]].map((digit) => ({ 零: 0, 〇: 0, 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 })[digit]).join("");
-  return Date.UTC(Number(year), chineseNumber(chinese[2]) - 1, chineseNumber(chinese[3]));
-}
-
-function chineseNumber(value) {
-  if (!value) return 1;
-  if (value === "十") return 10;
-  const digits = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
-  if (!value.includes("十")) return digits[value] || 1;
-  const [tens, units] = value.split("十");
-  return (tens ? digits[tens] : 1) * 10 + (units ? digits[units] : 0);
+  return /(ISBN|CIP|版权所有|版权|版次|印刷|印装|质量问题|销售中心|出版(?:社|日期|发行|信息)?|责任编辑|装帧|开本|定价|字数|邮编|网址|http|www\.|数据核字|图书馆|新华书店|印务|开本|印张|纪实文学|分类号|[ⅠⅡⅢⅣ]\.|第\s*\d+\s*版|第\s*\d+\s*次印刷|本书由)/i.test(paragraph);
 }
 
 function searchBook(chapters, query) {
@@ -1694,61 +2199,6 @@ function CategoryModal({ categories, selected, newCategory, setNewCategory, onAd
   return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className="category-modal" role="dialog" aria-modal="true" aria-label="管理图书分类" onMouseDown={(event) => event.stopPropagation()}><header><div><span>图书分类</span><h2>整理《长征》</h2></div><button onClick={onClose} title="关闭"><X size={19} /></button></header><p>选择这本书所属的分类。分类与阅读进度只保存在当前浏览器。</p><div className="category-checks">{categories.map((category) => <label key={category}><input type="checkbox" checked={selected.includes(category)} onChange={() => onToggle(category)} /><span>{category}</span><i><Check size={13} /></i></label>)}</div><form onSubmit={onAdd}><input value={newCategory} onChange={(event) => setNewCategory(event.target.value)} placeholder="新建分类，例如：长篇纪实" /><button className="text-action" type="submit"><FolderPlus size={16} /> 新建</button></form><footer><button className="primary-button" onClick={onClose}>完成</button></footer></section></div>;
 }
 
-function LegacyAnalysisSettingsModal({ settings, setSettings, state, onAnalyze, onClose }) {
-  const isAnalyzing = state.status === "loading";
-  const updateProvider = (provider) => setSettings((current) => ({
-    provider,
-    model: provider === "deepseek" ? "deepseek-v4-flash" : "gpt-4.1-mini",
-  }));
-  const selectMode = (analysisMode) => setSettings((current) => ({ ...current, analysisMode }));
-  const adjustThreshold = (amount) => setSettings((current) => ({ ...current, autoPageThreshold: Math.max(1, Math.min(50, Number(current.autoPageThreshold || 5) + amount)) }));
-  const analysisScope = settings.analysisMode === "full" ? "full" : "read";
-  return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className="analysis-modal" role="dialog" aria-modal="true" aria-label="大模型分析设置" onMouseDown={(event) => event.stopPropagation()}><header><div><span>阅读分析</span><h2>大模型设置</h2></div><button onClick={onClose} title="关闭"><X size={19} /></button></header><p>模型只输出可追溯的主线人物、地点和事件。密钥仅从本机 <code>.env</code> 读取，不会进入浏览器。</p><fieldset><legend>分析模式</legend><div className="analysis-mode-control"><button className={settings.analysisMode === "auto" ? "active" : ""} onClick={() => selectMode("auto")}>自动</button><button className={settings.analysisMode === "read" ? "active" : ""} onClick={() => selectMode("read")}>已读</button><button className={settings.analysisMode === "full" ? "active" : ""} onClick={() => selectMode("full")}>全书</button></div></fieldset>{settings.analysisMode === "auto" && <div className="auto-analysis-options"><label className="auto-switch"><input type="checkbox" checked onChange={() => selectMode("read")} /><span>自动分析</span></label><div className="page-stepper"><span>每读</span><button title="减少页数" onClick={() => adjustThreshold(-1)}><Minus size={14} /></button><b>{settings.autoPageThreshold}</b><button title="增加页数" onClick={() => adjustThreshold(1)}><Plus size={14} /></button><span>页后分析</span></div></div>}{settings.analysisMode === "full" && <div className="full-analysis-note">将读取整本书并重新建立索引，耗时较长。</div>}<fieldset><legend>提供方</legend><div className="provider-options"><label><input type="radio" name="provider" checked={settings.provider === "deepseek"} onChange={() => updateProvider("deepseek")} /><span>DeepSeek</span><small>默认</small></label><label><input type="radio" name="provider" checked={settings.provider === "openai"} onChange={() => updateProvider("openai")} /><span>OpenAI</span></label></div></fieldset><label className="model-field">模型名称<input value={settings.model} onChange={(event) => setSettings((current) => ({ ...current, model: event.target.value }))} placeholder="deepseek-v4-flash" /></label><div className={`analysis-state ${state.status}`}>{state.message}</div><footer><button className="text-action" onClick={onClose}>取消</button><button className="primary-button" disabled={isAnalyzing || !settings.model.trim()} onClick={() => onAnalyze(analysisScope)}>{isAnalyzing ? "正在分析" : settings.analysisMode === "full" ? "全书分析" : "分析已读内容"}</button></footer></section></div>;
-}
-
-function AnalysisSettingsModal({ settings, setSettings, state, onAnalyze, onClose }) {
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const isAnalyzing = state.status === "loading";
-  const updateProvider = (provider) => setSettings((current) => ({
-    ...current,
-    provider,
-    model: provider === "deepseek" ? "deepseek-v4-flash" : "gpt-4.1-mini",
-  }));
-  const adjustThreshold = (amount) => setSettings((current) => ({ ...current, autoPageThreshold: Math.max(1, Math.min(50, Number(current.autoPageThreshold || 5) + amount)) }));
-  const runReadAnalysis = () => {
-    setSettings((current) => ({ ...current, analysisMode: "read" }));
-    onAnalyze("read");
-  };
-  const runFullAnalysis = () => {
-    setSettings((current) => ({ ...current, analysisMode: "full" }));
-    onAnalyze("full");
-  };
-  const toggleAuto = () => setSettings((current) => ({ ...current, analysisMode: current.analysisMode === "auto" ? "read" : "auto" }));
-
-  return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
-    <section className="analysis-modal ai-reading-modal" role="dialog" aria-modal="true" aria-label="AI 阅读" onMouseDown={(event) => event.stopPropagation()}>
-      <header><div><span>AI 阅读</span><h2>更新阅读索引</h2></div><button onClick={onClose} title="关闭"><X size={19} /></button></header>
-      <p>围绕已读内容整理人物、地点、时间线和关系，并把每个结论回链到原文。默认只分析你已经读到的位置。</p>
-      <div className="ai-quick-actions">
-        <button className="primary-button" disabled={isAnalyzing || !settings.model.trim()} onClick={runReadAnalysis}><Sparkles size={16} /> {isAnalyzing ? "正在分析" : "分析已读内容"}</button>
-        <button className="text-action" disabled={isAnalyzing || !settings.model.trim()} onClick={runFullAnalysis}><BookOpen size={16} /> 全书分析</button>
-      </div>
-      <div className={`analysis-state ${state.status}`}>{state.message}</div>
-      <section className="ai-auto-row">
-        <label className="auto-switch"><input type="checkbox" checked={settings.analysisMode === "auto"} onChange={toggleAuto} /><span>自动更新索引</span></label>
-        <div className="page-stepper"><span>每读</span><button title="减少页数" onClick={() => adjustThreshold(-1)}><Minus size={14} /></button><b>{settings.autoPageThreshold}</b><button title="增加页数" onClick={() => adjustThreshold(1)}><Plus size={14} /></button><span>页</span></div>
-      </section>
-      <button className="ai-advanced-toggle" onClick={() => setAdvancedOpen((value) => !value)}>{advancedOpen ? "收起模型设置" : "模型设置"} <ChevronDown size={14} /></button>
-      {advancedOpen && <div className="ai-advanced-panel">
-        <fieldset><legend>提供方</legend><div className="provider-options"><label><input type="radio" name="provider" checked={settings.provider === "deepseek"} onChange={() => updateProvider("deepseek")} /><span>DeepSeek</span><small>默认</small></label><label><input type="radio" name="provider" checked={settings.provider === "openai"} onChange={() => updateProvider("openai")} /><span>OpenAI</span></label></div></fieldset>
-        <label className="model-field">模型名称<input value={settings.model} onChange={(event) => setSettings((current) => ({ ...current, model: event.target.value }))} placeholder="deepseek-v4-flash" /></label>
-        <p className="ai-key-note">API Key 只从本机 .env 读取，不进入浏览器。</p>
-      </div>}
-      <footer><button className="text-action" onClick={onClose}>关闭</button></footer>
-    </section>
-  </div>;
-}
-
 function AnalysisSummaryModal({ summary, onClose }) {
   const safeSummary = normalizeAnalysisSummary(summary);
   const cursor = summary.cursor || {};
@@ -1785,20 +2235,401 @@ function normalizeSummaryEvents(events) {
   return (Array.isArray(events) ? events : []).map(summaryText).filter(Boolean);
 }
 
+function normalizeRecoveryCard(card, fallback = null) {
+  if (!card || typeof card !== "object") return fallback;
+  const evidence = normalizeRecoveryEvidenceList(card.evidence?.length ? card.evidence : fallback?.evidence);
+  const evidenceAt = (item, index) => normalizeRecoveryEvidence(item?.evidence || evidence[index] || evidence[0]);
+  const keyPoints = (Array.isArray(card.keyPoints) ? card.keyPoints : [])
+    .map((item, index) => ({
+      id: item?.id || `ai-point-${index}`,
+      memoryKey: item?.memoryKey || evidenceAt(item, index)?.memoryKey || fallback?.keyPoints?.[index]?.memoryKey,
+      title: summaryText(item?.title) || fallback?.keyPoints?.[index]?.title || `关键点 ${index + 1}`,
+      detail: summaryText(item?.detail) || fallback?.keyPoints?.[index]?.detail || "",
+      evidence: evidenceAt(item, index),
+    }))
+    .filter((item) => item.detail && item.evidence)
+    .slice(0, 3);
+  const prerequisites = (Array.isArray(card.prerequisites) ? card.prerequisites : [])
+    .map((item, index) => ({
+      id: item?.id || `ai-prereq-${index}`,
+      memoryKey: item?.memoryKey || evidenceAt(item, index + keyPoints.length)?.memoryKey || fallback?.prerequisites?.[index]?.memoryKey,
+      text: summaryText(item?.text) || fallback?.prerequisites?.[index]?.text || "",
+      evidence: evidenceAt(item, index + keyPoints.length),
+    }))
+    .filter((item) => item.text && item.evidence)
+    .slice(0, 2);
+  const questionEvidence = normalizeRecoveryEvidence(card.question?.evidence || evidence[0]);
+  return {
+    intensity: ["light", "medium", "deep", "fresh"].includes(card.intensity) ? card.intensity : fallback?.intensity || "medium",
+    absenceLabel: summaryText(card.absenceLabel) || fallback?.absenceLabel || "继续阅读前",
+    positionLabel: summaryText(card.positionLabel) || fallback?.positionLabel || "上次阅读位置",
+    keyPoints: keyPoints.length ? keyPoints : fallback?.keyPoints || [],
+    prerequisites: prerequisites.length ? prerequisites : fallback?.prerequisites || [],
+    question: {
+      memoryKey: card.question?.memoryKey || questionEvidence?.memoryKey || fallback?.question?.memoryKey,
+      prompt: summaryText(card.question?.prompt) || fallback?.question?.prompt || "继续前，先回想上一阶段的主线变化是什么？",
+      answer: summaryText(card.question?.answer) || fallback?.question?.answer || "",
+      evidence: questionEvidence || fallback?.question?.evidence || evidence[0],
+    },
+    evidence,
+  };
+}
+
+function normalizeRecoveryEvidenceList(items = []) {
+  return (Array.isArray(items) ? items : []).map(normalizeRecoveryEvidence).filter(Boolean).slice(0, 8);
+}
+
+function normalizeRecoveryEvidence(item) {
+  if (!item || typeof item !== "object") return null;
+  const cite = item.cite || {};
+  const excerpt = summaryText(item.excerpt || item.quote || cite.quote);
+  if (!excerpt) return null;
+  const chapterIndex = Number(item.chapterIndex ?? cite.chapterIndex ?? 0);
+  const paragraphIndex = Number(item.paragraphIndex ?? cite.paragraphIndex ?? 0);
+  return {
+    ...item,
+    id: item.id || cite.id || `recovery-${chapterIndex}-${paragraphIndex}`,
+    memoryKey: item.memoryKey || recoveryMemoryKey("evidence", excerpt, { chapterIndex, paragraphIndex }),
+    chapterIndex: Number.isFinite(chapterIndex) ? chapterIndex : 0,
+    paragraphIndex: Number.isFinite(paragraphIndex) ? paragraphIndex : 0,
+    chapterTitle: summaryText(item.chapterTitle || cite.chapterTitle || cite.source) || "原文",
+    excerpt,
+    quote: excerpt,
+    cite: {
+      ...cite,
+      label: cite.label || cite.id || "[C]",
+      quote: excerpt,
+    },
+    matchSources: Array.isArray(item.matchSources) ? item.matchSources : ["contextcite"],
+  };
+}
+
+function buildTraceRecoveryCard(book, indexOrMemory = {}, savedPosition = {}, lastActivity = null, bookMemoryOrTrace = null, memoryState = {}) {
+  const bookMemory = normalizeBookMemory(
+    hasBookMemoryContent(indexOrMemory) || indexOrMemory?.version
+      ? indexOrMemory
+      : bookMemoryOrTrace?.version || hasBookMemoryContent(bookMemoryOrTrace)
+        ? bookMemoryOrTrace
+        : bookMemoryFromLegacy({ index: indexOrMemory, traceMemory: bookMemoryOrTrace }),
+    { bookId: book?.id || book?.title || "book" },
+  );
+  if (!book?.chapters?.length || !hasBookMemoryContent(bookMemory)) return null;
+  const cursor = normalizeRecoveryCursor(book, savedPosition);
+  const currentPageText = (book.chapters[cursor.chapterIndex]?.paragraphs || [])
+    .slice(Math.max(0, (cursor.paragraphIndex || 0) - 2), (cursor.paragraphIndex || 0) + 1)
+    .map((item) => (typeof item === "object" ? item.text : item))
+    .filter(Boolean)
+    .join("\n");
+  const plan = buildRecoveryPlan({
+    book,
+    bookMemory,
+    cursor,
+    currentPageText,
+    lastActivity,
+    reader: memoryState?.reader || memoryState,
+    minAbsenceMs: RECOVERY_CARD_MIN_ABSENCE_MS,
+  });
+  if (!plan || plan.suppressed) return null;
+  return {
+    intensity: plan.intensity,
+    absenceLabel: plan.absenceLabel,
+    positionLabel: plan.positionLabel,
+    keyPoints: plan.keyPoints,
+    prerequisites: plan.prerequisites,
+    question: plan.question,
+    evidence: plan.evidence,
+  };
+}
+
+function normalizeRecoveryCursor(book, savedPosition = {}) {
+  const chapterIndex = Math.min(Math.max(Number(savedPosition.chapterIndex || 0), 0), book.chapters.length - 1);
+  const pageIndex = Math.max(Number(savedPosition.pageIndex || 0), 0);
+  const pageWindow = paginateChapterWindow(book.chapters[chapterIndex], pageIndex, savedPosition.pageWidth || 900);
+  const pageParagraphs = pageWindow.items.map((item) => item.paragraphIndex).filter(Number.isInteger);
+  return {
+    chapterIndex,
+    pageIndex,
+    paragraphIndex: Number.isInteger(savedPosition.paragraphIndex)
+      ? savedPosition.paragraphIndex
+      : pageParagraphs.length ? Math.max(...pageParagraphs) : Math.max(0, (book.chapters[chapterIndex]?.paragraphs || []).length - 1),
+  };
+}
+
+function hasRecoverablePriorContext(book, cursor) {
+  if (!book?.chapters?.length) return false;
+  if (cursor.chapterIndex > 0 || cursor.pageIndex > 0) return true;
+  return Number(cursor.paragraphIndex || 0) >= 2;
+}
+
+function collectTraceRecoveryAnchors(index = {}, cursor, bookMemoryOrTrace = null, memoryState = {}) {
+  const bookMemory = normalizeBookMemory(
+    bookMemoryOrTrace?.version || hasBookMemoryContent(bookMemoryOrTrace)
+      ? bookMemoryOrTrace
+      : bookMemoryFromLegacy({ index, traceMemory: bookMemoryOrTrace }),
+  );
+  const memoryAnchors = collectMemoryAnchors(bookMemory, cursor, {
+    ...memoryState,
+    lastActivityAt: memoryState?.lastActivityAt || null,
+  }).map((item) => ({
+    id: item.id,
+    kind: item.kind,
+    name: item.name,
+    title: item.name,
+    detail: item.summary,
+    summary: item.summary,
+    priority: item.priority,
+    occurrence: item.evidence,
+    evidence: item.evidence,
+    memoryKey: item.id,
+    score: item.score,
+  }));
+  const ordered = [
+    ...memoryAnchors,
+    ...traceEntries(index.timeline, "timeline"),
+    ...traceEntries(index.relationships, "relationship"),
+    ...traceEntries(index.organizations, "organization"),
+    ...traceEntries(index.people, "person"),
+    ...traceEntries(index.places, "place"),
+  ].filter((item) => isTraceEntryBeforeCursor(item, cursor));
+  return uniqueTraceAnchors(ordered)
+    .sort((left, right) => {
+      const leftScore = (left.score || 0) + recoveryAnchorScore(left, cursor, memoryState) + readerForgettingScore({ memoryKey: left.memoryKey || left.id, reader: memoryState }) * 0.2;
+      const rightScore = (right.score || 0) + recoveryAnchorScore(right, cursor, memoryState) + readerForgettingScore({ memoryKey: right.memoryKey || right.id, reader: memoryState }) * 0.2;
+      return rightScore - leftScore;
+    })
+    .slice(0, 6)
+    .map(traceEntryToRecoveryAnchor)
+    .filter((item) => item.title && item.detail && item.evidence);
+}
+
+function traceMemoryEntries(traceMemory = null) {
+  return (traceMemory?.anchors || []).flatMap((anchor) => (anchor.items || []).map((item) => {
+    const evidence = normalizeRecoveryEvidence(item.evidence || item);
+    return {
+      id: `${anchor.id}:${item.title || item.name || evidence?.id || Math.random()}`,
+      kind: anchor.id || "memory",
+      name: summaryText(item.title || item.name || anchor.label),
+      title: summaryText(item.title || item.name || anchor.label),
+      detail: summaryText(item.summary || item.detail || item.reason || evidence?.excerpt),
+      summary: summaryText(item.summary || item.detail || item.reason || evidence?.excerpt),
+      priority: item.priority || "primary",
+      occurrence: evidence ? { chapterIndex: evidence.chapterIndex, paragraphIndex: evidence.paragraphIndex } : item.occurrence,
+      evidence,
+      cite: evidence?.cite,
+    };
+  })).filter((item) => item.title && item.detail && item.evidence);
+}
+
+function suggestTraceOrganizers(index = {}, bookMemoryOrTrace = null, traceProfile = null) {
+  const bookMemory = normalizeBookMemory(
+    bookMemoryOrTrace?.version || hasBookMemoryContent(bookMemoryOrTrace)
+      ? bookMemoryOrTrace
+      : bookMemoryFromLegacy({ index, traceMemory: bookMemoryOrTrace }),
+  );
+  const anchors = compatibilityTraceMemory(bookMemory).anchors || [];
+  const suggestions = [];
+  if ((index.relationships || []).length >= 2) {
+    suggestions.push({ type: "relationship", label: "关系图", reason: `${index.relationships.length} 条可追溯关系` });
+  }
+  if ((index.timeline || []).filter((item) => item.priority === "primary" || item.importance === "primary").length >= 3 || (index.timeline || []).length >= 5) {
+    suggestions.push({ type: "timeline", label: "时间链", reason: "事件顺序会影响理解" });
+  }
+  const conceptCount = anchors
+    .filter((anchor) => /concept|definition|mechanism|framework|knowledge|formula|api|flow|prerequisite/i.test(anchor.id || ""))
+    .reduce((sum, anchor) => sum + (anchor.items || []).length, 0);
+  if (conceptCount >= 3 || /science|technology|business|learning/i.test(traceProfile?.id || "")) {
+    suggestions.push({ type: "concept", label: "概念图", reason: "当前类型更依赖概念结构" });
+  }
+  const argumentCount = anchors
+    .filter((anchor) => /argument|proposition|objection|conclusion|decision|pitfall/i.test(anchor.id || ""))
+    .reduce((sum, anchor) => sum + (anchor.items || []).length, 0);
+  if (argumentCount >= 2 || /philosophy|business/i.test(traceProfile?.id || "")) {
+    suggestions.push({ type: "argument", label: "论证链", reason: "适合按观点与因果回忆" });
+  }
+  return uniqueBy(suggestions, (item) => item.type).slice(0, 4);
+}
+
+function organizerItemsForType(type, index = {}, bookMemoryOrTrace = null) {
+  const bookMemory = normalizeBookMemory(
+    bookMemoryOrTrace?.version || hasBookMemoryContent(bookMemoryOrTrace)
+      ? bookMemoryOrTrace
+      : bookMemoryFromLegacy({ index, traceMemory: bookMemoryOrTrace }),
+  );
+  if (type === "timeline") {
+    return (bookMemory.timeline || index.timeline || []).slice(0, 8).map((item) => traceEntryToRecoveryAnchor({ ...item, kind: "timeline", name: item.name || item.title, summary: item.summary || item.detail, evidence: item.evidence || item.occurrence }));
+  }
+  if (type === "concept") {
+    return (bookMemory.topics || []).slice(0, 8).map((item) => traceEntryToRecoveryAnchor({
+      ...item,
+      kind: item.kind || "concept",
+      name: item.name,
+      summary: item.summary,
+      evidence: item.evidence,
+      occurrence: item.evidence,
+    }));
+  }
+  if (type === "argument") {
+    return (bookMemory.arguments || []).slice(0, 8).map((item) => traceEntryToRecoveryAnchor({
+      ...item,
+      kind: item.kind || "argument",
+      name: item.name,
+      summary: item.summary,
+      evidence: item.evidence,
+      occurrence: item.evidence,
+    }));
+  }
+  return collectTraceRecoveryAnchors(index, getMaxIndexCursor(index), bookMemory).slice(0, 8);
+}
+
+function getMaxIndexCursor(index = {}) {
+  const entries = [
+    ...traceEntries(index.timeline, "timeline"),
+    ...traceEntries(index.relationships, "relationship"),
+    ...traceEntries(index.organizations, "organization"),
+    ...traceEntries(index.people, "person"),
+    ...traceEntries(index.places, "place"),
+  ];
+  return entries.reduce((cursor, item) => {
+    const occurrence = item.occurrence || item.evidence || {};
+    const chapterIndex = Number(occurrence.chapterIndex);
+    const paragraphIndex = Number(occurrence.paragraphIndex);
+    if (!Number.isInteger(chapterIndex) || !Number.isInteger(paragraphIndex)) return cursor;
+    if (chapterIndex > cursor.chapterIndex || (chapterIndex === cursor.chapterIndex && paragraphIndex > cursor.paragraphIndex)) {
+      return { chapterIndex, paragraphIndex, pageIndex: 0 };
+    }
+    return cursor;
+  }, { chapterIndex: 0, paragraphIndex: 0, pageIndex: 0 });
+}
+
+function traceEntries(items = [], kind) {
+  return (Array.isArray(items) ? items : []).map((item) => ({ ...item, kind })).filter((item) => summaryText(item.name || item.title || item.source || item.target));
+}
+
+function isTraceEntryBeforeCursor(item, cursor) {
+  const occurrence = item.occurrence || item.evidence || {};
+  const chapterIndex = Number(occurrence.chapterIndex);
+  const paragraphIndex = Number(occurrence.paragraphIndex);
+  if (!Number.isInteger(chapterIndex) || !Number.isInteger(paragraphIndex)) return false;
+  return chapterIndex < cursor.chapterIndex || (chapterIndex === cursor.chapterIndex && paragraphIndex <= cursor.paragraphIndex);
+}
+
+function recoveryAnchorScore(item, cursor, memoryState = {}) {
+  const occurrence = item.occurrence || item.evidence || {};
+  const primary = item.priority === "primary" || item.importance === "primary" ? 100 : 25;
+  const kindWeight = { events: 42, plot: 40, concepts: 38, mechanisms: 38, timeline: 36, relationship: 34, organizations: 28, organization: 28, people: 24, person: 24, places: 16, place: 16 }[item.kind] || 30;
+  const detail = summaryText(item.detail || item.summary || item.subtitle || item.relation || item.evidenceQuote || item.evidence?.quote);
+  const mainline = recoveryMainlineScore(detail);
+  const chapterDistance = Math.max(0, cursor.chapterIndex - Number(occurrence.chapterIndex || 0));
+  const proximity = Math.max(0, 24 - chapterDistance * 8);
+  const memoryKey = recoveryMemoryKey(item.kind || "trace", item.name || item.title || `${item.source || ""}-${item.target || ""}`, occurrence);
+  const memoryBoost = recoveryForgettingBoost(memoryState[memoryKey], occurrence, cursor);
+  return primary + kindWeight + mainline + proximity + memoryBoost;
+}
+
+function uniqueTraceAnchors(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = `${item.kind}:${summaryText(item.name || item.title || `${item.source}-${item.target}`)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function traceEntryToRecoveryAnchor(item) {
+  const occurrence = item.occurrence || item.evidence || {};
+  const evidence = normalizeRecoveryEvidence({
+    id: item.id,
+    chapterIndex: occurrence.chapterIndex,
+    paragraphIndex: occurrence.paragraphIndex,
+    chapterTitle: item.chapterTitle || item.evidence?.chapterTitle,
+    excerpt: item.evidenceQuote || item.evidence?.quote || item.detail || item.summary,
+    quote: item.evidenceQuote || item.evidence?.quote || item.detail || item.summary,
+    cite: item.cite,
+    matchSources: ["trace"],
+  });
+  const title = recoveryAnchorTitle(item);
+  const detail = recoveryAnchorDetail(item, evidence?.excerpt);
+  return {
+    kind: item.kind,
+    memoryKey: recoveryMemoryKey(item.kind || "trace", title, occurrence),
+    title,
+    detail,
+    prerequisite: recoveryPrerequisiteFromAnchor(item, title),
+    evidence,
+  };
+}
+
+function recoveryAnchorTitle(item) {
+  if (item.kind === "relationship") return summaryText(`${item.source}—${item.target}`).slice(0, 18);
+  if (item.kind === "timeline") return summaryText(item.subtitle || item.name || item.title).slice(0, 18);
+  return summaryText(item.name || item.title).slice(0, 18);
+}
+
+function recoveryAnchorDetail(item, fallback = "") {
+  if (item.kind === "relationship") {
+    return summaryText(`${item.source}与${item.target}的关系是：${item.relation || "主线相关"}`).slice(0, 96);
+  }
+  return summaryText(item.detail || item.summary || item.subtitle || fallback).slice(0, 96);
+}
+
+function buildTracePrerequisites(anchors, chapterTitle = "当前章节") {
+  return anchors.slice(0, 2).map((item, index) => ({
+    id: `trace-prereq-${index}`,
+    text: item.prerequisite || `继续读《${chapterTitle}》前，先接上：${item.title}。`,
+    evidence: item.evidence,
+  })).filter((item) => item.text && item.evidence);
+}
+
+function recoveryPrerequisiteFromAnchor(item, title) {
+  if (item.kind === "timeline") return `当前页承接前文的关键事件：${title}。忘记它会影响对后续因果的理解。`;
+  if (item.kind === "relationship") return `先想起这条关系变化：${title}。它会影响当前人物或组织行为的判断。`;
+  if (item.kind === "organization") return `先记起这个组织在前文中的作用：${title}。当前页常在延续它的决策或行动。`;
+  if (item.kind === "person") return `先记起这个人物为什么进入主线：${title}。不要只记名字，要记住他推动了什么。`;
+  return `先记起这个地点和主线的关系：${title}。它通常代表行动空间或形势变化。`;
+}
+
+function recoveryQuestionFromAnchor(anchor, chapterTitle = "当前章节") {
+  if (!anchor) return `继续读《${chapterTitle}》前，上一阶段最关键的变化是什么？`;
+  return `继续读《${chapterTitle}》前，你还记得“${anchor.title}”为什么会影响后面的内容吗？`;
+}
+
+function flattenRecoverySource(chapters = []) {
+  return chapters.flatMap((chapter, localChapterIndex) => {
+    const chapterIndex = chapter.sourceChapterIndex ?? chapter.chapterIndex ?? localChapterIndex;
+    return (chapter.paragraphs || []).map((item, paragraphIndex) => ({
+      chapterIndex,
+      chapterTitle: chapter.title,
+      paragraphIndex: typeof item === "object" ? item.paragraphIndex ?? paragraphIndex : paragraphIndex,
+      text: typeof item === "object" ? item.text : item,
+    }));
+  }).filter((item) => summaryText(item.text));
+}
+
 function summaryText(item) {
   const clean = (value) => {
     const text = String(value || "").trim();
-    return text && text.toLowerCase() !== "undefined" && text.toLowerCase() !== "null" ? text : "";
+    return text && !/^(undefined|null|nan)$/i.test(text) ? text : "";
   };
   if (typeof item === "string") {
     const text = clean(item);
-    return text && !/^undefined(?:\s*·\s*undefined)?$/i.test(text) ? text : "";
+    return text && !/^undefined(?:s*[·路-]s*undefined)?$/i.test(text) ? text : "";
   }
   if (!item || typeof item !== "object") return "";
   return [item.name || item.date || item.title, item.subtitle || item.summary || item.detail]
     .map(clean)
     .filter(Boolean)
     .join(" · ");
+}
+
+function uniqueBy(items, keyFn) {
+  const seen = new Set();
+  return (items || []).filter((item) => {
+    const key = keyFn(item);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 function getNewReadingContent(chapters, previousCursor, currentCursor) {
@@ -1811,14 +2642,20 @@ function getNewReadingContent(chapters, previousCursor, currentCursor) {
     if (!chapter) continue;
     const start = chapterIndex === previous.chapterIndex ? previous.paragraphIndex + 1 : 0;
     const end = chapterIndex === currentCursor.chapterIndex ? currentCursor.paragraphIndex + 1 : chapter.paragraphs.length;
-    const paragraphs = chapter.paragraphs.slice(Math.max(0, start), Math.max(0, end));
+    const paragraphs = chapter.paragraphs
+      .slice(Math.max(0, start), Math.max(0, end))
+      .map((text, offset) => ({ paragraphIndex: Math.max(0, start) + offset, text }));
     if (paragraphs.length) source.push({ sourceChapterIndex: chapterIndex, title: chapter.title, paragraphs });
   }
   return source;
 }
 
 function getFullBookContent(chapters) {
-  return chapters.map((chapter, sourceChapterIndex) => ({ sourceChapterIndex, title: chapter.title, paragraphs: chapter.paragraphs }));
+  return chapters.map((chapter, sourceChapterIndex) => ({
+    sourceChapterIndex,
+    title: chapter.title,
+    paragraphs: chapter.paragraphs.map((text, paragraphIndex) => ({ paragraphIndex, text })),
+  }));
 }
 
 function getFullBookCursor(book) {
@@ -1827,21 +2664,394 @@ function getFullBookCursor(book) {
   return { chapterIndex, paragraphIndex, pageIndex: 0, pageCount: 1, scope: "full" };
 }
 
+function getLogicalPageMetrics(pageWidth = 900) {
+  const charBudget = Math.max(700, Math.min(980, Math.round((Number(pageWidth) || 900) * 0.86)));
+  return { charBudget, longSegmentSize: Math.max(340, Math.round(charBudget * 0.86)) };
+}
+
+function paginateChapterWindow(chapter, pageIndex = 0, pageWidth = 900) {
+  const paragraphs = chapter?.paragraphs || [];
+  if (!paragraphs.length) return { pageCount: 1, items: [] };
+  const targetPage = Math.max(0, Number(pageIndex) || 0);
+  const { charBudget, longSegmentSize } = getLogicalPageMetrics(pageWidth);
+  const items = [];
+  let currentSize = 0;
+  let currentPage = 0;
+
+  paragraphs.forEach((paragraph, paragraphIndex) => {
+    const text = summaryText(paragraph).trim();
+    if (!text) return;
+    for (let offset = 0; offset < text.length; offset += longSegmentSize) {
+      const segment = text.slice(offset, offset + longSegmentSize);
+      const size = segment.length + 42;
+      if (currentSize && currentSize + size > charBudget) {
+        currentPage += 1;
+        currentSize = 0;
+      }
+      if (currentPage === targetPage) items.push({ text: segment, paragraphIndex, segmentIndex: Math.floor(offset / longSegmentSize) });
+      currentSize += size;
+      if (size >= charBudget) {
+        currentPage += 1;
+        currentSize = 0;
+      }
+    }
+  });
+
+  return { pageCount: Math.max(1, currentPage + (currentSize > 0 ? 1 : 0)), items };
+}
+
+function findPageForParagraphInChapter(chapter, paragraphIndex = 0, pageWidth = 900) {
+  const paragraphs = chapter?.paragraphs || [];
+  const target = Number(paragraphIndex) || 0;
+  const { charBudget, longSegmentSize } = getLogicalPageMetrics(pageWidth);
+  let currentSize = 0;
+  let currentPage = 0;
+  for (let index = 0; index < paragraphs.length; index += 1) {
+    const text = summaryText(paragraphs[index]).trim();
+    if (!text) continue;
+    for (let offset = 0; offset < text.length; offset += longSegmentSize) {
+      const segment = text.slice(offset, offset + longSegmentSize);
+      const size = segment.length + 42;
+      if (currentSize && currentSize + size > charBudget) {
+        currentPage += 1;
+        currentSize = 0;
+      }
+      if (index >= target) return currentPage;
+      currentSize += size;
+      if (size >= charBudget) {
+        currentPage += 1;
+        currentSize = 0;
+      }
+    }
+  }
+  return Math.max(0, currentPage);
+}
+
+function buildRecoveryCard(book, readPages = [], savedPosition = {}, lastActivity = null, memoryState = {}) {
+  if (!book?.chapters?.length) return null;
+  const lastActivityTime = Number(lastActivity || 0);
+  if (lastActivityTime && Date.now() - lastActivityTime < RECOVERY_CARD_MIN_ABSENCE_MS) return null;
+  const cursor = normalizeRecoveryCursor(book, savedPosition);
+  if (!hasRecoverablePriorContext(book, cursor) && !readPages.length) return null;
+  const evidence = collectRecoveryEvidence(book, cursor, memoryState);
+  if (evidence.length < 2) return null;
+  const absence = describeReadingAbsence(lastActivity);
+  const keyPoints = evidence.slice(0, 3).map((item, index) => ({
+    id: `point-${index}`,
+    memoryKey: item.memoryKey,
+    title: recoveryPointTitle(item.excerpt, index),
+    detail: recoveryPointDetail(item.excerpt),
+    evidence: item,
+  }));
+  const prerequisites = buildRecoveryPrerequisites(book, cursor, evidence);
+  const questionEvidence = evidence[0];
+  return {
+    intensity: absence.intensity,
+    absenceLabel: absence.label,
+    positionLabel: `上次读到 ${book.chapters[cursor.chapterIndex]?.title || `第 ${cursor.chapterIndex + 1} 节`} · 第 ${cursor.pageIndex + 1} 页`,
+    keyPoints,
+    prerequisites,
+    question: {
+      memoryKey: questionEvidence?.memoryKey,
+      prompt: buildRecoveryQuestion(book, cursor, evidence),
+      answer: questionEvidence?.excerpt || "先回想上一阶段的主线变化，再继续阅读当前页。",
+      evidence: questionEvidence,
+    },
+    evidence,
+  };
+}
+
+function getLatestReadPage(readPages = []) {
+  if (!readPages.length) return null;
+  return [...readPages].sort((left, right) => right.chapterIndex - left.chapterIndex || right.pageIndex - left.pageIndex || right.paragraphIndex - left.paragraphIndex)[0];
+}
+
+function laterCursor(left, right) {
+  if (!left) return right || null;
+  if (!right) return left;
+  if (left.chapterIndex !== right.chapterIndex) return left.chapterIndex > right.chapterIndex ? left : right;
+  return (left.paragraphIndex ?? 0) >= (right.paragraphIndex ?? 0) ? left : right;
+}
+
+function collectRecoveryEvidence(book, cursor, memoryState = {}) {
+  const candidates = [];
+  for (let chapterIndex = cursor.chapterIndex; chapterIndex >= 0; chapterIndex -= 1) {
+    const chapter = book.chapters[chapterIndex];
+    if (!chapter || isNonNarrativeChapter(chapter.title)) continue;
+    const maxParagraph = chapterIndex === cursor.chapterIndex ? Math.min(cursor.paragraphIndex ?? chapter.paragraphs.length - 1, chapter.paragraphs.length - 1) : chapter.paragraphs.length - 1;
+    for (let paragraphIndex = maxParagraph; paragraphIndex >= 0; paragraphIndex -= 1) {
+      const text = cleanRecoveryText(chapter.paragraphs[paragraphIndex]);
+      if (!text || text.length < 24 || isPublicationMetadata(text) || isIncidentalRecoveryText(text)) continue;
+      const occurrence = { chapterIndex, paragraphIndex };
+      const memoryKey = recoveryMemoryKey("paragraph", recoveryPointTitle(text, candidates.length), occurrence);
+      const score = scoreRecoveryParagraph(text, chapter.title, cursor, chapterIndex, paragraphIndex) + recoveryForgettingBoost(memoryState[memoryKey], occurrence, cursor);
+      if (score <= 0) continue;
+      candidates.push({
+        id: `recovery-${chapterIndex}-${paragraphIndex}`,
+        memoryKey,
+        chapterIndex,
+        chapterTitle: chapter.title,
+        paragraphIndex,
+        excerpt: text,
+        score,
+        cite: {
+          label: `[R${candidates.length + 1}]`,
+          source: `${chapter.title} · 第 ${paragraphIndex + 1} 段`,
+          quote: text,
+        },
+        matchSources: ["mainline-recovery"],
+      });
+    }
+  }
+  return candidates
+    .sort((left, right) => right.score - left.score || right.chapterIndex - left.chapterIndex || right.paragraphIndex - left.paragraphIndex)
+    .slice(0, 5)
+    .sort((left, right) => left.chapterIndex - right.chapterIndex || left.paragraphIndex - right.paragraphIndex);
+}
+
+function scoreRecoveryParagraph(text, chapterTitle, cursor, chapterIndex, paragraphIndex) {
+  let score = recoveryMainlineScore(text);
+  if (chapterIndex === cursor.chapterIndex) score += 12;
+  const distance = Math.abs((cursor.paragraphIndex || 0) - paragraphIndex);
+  score += Math.max(0, 16 - Math.floor(distance / 2));
+  if (/第一章|第[一二三四五六七八九十]+章|chapter/i.test(chapterTitle || "")) score += 4;
+  if (/出生|生于|逝世|享年|出版|印刷|译者|版权|ISBN|目录|序言/.test(text)) score -= 28;
+  if (text.length > 45 && text.length < 160) score += 6;
+  return score;
+}
+
+function recoveryMainlineScore(text) {
+  let score = 0;
+  const groups = [
+    [18, /转折|决定|命令|部署|会议|冲突|突破|重围|撤退|转移|进攻|防守|会师|围剿|起义|谈判|分裂|危机|失败|胜利|牺牲|被俘|追击|主力|战略|战役|形势|原因|导致|因此|于是|为了/],
+    [12, /主张|观点|结论|概念|机制|模型|定义|原则|问题|矛盾|线索|铺垫|承接|影响|关键|核心|重要/],
+    [8, /红军|国民党|中央|军团|军委|政委|司令|组织|部队|政府|委员会|根据地/],
+    [4, /说|认为|指出|表示|要求|宣布|计划|准备|开始|继续/],
+  ];
+  groups.forEach(([weight, pattern]) => {
+    if (pattern.test(text)) score += weight;
+  });
+  return score;
+}
+
+function isIncidentalRecoveryText(text) {
+  if (/^(他|他们|她|这|那|也就是|报告|指出)$/.test(text)) return true;
+  if (text.length < 18) return true;
+  const hasMainline = recoveryMainlineScore(text) >= 12;
+  const onlyEntityList = /^([一-鿿]{2,4}[、，,]){2,}[一-鿿]{2,4}/.test(text) && !hasMainline;
+  return onlyEntityList;
+}
+
+function buildRecoveryPrerequisites(book, cursor, evidence) {
+  const chapterTitle = book.chapters[cursor.chapterIndex]?.title || "当前章节";
+  const previous = evidence[0];
+  const current = evidence[1] || evidence[0];
+  return [
+    {
+      id: "prereq-mainline",
+      text: `继续读《${chapterTitle}》前，先接上前文主线：${recoveryPointTitle(previous?.excerpt || "", 0)}。`,
+      evidence: previous,
+    },
+    {
+      id: "prereq-cause",
+      text: current ? `当前页更需要记住因果承接：${recoveryPointTitle(current.excerpt, 1)}。` : "先回到上次结束前的主线变化，再继续当前页。",
+      evidence: current,
+    },
+  ].filter((item) => item.evidence);
+}
+
+function updateRecoveryMemoryState(book, card, action) {
+  if (!book || !card || !["shown", "remembered", "missed", "hint", "answer"].includes(action)) return;
+  const storageKey = recoveryMemoryStorageKey(book);
+  const current = loadStored(storageKey, {});
+  const now = new Date().toISOString();
+  const keys = recoveryCardMemoryKeys(card);
+  if (!keys.length) return;
+  const next = { ...current };
+  keys.forEach((key) => {
+    const item = next[key] || { strength: 0, shown: 0, remembered: 0, missed: 0, hints: 0, answers: 0 };
+    const updated = { ...item, updatedAt: now };
+    if (action === "shown") {
+      updated.shown = Number(updated.shown || 0) + 1;
+      updated.lastShownAt = now;
+    }
+    if (action === "remembered") {
+      updated.remembered = Number(updated.remembered || 0) + 1;
+      updated.lastReviewedAt = now;
+      updated.strength = Math.min(5, Number(updated.strength || 0) + 1);
+    }
+    if (action === "missed") {
+      updated.missed = Number(updated.missed || 0) + 1;
+      updated.lastReviewedAt = now;
+      updated.strength = Math.max(0, Number(updated.strength || 0) - 1);
+    }
+    if (action === "hint") {
+      updated.hints = Number(updated.hints || 0) + 1;
+      updated.lastHintAt = now;
+      updated.strength = Math.max(0, Number(updated.strength || 0) - 0.5);
+    }
+    if (action === "answer") {
+      updated.answers = Number(updated.answers || 0) + 1;
+      updated.lastAnswerAt = now;
+      updated.strength = Math.max(0, Number(updated.strength || 0) - 1);
+    }
+    next[key] = updated;
+  });
+  next.reader = updateReaderMemory(current.reader || null, {
+    lastActivityAt: Date.now(),
+    rememberedKeys: action === "remembered" ? keys : [],
+    missedKeys: action === "missed" ? keys : [],
+    forgettingScores: Object.fromEntries(keys.map((key) => [
+      key,
+      readerForgettingScore({
+        memoryKey: key,
+        reader: {
+          rememberedKeys: action === "remembered" ? keys : [],
+          missedKeys: action === "missed" ? keys : [],
+        },
+      }),
+    ])),
+  });
+  localStorage.setItem(storageKey, JSON.stringify(next));
+}
+
+function recoveryCardMemoryKeys(card) {
+  const keys = [
+    ...(card.keyPoints || []).map((item) => item.memoryKey || item.evidence?.memoryKey),
+    ...(card.prerequisites || []).map((item) => item.memoryKey || item.evidence?.memoryKey),
+    card.question?.memoryKey,
+    card.question?.evidence?.memoryKey,
+    ...(card.evidence || []).map((item) => item.memoryKey),
+  ];
+  return [...new Set(keys.filter(Boolean))].slice(0, 8);
+}
+
+function recoveryMemoryKey(kind = "memory", title = "", occurrence = {}) {
+  const chapterIndex = Number.isInteger(Number(occurrence.chapterIndex)) ? Number(occurrence.chapterIndex) : 0;
+  const paragraphIndex = Number.isInteger(Number(occurrence.paragraphIndex)) ? Number(occurrence.paragraphIndex) : 0;
+  const normalizedTitle = summaryText(title || "memory").replace(/\s+/g, "").slice(0, 32);
+  return `${kind}:${chapterIndex}:${paragraphIndex}:${normalizedTitle}`;
+}
+
+function recoveryForgettingBoost(state = null, occurrence = {}, cursor = {}) {
+  const chapterDistance = Math.max(0, Number(cursor.chapterIndex || 0) - Number(occurrence.chapterIndex || 0));
+  const paragraphDistance = Number(cursor.chapterIndex || 0) === Number(occurrence.chapterIndex || 0)
+    ? Math.max(0, Number(cursor.paragraphIndex || 0) - Number(occurrence.paragraphIndex || 0))
+    : 0;
+  const distanceBoost = Math.min(18, chapterDistance * 7 + Math.floor(paragraphDistance / 8));
+  if (!state) return distanceBoost;
+  const strength = Math.max(0, Number(state.strength || 0));
+  const intervalHours = [8, 18, 36, 72, 120, 192][Math.min(5, Math.floor(strength))];
+  const lastReviewed = Date.parse(state.lastReviewedAt || state.lastShownAt || state.updatedAt || "");
+  const elapsedHours = Number.isFinite(lastReviewed) ? Math.max(0, (Date.now() - lastReviewed) / 3600000) : intervalHours;
+  const overdueBoost = Math.min(24, Math.max(0, elapsedHours / intervalHours) * 10);
+  const struggleBoost = Math.min(18, Number(state.missed || 0) * 8 + Number(state.answers || 0) * 6 + Number(state.hints || 0) * 3);
+  const rememberedPenalty = Math.min(16, Number(state.remembered || 0) * 4 + strength * 3);
+  return Math.max(0, Math.min(36, distanceBoost + overdueBoost + struggleBoost - rememberedPenalty));
+}
+
+function buildRecoveryQuestion(book, cursor, evidence) {
+  const chapterTitle = book.chapters[cursor.chapterIndex]?.title || "当前章节";
+  const first = evidence[0]?.excerpt || "";
+  if (/原因|因为|导致|因此|于是|为了|影响/.test(first)) return `继续读《${chapterTitle}》前，上一阶段最关键的因果变化是什么？`;
+  if (/命令|决定|部署|会议|计划|准备/.test(first)) return `继续读《${chapterTitle}》前，前文哪个决定或部署正在影响当前局势？`;
+  if (/冲突|危机|失败|胜利|突破|撤退|转移/.test(first)) return `继续读《${chapterTitle}》前，上一阶段的主要冲突推进到了哪一步？`;
+  return `继续读《${chapterTitle}》前，前文留下的主线变化是什么？`;
+}
+
+function recoveryPointTitle(text, index) {
+  const clean = cleanRecoveryText(text);
+  if (/赤匪来了|陷入混乱|逃进深山|空荡荡/.test(clean)) return "小镇陷入混乱";
+  if (/巨大灾难|影响深远|恶战|后果/.test(clean)) return "灾难即将展开";
+  if (/不安|空旷|闪现|土黄色|镇口/.test(clean)) return "红军察觉异常";
+  if (/决定|命令|部署|会议|计划/.test(clean)) return "关键决策形成";
+  if (/冲突|危机|突破|撤退|转移|失败|胜利/.test(clean)) return "主线冲突推进";
+  if (/原因|导致|因此|于是|为了|影响/.test(clean)) return "因果线索明确";
+  if (/概念|定义|机制|模型|原则/.test(clean)) return "核心概念出现";
+  const sentence = clean.split(/[。！？；]/).find((item) => item.trim().length >= 8) || clean;
+  return sentence.slice(0, 22) || `关键点 ${index + 1}`;
+}
+
+function recoveryPointDetail(text) {
+  const clean = cleanRecoveryText(text);
+  const sentence = clean.split(/[。！？；]/).find((item) => item.trim().length >= 12) || clean;
+  return sentence.slice(0, 62) + (sentence.length > 62 ? "…" : "");
+}
+
+function cleanRecoveryText(value) {
+  return summaryText(value)
+    .replace(/s+/g, "")
+    .replace(/^["“”'‘’]+|["“”'‘’]+$/g, "")
+    .slice(0, 140);
+}
+
+function describeReadingAbsence(lastActivity) {
+  const timestamp = Number(lastActivity || 0);
+  if (!timestamp) return { label: "继续阅读前", intensity: "fresh" };
+  const days = Math.floor((Date.now() - timestamp) / 86400000);
+  if (days <= 0) return { label: "刚刚读过", intensity: "fresh" };
+  if (days <= 1) return { label: "隔了一天", intensity: "light" };
+  if (days <= 3) return { label: `隔了 ${days} 天`, intensity: "medium" };
+  if (days <= 7) return { label: `隔了 ${days} 天`, intensity: "deep" };
+  return { label: "久违续读", intensity: "deep" };
+}
+
 function countReadPagesAfter(readPages, cursor) {
   if (!cursor) return readPages.length;
   return readPages.filter((page) => page.chapterIndex > cursor.chapterIndex || (page.chapterIndex === cursor.chapterIndex && page.pageIndex > cursor.pageIndex)).length;
 }
 
 function analysisStorageKey(book) {
-  return `yuezhi-analysis:${book.title}:${book.creator || "unknown"}:${book.chapters.length}`;
+  return `yuezhi-analysis:${TRACE_ANALYSIS_VERSION}:${storageBookIdentity(book)}`;
+}
+
+function hydrateAnalysisRecord(storedRecord, book = null) {
+  if (!storedRecord) return null;
+  const bookMemory = normalizeBookMemory(
+    storedRecord.bookMemory || bookMemoryFromLegacy({
+      index: storedRecord.index,
+      traceMemory: storedRecord.traceMemory,
+      cursor: storedRecord.cursor,
+      profile: storedRecord.profile,
+      traceProfile: storedRecord.traceProfile,
+    }, { bookId: book?.id || book?.title || "book", cursor: storedRecord.cursor }),
+    { bookId: book?.id || book?.title || "book", cursor: storedRecord.cursor, profile: storedRecord.profile, traceProfile: storedRecord.traceProfile },
+  );
+  const index = normalizeReadingIndex(storedRecord.index || readingIndexFromBookMemory(bookMemory));
+  return {
+    ...storedRecord,
+    bookMemory,
+    index,
+    traceMemory: storedRecord.traceMemory || compatibilityTraceMemory(bookMemory),
+    summary: normalizeAnalysisSummary(storedRecord.summary),
+    recoveryCard: normalizeRecoveryCard(storedRecord.recoveryCard, null),
+  };
+}
+
+function clearLegacyAnalysisStorage() {
+  try {
+    Object.keys(localStorage)
+      .filter((key) => key.startsWith("yuezhi-analysis:") && !key.startsWith(`yuezhi-analysis:${TRACE_ANALYSIS_VERSION}:`))
+      .forEach((key) => localStorage.removeItem(key));
+  } catch {
+    // Ignore storage access failures; analysis can still run without cache.
+  }
 }
 
 function readPagesStorageKey(book) {
   return `yuezhi-read-pages:${storageBookIdentity(book)}`;
 }
 
+function recoveryMemoryStorageKey(book) {
+  return `shumai-recovery-memory:${storageBookIdentity(book)}`;
+}
+
 function readingPositionStorageKey(book) {
   return `yuezhi-reading-position:${book.id || book.title}:${book.creator || "unknown"}:${book.chapters.length}`;
+}
+
+function readingActivityStorageKey(book) {
+  return `yuezhi-reading-activity:${storageBookIdentity(book)}`;
 }
 
 function storageBookIdentity(book) {

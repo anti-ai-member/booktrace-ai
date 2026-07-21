@@ -2,22 +2,63 @@ import "dotenv/config";
 import express from "express";
 import { ChatOpenAI } from "@langchain/openai";
 import { BOOK_TYPES } from "./src/bookTaxonomy.js";
+import { resolveTraceProfile, traceProfileForPrompt } from "./src/traceProfiles.js";
+import {
+  bookMemoryFromLegacy,
+  compatibilityTraceMemory,
+  mergeBookMemory,
+  normalizeBookMemory,
+  readingIndexFromBookMemory,
+} from "./src/memoryModels.js";
 
 const app = express();
 app.use(express.json({ limit: "12mb" }));
+const TRACE_ACTION_WORDS = /出发|抵达|进入|离开|命令|决定|转移|撤退|突围|会合|指挥|率领|带领|阻击|战斗|冲突|失败|胜利|发现|看见|证明|导致|形成|改变|抛弃|召开|警觉|迂回|接敌|掩护|杀开|翻译|移动|通过|追赶|牺牲/;
 
 const PROVIDERS = {
   deepseek: {
     apiKey: "DEEPSEEK_API_KEY",
     baseURL: "https://api.deepseek.com",
     defaultModel: "deepseek-v4-flash",
+    recoveryModel: "deepseek-v4-pro",
   },
   openai: {
     apiKey: "OPENAI_API_KEY",
     baseURL: undefined,
     defaultModel: "gpt-4.1-mini",
+    recoveryModel: "gpt-4.1-mini",
   },
 };
+
+/** Default model for continued-reading recovery cards (DeepSeek Pro + thinking). */
+const DEFAULT_RECOVERY_MODEL = "deepseek-v4-pro";
+
+function createModelClient({ provider, model, thinking = false }) {
+  const config = PROVIDERS[provider];
+  const resolvedModel = model || config.defaultModel;
+  const modelKwargs = thinking && provider === "deepseek"
+    ? { thinking: { type: "enabled" }, reasoning_effort: "high" }
+    : undefined;
+  return {
+    model: resolvedModel,
+    client: new ChatOpenAI({
+      apiKey: process.env[config.apiKey],
+      model: resolvedModel,
+      // Thinking mode ignores sampling params; omit temperature when enabled.
+      ...(thinking ? {} : { temperature: 0 }),
+      maxTokens: thinking ? 8192 : undefined,
+      timeout: thinking ? 180_000 : 60_000,
+      configuration: config.baseURL ? { baseURL: config.baseURL } : undefined,
+      modelKwargs,
+    }),
+  };
+}
+
+function resolveRecoveryModel(provider, model) {
+  const config = PROVIDERS[provider];
+  if (model && String(model).trim()) return String(model).trim();
+  return config?.recoveryModel || DEFAULT_RECOVERY_MODEL;
+}
 
 app.get("/api/health", (_request, response) => response.json({ ok: true }));
 
@@ -31,52 +72,395 @@ app.post("/api/classify-book", async (request, response) => {
   if (!apiKey) return response.status(400).json({ error: `Please configure ${config.apiKey} in .env first` });
 
   try {
-    const modelClient = new ChatOpenAI({
-      apiKey,
-      model: model || config.defaultModel,
-      temperature: 0,
-      configuration: config.baseURL ? { baseURL: config.baseURL } : undefined,
-    });
+    const { client: modelClient, model: resolvedModel } = createModelClient({ provider, model });
     const result = await modelClient.invoke([
       ["system", "You classify books for a quiet AI reading app. Return compact JSON only, with no Markdown."],
       ["human", buildClassificationPrompt(book)],
     ]);
-    const parsed = parseJson(result.content);
+    const parsed = parseJson(messageContent(result));
     const profile = normaliseProfile({ category: parsed.category, facets: parsed.facets });
-    response.json({ provider, model: model || config.defaultModel, profile, reason: String(parsed.reason || "").slice(0, 140) });
+    response.json({ provider, model: resolvedModel, profile, reason: String(parsed.reason || "").slice(0, 140) });
   } catch (error) {
     response.status(502).json({ error: error.message || "Book classification failed" });
   }
 });
 
-app.post("/api/analyze", async (request, response) => {
-  const { provider = "deepseek", model, book, previousIndex, cursor, scope = "read" } = request.body || {};
+app.post("/api/recovery-card", async (request, response) => {
+  const {
+    provider = "deepseek",
+    model,
+    thinking = true,
+    book,
+    cursor,
+    traceProfile,
+    bookMemory,
+    traceMemory,
+    evidence = [],
+    currentText = [],
+  } = request.body || {};
   const config = PROVIDERS[provider];
-  if (!config) return response.status(400).json({ error: "不支持的模型提供方" });
-  if (!book?.chapters?.length) return response.status(400).json({ error: "没有可分析的正文内容" });
+  if (!config) return response.status(400).json({ error: "Unsupported model provider" });
+  if (!book?.title) return response.status(400).json({ error: "Missing book metadata" });
+  if (!Array.isArray(evidence) || !evidence.length) return response.status(400).json({ error: "Missing ContextCite evidence" });
 
   const apiKey = process.env[config.apiKey];
-  if (!apiKey) return response.status(400).json({ error: `请先在 .env 中配置 ${config.apiKey}` });
+  if (!apiKey) return response.status(400).json({ error: `Please configure ${config.apiKey} in .env first` });
+
+  const useThinking = provider === "deepseek" && thinking !== false;
+  const recoveryModel = resolveRecoveryModel(provider, model);
 
   try {
-    const modelClient = new ChatOpenAI({
-      apiKey,
-      model: model || config.defaultModel,
-      temperature: 0,
-      configuration: config.baseURL ? { baseURL: config.baseURL } : undefined,
+    const { client: modelClient, model: resolvedModel } = createModelClient({
+      provider,
+      model: recoveryModel,
+      thinking: useThinking,
     });
+    const memory = normalizeBookMemory(bookMemory || traceMemory || {}, { bookId: book.id || book.title, cursor, traceProfile });
     const result = await modelClient.invoke([
-      ["system", "你是严谨的阅读索引分析器。只根据提供的原文工作，不得补写或猜测。只返回 JSON，不要 Markdown。"],
-      ["human", `${buildAnalysisPrompt(book, previousIndex, cursor, scope)}\n\n关系图补充输出：在同一个 JSON 顶层增加 relationships 数组。只收录与当前已读主线直接相关、且原文能明确证明的关系；不要根据常识推断。每项格式为 {"source":"实体原文名","sourceType":"person|organization|event","target":"实体原文名","targetType":"person|organization|event","relation":"指挥/隶属/协作/对立/参与等简短关系","relationKind":"command|belongs|cooperate|conflict|participate|other","importance":"primary|secondary","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":"直接证明关系的原文短句"}}。同一对实体最多保留一条最有证据的关系；没有可靠关系就返回空数组。`],
+      ["system", "You create concise, evidence-backed continued-reading memory cards. Use only supplied ContextCite evidence. Return JSON only, no Markdown."],
+      ["human", buildRecoveryCardPrompt({ book, cursor, traceProfile, bookMemory: memory, evidence, currentText })],
     ]);
-    const parsed = parseJson(result.content);
-    const index = normaliseIndex(parsed, book.chapters);
-    const profile = normaliseProfile(parsed.bookProfile);
-    response.json({ provider, model: model || config.defaultModel, index, profile, summary: buildSummary(index, cursor) });
+    const parsed = parseJson(messageContent(result));
+    response.json({
+      provider,
+      model: resolvedModel,
+      thinking: useThinking,
+      card: normaliseRecoveryCard(parsed, evidence, book, cursor),
+    });
   } catch (error) {
-    response.status(502).json({ error: error.message || "大模型分析失败" });
+    response.status(502).json({ error: error.message || "Recovery card generation failed" });
   }
 });
+
+app.post("/api/analyze", async (request, response) => {
+  const {
+    provider = "deepseek",
+    model,
+    book,
+    previousBookMemory,
+    previousIndex,
+    previousTraceMemory,
+    cursor,
+    scope = "read",
+    traceProfile,
+    candidates = [],
+    supportingEvidence = [],
+  } = request.body || {};
+  const evidence = Array.isArray(supportingEvidence) ? supportingEvidence : [];
+  const config = PROVIDERS[provider];
+  if (!config) return response.status(400).json({ error: "Unsupported model provider" });
+  if (!book?.chapters?.length) return response.status(400).json({ error: "Missing readable book content" });
+
+  const apiKey = process.env[config.apiKey];
+  if (!apiKey) return response.status(400).json({ error: `Please configure ${config.apiKey} in .env first` });
+
+  try {
+    const { client: modelClient, model: resolvedModel } = createModelClient({ provider, model });
+    const activeTraceProfile = traceProfile || traceProfileForPrompt(resolveTraceProfile(book.bookType, book.indexSchema || []));
+    const priorMemory = resolvePreviousBookMemory({
+      previousBookMemory,
+      previousIndex,
+      previousTraceMemory,
+      book,
+      traceProfile: activeTraceProfile,
+    });
+    const result = await modelClient.invoke([
+      ["system", "You are a rigorous AI Trace reading analyzer. Use only the supplied original text, candidates, and ContextCite evidence. Do not invent or guess. Return JSON only, no Markdown."],
+      ["human", buildTraceAnalysisPrompt(book, priorMemory, cursor, scope, activeTraceProfile, candidates, evidence)],
+    ]);
+    const parsed = parseJson(messageContent(result));
+    const index = normaliseIndex(parsed, book.chapters);
+    const profile = normaliseProfile(parsed.bookProfile);
+    const bookMemory = buildBookMemoryFromAnalysis({
+      parsed,
+      index,
+      profile,
+      cursor,
+      traceProfile: activeTraceProfile,
+      supportingEvidence: evidence,
+      previousBookMemory: priorMemory,
+      bookId: book.id || book.title || "book",
+    });
+    const projectedIndex = readingIndexFromBookMemory(bookMemory);
+    response.json({
+      provider,
+      model: resolvedModel,
+      bookMemory,
+      index: projectedIndex,
+      profile,
+      traceProfile: activeTraceProfile,
+      traceMemory: compatibilityTraceMemory(bookMemory),
+      summary: buildSummary(projectedIndex, cursor),
+    });
+  } catch (error) {
+    response.status(502).json({ error: error.message || "AI Trace analysis failed" });
+  }
+});
+
+function buildRecoveryCardPrompt({ book, cursor, traceProfile, bookMemory, traceMemory, evidence, currentText }) {
+  const cites = evidence.slice(0, 16).map((item, index) => ({
+    ref: item.cite?.label || `[C${index + 1}]`,
+    id: item.cite?.id || `C${index + 1}`,
+    chapterIndex: item.chapterIndex,
+    paragraphIndex: item.paragraphIndex,
+    chapterTitle: item.chapterTitle,
+    quote: item.quote || item.cite?.quote || item.excerpt,
+    matchSources: item.matchSources || [],
+  }));
+  return `Create a continued-reading recovery card for the reading app "Shumai".
+
+Goal:
+- Help the reader quickly restore the MAIN THREAD needed to understand the current checkpoint.
+- The output is not an entity index. It should answer: what prior mainline context matters now, what the current page depends on, and one active-recall question.
+- Be book-type adaptive. For science/textbook books, prefer concepts, mechanisms, definitions, unresolved questions, examples, and argument structure. For history/military/fiction/biography, prefer central actors, organizations, decisions, conflicts, places, timeline turns, and causal links.
+- Keep only the top 80% high-value memory anchors. Omit minor names, birth/death dates, publication metadata, incidental historical mentions, and place names that do not change understanding of the current page.
+- Do not spoil unread content. Use only the supplied ContextCite evidence and the checkpoint.
+- Every claim must cite one supplied evidenceRef such as "C1". If evidence is weak, omit the claim.
+
+Return JSON exactly:
+{
+  "absenceLabel":"继续阅读前",
+  "intensity":"light|medium|deep|fresh",
+  "positionLabel":"上次读到 ...",
+  "keyPoints":[{"title":"","detail":"","evidenceRef":"C1"}],
+  "prerequisites":[{"text":"","evidenceRef":"C2"}],
+  "question":{"prompt":"","answer":"","evidenceRef":"C3"},
+  "evidenceRefs":["C1","C2","C3"]
+}
+
+Constraints:
+- keyPoints: 2-3 items, each title <= 12 Chinese chars or 5 English words, detail <= 48 Chinese chars or 24 English words.
+- prerequisites: 1-2 items, focused on what must be recalled to understand the current page.
+- question: one active-recall question. Include a "hint" string that nudges the reader without giving the full answer. The answer must be directly supported by cited evidence.
+- If a quote only mentions incidental names/dates/places, do not turn them into key points.
+- Prefer causal summaries, decisions, conflicts, concepts, unresolved problems, and turning points over raw entity mentions.
+
+Book:
+${JSON.stringify(book)}
+
+Checkpoint:
+${JSON.stringify(cursor)}
+
+Trace profile:
+${JSON.stringify(traceProfile || null)}
+
+Book Memory:
+${JSON.stringify(bookMemory || traceMemory || null)}
+
+Current newly-read text near checkpoint:
+${JSON.stringify((currentText || []).slice(-10))}
+
+ContextCite evidence:
+${JSON.stringify(cites)}`;
+}
+
+function normaliseRecoveryCard(raw, evidence, book, cursor) {
+  const evidenceList = evidence.slice(0, 16).map((item, index) => normaliseRecoveryEvidence(item, index)).filter(Boolean);
+  const byRef = new Map(evidenceList.flatMap((item) => [[item.ref, item], [item.ref.replace(/[\[\]]/g, ""), item], [item.id, item]].filter(([key]) => key)));
+  const resolveEvidence = (ref, fallbackIndex = 0) => {
+    const key = String(ref || "").replace(/^\[/, "").replace(/\]$/, "");
+    return byRef.get(ref) || byRef.get(key) || evidenceList[fallbackIndex] || null;
+  };
+  const clean = (value, fallback = "") => {
+    const text = String(value || "").trim();
+    return text && !/^(undefined|null)$/i.test(text) ? text : fallback;
+  };
+  const keyPoints = (Array.isArray(raw?.keyPoints) ? raw.keyPoints : [])
+    .map((item, index) => ({
+      id: `ai-point-${index}`,
+      title: clean(item?.title, `重点 ${index + 1}`).slice(0, 32),
+      detail: clean(item?.detail).slice(0, 120),
+      evidence: resolveEvidence(item?.evidenceRef, index),
+    }))
+    .filter((item) => item.detail && item.evidence)
+    .slice(0, 3);
+  const prerequisites = (Array.isArray(raw?.prerequisites) ? raw.prerequisites : [])
+    .map((item, index) => ({
+      id: `ai-prereq-${index}`,
+      text: clean(item?.text).slice(0, 120),
+      evidence: resolveEvidence(item?.evidenceRef, index + keyPoints.length),
+    }))
+    .filter((item) => item.text && item.evidence)
+    .slice(0, 2);
+  const questionEvidence = resolveEvidence(raw?.question?.evidenceRef, 0);
+  const chapterTitle = evidenceList[0]?.chapterTitle || `第 ${Number(cursor?.chapterIndex || 0) + 1} 节`;
+  return {
+    intensity: ["light", "medium", "deep", "fresh"].includes(raw?.intensity) ? raw.intensity : "medium",
+    absenceLabel: clean(raw?.absenceLabel, "继续阅读前"),
+    positionLabel: clean(raw?.positionLabel, `上次读到 ${chapterTitle}`),
+    keyPoints,
+    prerequisites,
+    question: {
+      prompt: clean(raw?.question?.prompt, "继续前，先回想上一页的关键变化是什么？"),
+      hint: clean(raw?.question?.hint, ""),
+      answer: clean(raw?.question?.answer, evidenceList[0]?.excerpt || ""),
+      evidence: questionEvidence,
+    },
+    evidence: evidenceList.slice(0, 6),
+    sourceBook: { title: book?.title, creator: book?.creator },
+  };
+}
+
+function normaliseRecoveryEvidence(item, index = 0) {
+  if (!item) return null;
+  const cite = item.cite || {};
+  const ref = cite.label || cite.id || `[C${index + 1}]`;
+  const excerpt = String(item.quote || cite.quote || item.excerpt || "").trim().slice(0, 180);
+  if (!excerpt) return null;
+  const chapterIndex = Number(item.chapterIndex ?? cite.chapterIndex ?? 0);
+  const paragraphIndex = Number(item.paragraphIndex ?? cite.paragraphIndex ?? 0);
+  return {
+    id: item.id || cite.chunkId || `recovery-${chapterIndex}-${paragraphIndex}`,
+    ref,
+    chapterIndex: Number.isFinite(chapterIndex) ? chapterIndex : 0,
+    paragraphIndex: Number.isFinite(paragraphIndex) ? paragraphIndex : 0,
+    chapterTitle: String(item.chapterTitle || cite.chapterTitle || "").trim(),
+    excerpt,
+    quote: excerpt,
+    cite: {
+      ...cite,
+      id: cite.id || ref.replace(/[\[\]]/g, ""),
+      label: ref,
+      quote: excerpt,
+    },
+    matchSources: Array.isArray(item.matchSources) ? item.matchSources : ["contextcite"],
+  };
+}
+
+function buildTraceAnalysisPrompt(book, previousBookMemory, cursor, scope, traceProfile, candidates, supportingEvidence) {
+  const source = book.chapters.map((chapter, chapterIndex) => ({
+    chapterIndex: chapter.sourceChapterIndex ?? chapterIndex,
+    title: chapter.title,
+    paragraphs: (chapter.paragraphs || []).map((item, paragraphIndex) => ({
+      paragraphIndex: typeof item === "object" ? item.paragraphIndex ?? paragraphIndex : paragraphIndex,
+      text: typeof item === "object" ? item.text : item,
+    })),
+  }));
+  const candidateTypes = BOOK_TYPES.map((type) => ({ name: type.name, facets: type.facets }));
+  const scopeInstruction = scope === "full"
+    ? "本次是手动全书分析。可以重建 Book Memory，但仍然只提取真正影响读者理解和回忆的高价值信息。"
+    : "本次是增量已读分析。先读取上次 Book Memory，再根据新增已读正文补充、修正或删除条目；不得推断未读内容。";
+
+  return `请为阅读软件“书脉”生成 Memory Engine 结果。目标不是穷举百科信息，而是帮助读者在继续阅读时回忆前文脉络。只保留最有帮助的约 80% 记忆锚点，宁可少而准。
+
+${scopeInstruction}
+
+核心原则：
+1. 先判断图书类型，再按 Trace Profile 的 anchors 决定提取什么。科普、教材、技术、商业类不必强行输出人物、地点或时间线；历史、传记、军事、小说则按主线需要输出人物、组织、地点、时间线、事件和关系。
+2. 候选池只是召回线索，不是答案。必须由原文或 ContextCite 证据证明，且必须与当前书的主旨、论证、情节、知识框架或主线行动密切相关。
+3. 排除弱信息：人物出生日期、履历背景、出版信息、偶然提到的历史事件、无因果关系的地名、只出现一次且不影响理解的人名/术语。
+4. 每个输出条目必须有 evidence.chapterIndex、evidence.paragraphIndex、evidence.quote。quote 必须来自提供文本或 ContextCite，不要凭常识补全。
+5. priority 只允许 primary、recent 或 secondary。primary 是默认展示层；recent 表示最近已读新增；secondary 可展开。
+6. relationships 只输出原文能直接证明的关系。没有可靠关系就返回空数组。
+7. 优先填充 memory 六类桶；若某类不适用，返回空数组。可同时返回 legacy 字段作为兼容。
+
+输出 JSON：
+{
+  "bookProfile":{"category":"候选类型之一","facets":["4-6 个适合本书的索引面板"]},
+  "memory":{
+    "entities":[{"kind":"person|organization|place|term","name":"","priority":"primary|recent|secondary","attributes":["1-2 个角色标签"],"summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+    "timeline":[{"kind":"event|timepoint","name":"","priority":"primary|recent|secondary","summary":"","causes":[],"causedBy":[],"evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+    "topics":[{"kind":"concept|definition|mechanism|framework|example","name":"","priority":"primary|recent|secondary","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+    "arguments":[{"kind":"claim|reason|evidence|example|conclusion|objection","name":"","priority":"primary|recent|secondary","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+    "episodic":[{"kind":"event|scene","name":"","priority":"primary|recent|secondary","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+    "relationships":[{"source":"","sourceType":"person|organization|event","target":"","targetType":"person|organization|event","relation":"","relationKind":"command|belongs|cooperate|conflict|participate|other","importance":"primary|secondary","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}]
+  },
+  "people":[{"name":"","priority":"primary|secondary","attributes":["1-2 个身份/职责/阵营/关键关系"],"summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+  "organizations":[{"name":"","priority":"primary|secondary","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+  "places":[{"name":"","priority":"primary|secondary","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+  "timeline":[{"date":"","priority":"primary|secondary","title":"","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+  "relationships":[{"source":"","sourceType":"person|organization|event","target":"","targetType":"person|organization|event","relation":"","relationKind":"command|belongs|cooperate|conflict|participate|other","importance":"primary|secondary","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+  "discarded":[{"name":"","type":"","reason":""}]
+}
+
+图书类型候选：
+${JSON.stringify(candidateTypes)}
+
+Trace Profile：
+${JSON.stringify(traceProfile)}
+
+候选池：
+${JSON.stringify((candidates || []).slice(0, 80))}
+
+ContextCite 证据：
+${JSON.stringify((supportingEvidence || []).slice(0, 20))}
+
+上次 Book Memory：
+${JSON.stringify(previousBookMemory || null)}
+
+本次分析断点：
+${JSON.stringify(cursor)}
+
+本次正文：
+${JSON.stringify(source)}`;
+}
+
+function resolvePreviousBookMemory({ previousBookMemory, previousIndex, previousTraceMemory, book, traceProfile }) {
+  if (previousBookMemory) {
+    return normalizeBookMemory(previousBookMemory, {
+      bookId: book?.id || book?.title || "book",
+      traceProfile,
+    });
+  }
+  if (previousIndex || previousTraceMemory) {
+    return bookMemoryFromLegacy({
+      index: previousIndex,
+      traceMemory: previousTraceMemory,
+      cursor: previousTraceMemory?.cursor || null,
+      profile: previousTraceMemory?.profile || null,
+      traceProfile: previousTraceMemory?.traceProfile || traceProfile,
+    }, {
+      bookId: book?.id || book?.title || "book",
+      traceProfile,
+    });
+  }
+  return null;
+}
+
+function buildBookMemoryFromAnalysis({
+  parsed,
+  index,
+  profile,
+  cursor,
+  traceProfile,
+  supportingEvidence,
+  previousBookMemory,
+  bookId,
+}) {
+  const fromLegacy = bookMemoryFromLegacy({
+    index,
+    traceMemory: {
+      anchors: Array.isArray(parsed.memoryAnchors) ? parsed.memoryAnchors.map((anchor) => ({
+        id: anchor.anchorId || anchor.id,
+        label: anchor.label,
+        items: anchor.items,
+      })) : [],
+      discarded: parsed.discarded,
+      evidence: supportingEvidence,
+      cursor,
+      profile,
+      traceProfile,
+    },
+    discarded: parsed.discarded,
+    supportingEvidence,
+    cursor,
+    profile,
+    traceProfile,
+  }, { bookId, cursor, profile, traceProfile, supportingEvidence });
+
+  const fromCanonical = normalizeBookMemory({
+    ...(parsed.memory || {}),
+    discarded: parsed.discarded,
+    supportingEvidence,
+    cursor,
+    profile,
+    traceProfile,
+    bookId,
+  }, { bookId, cursor, profile, traceProfile, supportingEvidence });
+
+  const incoming = mergeBookMemory(fromLegacy, fromCanonical, cursor);
+  return mergeBookMemory(previousBookMemory, incoming, cursor);
+}
 
 function buildClassificationPrompt(book) {
   const candidates = BOOK_TYPES.map((type) => ({ name: type.name, facets: type.facets }));
@@ -94,22 +478,20 @@ Book metadata:
 ${JSON.stringify(book)}`;
 }
 
-function buildAnalysisPrompt(book, previousIndex, cursor, scope) {
-  const source = book.chapters.map((chapter, chapterIndex) => ({
-    chapterIndex: chapter.sourceChapterIndex ?? chapterIndex,
-    title: chapter.title,
-    paragraphs: chapter.paragraphs.map((text, paragraphIndex) => ({ paragraphIndex, text })),
-  }));
-  const scopeInstruction = scope === "full"
-    ? "本次为手动全书分析：提供的是全书正文。请重新建立完整索引，不受上次索引限制。"
-    : "本次为增量已读分析：本次断点是读者已读页面中最靠后的页，正文仅包含断点之前、且上次分析之后的已读内容。先阅读上次分析结果，再只根据新增正文补充、修正或删除条目；不要推断未读内容。";
-  return `分析下面这本书的正文，生成读者可追溯的累计主线索引。${scopeInstruction}\n\n图书类型候选：${JSON.stringify(BOOK_TYPES.map((type) => ({ name: type.name, facets: type.facets })))}。先选择最匹配的一个类型，并只从该类型的 facets 中挑选 4-6 个最适合本书的索引面板。\n\n严格筛选规则：\n1. 时间线只收录直接推动中心主题的转折、行动、冲突、决策、迁移、结果或阶段性变化。人物出生/死亡年份、作者或出版信息、顺带提及的历史年代、类比举例、与主叙事没有因果关系的背景事件，一律不要收录。\n2. 地点只收录主线人物或主体实际到达、行动、冲突、停留、决策或反复围绕的关键空间。不要收录人物籍贯、出生地、出版地、顺带提到的地名，或仅用于背景说明的地名。\n3. 每个人物、组织、地点与时间节点必须标注 priority：primary 仅限持续推动中心主题、读者必须记住的关键角色/关键组织/关键空间/重大历史节点；secondary 用于与主线相关但不需要默认展开的次级条目。优先少而准，primary 人物、组织、地点和时间节点各不超过 8 个。\n4. 每个人物必须给出 1-2 个 attributes，只能是对主线重要的身份、阵营、职责或关键关系；每个属性应是简短名词短语，不能重复人名、不能编造。军团、部队、政党、政府、军队、机关、委员会、师团等集体主体必须放入 organizations，不得放入 people。\n5. 地点名称必须逐字来自 evidence.quote 的原文，不能凭常识补全、纠正、合并或猜测。若不能确定其与主题的关系，宁可不收录。\n6. 人物只收录持续影响主线的核心自然人；不要把组织、部队、党派、政府、军队当作人物卡，也不要把被提及一次的背景人物当作人物卡。\n7. 每个条目必须有至少一个准确的 chapterIndex 与 paragraphIndex 作为 evidence；quote 必须是对应原文的短摘，并直接证明该条目的主线关联。\n8. timeline 按事件发生的时间排序；primary 时间节点必须是具有历史意义或结构性转折的事件，普通背景日期、人物履历日期、出版日期、类比日期只能标为 secondary 或不输出；日期不明确时不要臆测。最多输出 24 个时间节点、20 个地点、20 个人物、20 个组织，优先少而准确。\n9. JSON 格式必须为：\n{\n  "bookProfile":{"category":"候选中的一个类型", "facets":["索引面板"]},\n  "people": [{"name":"", "priority":"primary|secondary", "attributes":["身份或职责", "关键关系"], "summary":"", "evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],\n  "organizations": [{"name":"", "priority":"primary|secondary", "summary":"", "evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],\n  "places": [{"name":"", "priority":"primary|secondary", "summary":"", "evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],\n  "timeline": [{"date":"", "priority":"primary|secondary", "title":"", "summary":"", "evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}]\n}\n\n书名：${book.title}\n上次分析结果：${JSON.stringify(previousIndex || { people: [], organizations: [], places: [], timeline: [] })}\n本次分析断点：${JSON.stringify(cursor)}\n本次正文：${JSON.stringify(source)}`;
-}
-
 function parseJson(content) {
   const text = typeof content === "string" ? content : JSON.stringify(content);
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   return JSON.parse(fenced ? fenced[1] : text);
+}
+
+/** Extract final answer text from a LangChain AIMessage (thinking models keep CoT separate). */
+function messageContent(result) {
+  const content = result?.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("");
+  }
+  return String(content ?? "");
 }
 
 function normaliseIndex(raw, chapters) {
@@ -122,8 +504,7 @@ function normaliseIndex(raw, chapters) {
   const makeEntry = (kind, item, index) => {
     item = item || {};
     const evidence = item.evidence || {};
-    const summary = String(item.summary || "").trim();
-    const quote = String(evidence.quote || "").trim();
+    const summary = cleanTraceSummary(item.summary);
     const requestedChapter = Number(evidence.chapterIndex);
     const chapter = chapters.find((candidate, chapterIndex) => (candidate.sourceChapterIndex ?? chapterIndex) === requestedChapter) || chapters[0];
     const chapterIndex = chapter.sourceChapterIndex ?? chapters.indexOf(chapter);
@@ -131,6 +512,15 @@ function normaliseIndex(raw, chapters) {
     const timelineName = String(item.date || item.name || item.title || "").trim();
     const entityName = String(item.name || item.title || "").trim();
     const name = kind === "timeline" ? timelineName : entityName;
+    let quote = repairEvidenceQuote(chapter, paragraphIndex, evidence.quote, [name, item.title, summary]);
+    let resolvedChapterIndex = chapterIndex;
+    let resolvedParagraphIndex = paragraphIndex;
+    const betterEvidence = findBetterTraceEvidence(chapters, { kind, name, summary, chapterIndex, paragraphIndex, quote });
+    if (betterEvidence) {
+      resolvedChapterIndex = betterEvidence.chapterIndex;
+      resolvedParagraphIndex = betterEvidence.paragraphIndex;
+      quote = betterEvidence.quote;
+    }
     return {
       id: `${kind}-${index}-${name}`,
       name,
@@ -138,10 +528,11 @@ function normaliseIndex(raw, chapters) {
       detail: kind === "timeline" ? summary : summary || quote,
       evidenceQuote: quote,
       priority: item.priority === "primary" ? "primary" : "secondary",
-      attributes: kind === "person" ? (Array.isArray(item.attributes) ? item.attributes.filter((attribute) => typeof attribute === "string" && attribute.trim()).slice(0, 2) : []) : [],
+      attributes: kind === "person" ? (Array.isArray(item.attributes) ? item.attributes.map(cleanTraceSummary).filter(Boolean).slice(0, 2) : []) : [],
       sortKey: kind === "timeline" ? parseDate(item.date) : index,
-      occurrence: { chapterIndex, paragraphIndex },
-      occurrences: [{ chapterIndex, paragraphIndex }],
+      weakEvidence: isWeakTraceEvidenceQuote(quote),
+      occurrence: { chapterIndex: resolvedChapterIndex, paragraphIndex: resolvedParagraphIndex },
+      occurrences: [{ chapterIndex: resolvedChapterIndex, paragraphIndex: resolvedParagraphIndex }],
     };
   };
   const timeline = (raw.timeline || []).map((item, index) => makeEntry("timeline", item, index)).filter((item) => item.name && item.name !== "undefined").sort((a, b) => a.sortKey - b.sortKey);
@@ -150,6 +541,7 @@ function normaliseIndex(raw, chapters) {
   (raw.people || []).forEach((item, index) => {
     const entry = makeEntry("person", item, index);
     if (!entry.name || entry.name === "undefined") return;
+    if (entry.weakEvidence) return;
     if (isOrganizationName(entry.name)) {
       organizations.push({ ...entry, id: `organization-from-person-${index}-${entry.name}`, attributes: [] });
     } else {
@@ -159,6 +551,7 @@ function normaliseIndex(raw, chapters) {
   (raw.organizations || []).forEach((item, index) => {
     const entry = makeEntry("organization", item, index);
     if (!entry.name || entry.name === "undefined") return;
+    if (entry.weakEvidence) return;
     organizations.push({ ...entry, id: `organization-${index}-${entry.name}`, attributes: [] });
   });
   const uniqueByName = (items) => Array.from(new Map(items.map((item) => [item.name, item])).values());
@@ -180,13 +573,17 @@ function normaliseIndex(raw, chapters) {
       relation,
       relationKind: ["command", "belongs", "cooperate", "conflict", "participate", "other"].includes(item.relationKind) ? item.relationKind : "other",
       importance: item.importance === "primary" ? "primary" : "secondary",
-      evidence: { chapterIndex, paragraphIndex: clamp(evidence.paragraphIndex, 0, chapter.paragraphs.length - 1), quote: String(evidence.quote || "").slice(0, 160) },
+      evidence: {
+        chapterIndex,
+        paragraphIndex: clamp(evidence.paragraphIndex, 0, chapter.paragraphs.length - 1),
+        quote: repairEvidenceQuote(chapter, clamp(evidence.paragraphIndex, 0, chapter.paragraphs.length - 1), evidence.quote, [source, target, relation]),
+      },
     };
   }).filter(Boolean).slice(0, 36);
   return {
     people: uniqueByName(people),
     organizations: uniqueByName(organizations),
-    places: (raw.places || []).map((item, index) => makeEntry("place", item, index)),
+    places: (raw.places || []).map((item, index) => makeEntry("place", item, index)).filter((item) => item.name && !item.weakEvidence),
     timeline,
     relationships,
   };
@@ -201,6 +598,102 @@ function normaliseProfile(profile) {
 function clamp(value, min, max) {
   const number = Number(value);
   return Number.isInteger(number) ? Math.min(Math.max(number, min), max) : min;
+}
+
+function paragraphText(item) {
+  return typeof item === "object" ? String(item?.text || "") : String(item || "");
+}
+
+function cleanTraceSummary(value) {
+  return String(value || "")
+    .replace(/[，,；;]?\s*(?:一?[二三四五六七八九十]{1,3}|[1-9]\d?)岁/g, "")
+    .replace(/[，,；;]?\s*(?:籍贯|出生于|生于|出生地|祖籍)[^，,。；;]{0,18}/g, "")
+    .replace(/[，,；;]?\s*(?:湖南人|湖北人|陕西人|江西人|广东人|广西人|贵州人|四川人|云南人|福建人|浙江人|江苏人|山东人|河南人|河北人)/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[，,；;\s]+|[，,；;\s]+$/g, "")
+    .trim();
+}
+
+function repairEvidenceQuote(chapter, paragraphIndex, quote, hints = []) {
+  const source = paragraphText(chapter?.paragraphs?.[paragraphIndex]).trim();
+  const requested = String(quote || "").trim().replace(/\s+/g, "");
+  if (!source) return requested.slice(0, 160);
+  const compactSource = source.replace(/\s+/g, "");
+  if (requested.length >= 8 && compactSource.includes(requested)) return requested.slice(0, 160);
+  const cleanHints = hints.map((item) => String(item || "").trim()).filter((item) => item.length >= 2);
+  const hit = cleanHints
+    .map((hint) => ({ hint, index: source.indexOf(hint) }))
+    .filter((item) => item.index >= 0)
+    .sort((left, right) => left.index - right.index)[0];
+  if (hit) {
+    const start = Math.max(0, hit.index - 28);
+    const end = Math.min(source.length, hit.index + hit.hint.length + 92);
+    return source.slice(start, end).replace(/\s+/g, "").slice(0, 160);
+  }
+  return source.replace(/\s+/g, "").slice(0, 160);
+}
+
+function findBetterTraceEvidence(chapters, { kind, name, summary, chapterIndex, paragraphIndex, quote }) {
+  if (!["person", "organization", "place"].includes(kind)) return null;
+  const wanted = traceSummaryTokens(summary);
+  const rosterWeak = hasTraceRosterSignal(quote);
+  if (!shouldImproveTraceEvidenceQuote(quote, wanted)) return null;
+  let best = null;
+  chapters.forEach((chapter, localChapterIndex) => {
+    const sourceChapterIndex = chapter.sourceChapterIndex ?? localChapterIndex;
+    (chapter.paragraphs || []).forEach((paragraph, localParagraphIndex) => {
+      const text = paragraphText(paragraph);
+      if (!text.includes(name) || !TRACE_ACTION_WORDS.test(text)) return;
+      const sourceParagraphIndex = typeof paragraph === "object" ? paragraph.paragraphIndex ?? localParagraphIndex : localParagraphIndex;
+      const tokenHits = wanted.filter((token) => text.includes(token)).length;
+      if (!rosterWeak && wanted.length && tokenHits === 0) return;
+      const distance = Math.abs(sourceChapterIndex - chapterIndex) * 20 + Math.abs(sourceParagraphIndex - paragraphIndex);
+      const score = 40 + tokenHits * 10 - Math.min(distance, 30);
+      if (!best || score > best.score) {
+        best = {
+          score,
+          chapterIndex: sourceChapterIndex,
+          paragraphIndex: sourceParagraphIndex,
+          quote: trimTraceQuote(text, name),
+        };
+      }
+    });
+  });
+  return best && best.score >= 30 ? best : null;
+}
+
+function shouldImproveTraceEvidenceQuote(quote, wanted = []) {
+  const text = String(quote || "");
+  if (!text) return true;
+  const hasRosterSignal = hasTraceRosterSignal(text);
+  const tokenHits = wanted.filter((token) => text.includes(token)).length;
+  return hasRosterSignal || (wanted.length > 0 && tokenHits === 0);
+}
+
+function isWeakTraceEvidenceQuote(quote) {
+  const text = String(quote || "");
+  return !TRACE_ACTION_WORDS.test(text) || hasTraceRosterSignal(text) && !TRACE_ACTION_WORDS.test(text);
+}
+
+function hasTraceRosterSignal(value) {
+  return /(?:岁|领导成员|他们是|担任|参谋长|政治委员|主任|主席|湖南人|陕西人)/.test(String(value || ""));
+}
+
+function traceSummaryTokens(summary) {
+  return String(summary || "")
+    .replace(/[^\u4e00-\u9fffA-Za-z0-9]+/g, " ")
+    .split(/\s+/)
+    .flatMap((token) => token.length > 4 && /^[\u4e00-\u9fff]+$/.test(token) ? [token.slice(0, 4), token.slice(-4)] : [token])
+    .filter((token) => token.length >= 2)
+    .slice(0, 8);
+}
+
+function trimTraceQuote(text, name) {
+  const source = String(text || "").trim();
+  const index = source.indexOf(name);
+  if (index < 0) return source.replace(/\s+/g, "").slice(0, 160);
+  const start = Math.max(0, index - 36);
+  return source.slice(start, start + 130).replace(/\s+/g, "").slice(0, 160);
 }
 
 function parseDate(value) {

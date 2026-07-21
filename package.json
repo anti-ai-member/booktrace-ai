@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "concurrently -k -n api,web -c green,cyan \"node server.mjs\" \"vite\"",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "trace:evaluate": "node scripts/trace-eval.mjs",
+    "trace:evaluate:live": "node scripts/trace-eval.mjs --live",
+    "trace:evaluate:judge": "node scripts/trace-eval.mjs --live --judge"
   },
   "dependencies": {
     "@langchain/openai": "^1.5.5",
@@ -26,5 +29,8 @@
     "react-dom": "19.2.0",
     "vite": "6.4.2",
     "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "playwright": "^1.61.1"
   }
 }

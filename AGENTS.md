@@ -2,6 +2,10 @@
 
 Run the local server yourself and open the preview in the browser available to this environment. Do not give the user server-start instructions when you can run it.
 
+Before changing core product logic, read and follow `constitution/mission.md`, `constitution/teck-stack.md`, and `constitution/roadmap.md`. Core work must follow the documented loop: feature spec -> feature implement -> verify with a sub-agent -> next task. Do not implement architecture changes that are not covered by the current feature spec.
+
+Before creating or modifying product UI/UE, read and follow `docs/product-ui-ux-spec.md`. If a requested UI change conflicts with that spec, explain the conflict and either update the spec deliberately or implement the change in the closest spec-compatible way.
+
 Before making substantial visual changes, use the Product Design plugin's `get-context` skill when the visual source is unclear or no longer matches the current goal. When the user gives durable prototype-specific design feedback, preferences, or decisions, record them in `AGENTS.md`.
 
 When implementing from a selected generated mock, treat that image as the source of truth for layout, component anatomy, density, spacing, color, typography, visible content, and hierarchy.
@@ -15,7 +19,7 @@ When implementing from a selected generated mock, treat that image as the source
 - Keep people, timeline, places, and citations contextual to the reading position and do not reveal unread material.
 - Include a functional local bookshelf and book classification workflow.
 - Keep analysis book-agnostic: do not add title-specific entity lists, fixed year ranges, or other book-specific extraction rules. The reader UI must remain independent of the analysis provider.
-- Prefer model-driven, evidence-backed reading indexes for relevance judgments. Default provider/model: DeepSeek `deepseek-v4-flash`; support user-selected OpenAI models with API keys read only from local `.env`.
+- Prefer model-driven, evidence-backed reading indexes for relevance judgments. Default analysis provider/model: DeepSeek `deepseek-v4-flash`; support `deepseek-v4-pro` and user-selected OpenAI models with API keys read only from local `.env`. Continued-reading recovery cards default to DeepSeek `deepseek-v4-pro` with thinking mode enabled.
 - Model prompts must prioritize the book's central narrative: include only causal, theme-relevant events and locations with direct original-text evidence; exclude biographical dates, incidental historical references, and inferred or corrected place names.
 - Analysis is incremental and reading-bounded: analyze only content up to the current page, retain a per-book checkpoint and prior result, then pass only newly read content plus that prior result on the next analysis. Show the resulting people, places, key events, and chapter/page checkpoint after each run.
 - Pages become read only after the reader leaves them; persist their chapter/page/paragraph markers. The latest read page, not merely the current open page, is the upper bound for incremental analysis.
@@ -58,3 +62,9 @@ When implementing from a selected generated mock, treat that image as the source
 - The AI reading rail entry must use an explicit AI metaphor icon, not generic settings controls. Its panel should feel like a compact AI reading console with a clear status header, two primary analysis actions, auto-update controls, and a secondary model-settings section.
 - Relationship visualizations open as a larger left-side workspace column that pushes the reading canvas to the right; do not render them as right-side overlays. Hide React Flow minimaps in this reader context unless a specific dense graph needs one.
 - Relationship mode should not also show the normal reader side-content placeholder; keep only the icon rail plus the large relationship workspace.
+- AI Trace no longer uses the old RAG/HNSW/vector pipeline. Use Memory Engine as the primary decision layer and a lightweight evidence locator only for original-text positioning and ContextCite source objects.
+- AI Trace extraction is type-adaptive: each book type maps to memory-anchor profiles, candidate extraction plus hybrid evidence retrieval happen before the model call, and automatic Trace runs as a background job with visible foreground status.
+- The next core product direction is continued-reading recovery, not default entity indexing. When a reader returns after time away, the first AI-native experience should restore the reading situation model: last position, prior key points, current-page prerequisites, one active-recall question, and evidence links. People, places, timelines, relationship graphs, concept maps, and argument chains are type/content-specific aids that appear only when they help recovery or current understanding.
+- Treat reading intelligence as a Memory Engine first, not a RAG-first reader. Build persistent Entity Memory, Timeline Memory, Topic/Semantic Memory, Argument Memory, Episodic Memory, and Reader Memory as the primary decision layer for "what should the reader recall right now"; use ContextCite afterward for original-text positioning, evidence, and fallback enrichment.
+- The continued-reading recovery card uses a single-column reading path: title and position, then the recall question as the visual focus, then at most three memory anchors as a numbered vertical step list, then 1-2 quieter prerequisites, with evidence collapsed. Keep generous section spacing and normal document flow only — never absolute-position content sections inside the card. Do not use two-column report layouts or decorative aura blobs.
+- Prefer icon-only controls in chrome and transient reading tools (home/reader rails, recovery actions including continue). Visible text labels appear on hover/focus via tooltips (`title` / `aria-label`), not as always-on button text. Give the continue control a quiet accent treatment so it remains the obvious next step without a text pill.
