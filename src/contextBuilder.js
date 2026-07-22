@@ -5,6 +5,13 @@ import {
   normalizeBookMemory,
   readerForgettingScore,
 } from "./memoryModels.js";
+import {
+  hintFromEvidenceExcerpt,
+  isBroadMegaTopic,
+  isEpisodeWorthyAnchor,
+  preferQuestionAnchor,
+  questionFromEpisodeAnchor,
+} from "./recoveryQuality.js";
 
 const NOISE_PATTERNS = /出生|生于|逝世|享年|出版|印刷|译者|版权|ISBN|目录|字数|开本|印张|邮编|新华书店|版本图书馆|CIP数据|http:\/\/|www\./i;
 const WEAK_SUMMARY_PATTERNS = /^(undefined|null|详见|同上|略|无)$/i;
@@ -45,7 +52,7 @@ export function buildRecoveryPlan({
 
   const keyAnchors = ranked.slice(0, 3);
   const prerequisiteAnchors = selectPrerequisites(ranked, pageText).slice(0, 2);
-  const questionAnchor = keyAnchors[0];
+  const questionAnchor = preferQuestionAnchor(ranked) || preferQuestionAnchor(keyAnchors) || keyAnchors[0];
   const chapterTitle = book?.chapters?.[normalizedCursor.chapterIndex]?.title || `第 ${normalizedCursor.chapterIndex + 1} 节`;
 
   const keyPoints = keyAnchors.map((item, index) => ({
@@ -60,6 +67,8 @@ export function buildRecoveryPlan({
     text: prerequisiteText(item, chapterTitle),
     evidence: toEvidence(item),
   }));
+  const questionEvidence = toEvidence(questionAnchor);
+  const questionHint = hintFromEvidenceExcerpt(questionEvidence?.excerpt || questionAnchor?.summary || "");
 
   return {
     suppressed: false,
@@ -71,9 +80,10 @@ export function buildRecoveryPlan({
     prerequisites,
     question: {
       memoryKey: questionAnchor.memoryKey || questionAnchor.id,
-      prompt: questionFromAnchor(questionAnchor, chapterTitle),
+      prompt: questionFromEpisodeAnchor(questionAnchor, chapterTitle),
+      hint: questionHint,
       answer: clip(questionAnchor.summary || questionAnchor.detail, 120),
-      evidence: toEvidence(questionAnchor),
+      evidence: questionEvidence,
     },
     evidence: uniqueEvidence([...keyAnchors, ...prerequisiteAnchors].map(toEvidence)).slice(0, 6),
   };
@@ -149,6 +159,7 @@ function isNoiseMemoryItem(item) {
   if (NOISE_PATTERNS.test(blob)) return true;
   if (/^\d{2,4}年\d{1,2}月\d{1,2}日$/.test(item.name) && !ACTION_HINT.test(item.summary || "")) return true;
   if ((item.kind === "place" || item.kind === "person") && (item.summary || "").length < 8 && item.priority === "secondary") return true;
+  if (isBroadMegaTopic(item.name) && !isEpisodeWorthyAnchor(item) && item.priority === "secondary") return true;
   return false;
 }
 
@@ -183,7 +194,8 @@ function scoreMainline(item) {
     term: 0.5,
   }[item.kind] || 0.6;
   const actionBoost = ACTION_HINT.test(item.summary || "") ? 0.15 : 0;
-  return Math.min(1, kindBoost + actionBoost);
+  const broadPenalty = isBroadMegaTopic(item.name) && !isEpisodeWorthyAnchor(item) ? -0.45 : 0;
+  return Math.min(1, Math.max(0, kindBoost + actionBoost + broadPenalty));
 }
 
 function prerequisiteText(item, chapterTitle) {
@@ -200,17 +212,6 @@ function prerequisiteText(item, chapterTitle) {
     return `继续读《${chapterTitle}》前，先记起${clip(item.name, 12)}在主线中的作用。`;
   }
   return `继续读《${chapterTitle}》前，先接上：${clip(item.name, 18)}。`;
-}
-
-function questionFromAnchor(anchor, chapterTitle) {
-  if (!anchor) return `继续读《${chapterTitle}》前，上一阶段最关键的变化是什么？`;
-  if (anchor.kind === "event" || anchor.kind === "scene") {
-    return `继续读《${chapterTitle}》前，你还记得“${clip(anchor.name, 16)}”为什么会发生吗？`;
-  }
-  if (anchor.kind === "concept" || anchor.kind === "mechanism" || anchor.kind === "framework") {
-    return `继续读《${chapterTitle}》前，你还记得“${clip(anchor.name, 16)}”指的是什么吗？`;
-  }
-  return `继续读《${chapterTitle}》前，你还记得“${clip(anchor.name, 16)}”为什么会影响后面的内容吗？`;
 }
 
 function extractCurrentPageText(book, cursor) {

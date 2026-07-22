@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { Background, Controls, ReactFlow } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
@@ -9,6 +9,7 @@ import {
   BookOpen,
   Bookmark,
   Bot,
+  Brain,
   Camera,
   Check,
   ChevronDown,
@@ -23,15 +24,13 @@ import {
   FileText,
   Flower2,
   FolderPlus,
+  GitBranch,
   History,
   Lightbulb,
   Quote,
   ListFilter,
-  MapPin,
   Minus,
   Network,
-  PanelLeftClose,
-  PanelLeftOpen,
   Plus,
   Palette,
   Search,
@@ -42,8 +41,10 @@ import {
   Sprout,
   Tag,
   Trees,
+  Trash2,
   Upload,
   X,
+  Zap,
 } from "lucide-react";
 import { parseEpub } from "./epub.js";
 import { BOOK_TYPES, findBookType } from "./bookTaxonomy.js";
@@ -59,16 +60,58 @@ import {
   updateReaderMemory,
 } from "./memoryModels.js";
 import { buildRecoveryPlan } from "./contextBuilder.js";
+import {
+  hasConcreteEpisodeCue,
+  hintFromEvidenceExcerpt,
+  isBroadMegaTopic,
+  isWeakRecoveryHint,
+  isWeakRecoveryQuestion,
+  preferQuestionAnchor,
+  questionFromEpisodeAnchor,
+  sanitizeModelRecoveryQuestion,
+  sortEvidenceByCursorProximity,
+} from "./recoveryQuality.js";
 import { resolveTraceProfile, traceProfileForPrompt } from "./traceProfiles.js";
 import { UNIVERSAL_SKILLS, createReadingProgress, domainProgress, earnedBadges, getDomainConfig, resolveSkillDomain, unlockedSpecialSkills } from "./skillSystem.js";
 import { TalentConstellation } from "./TalentConstellation.jsx";
+import {
+  buildAssistFromExplain,
+  explainModeLabel,
+  findExplainsForSelection,
+  groupExplainMarkersForSegment,
+  groupNoteMarksForSegment,
+  loadExplains,
+  markerShortLabel,
+  previewConclusion,
+  previewMetaLabel,
+  removeExplains,
+  upsertExplain,
+} from "./explainMemory.js";
 
 const BUILT_IN_BOOK_ID = "long-march";
-const BUILT_IN_CACHE_VERSION = "long-march-v1";
+const BUILT_IN_CACHE_VERSION = "long-march-v2-images";
+/** Bump when EPUB paragraph shape changes (e.g. keep inline images). Re-import upgrades stale IndexedDB books. */
+const EPUB_CONTENT_PARSE_VERSION = "epub-v2-images";
 const BOOK_PATH = "/books/long-march.epub";
 const COVER_PATH = "/books/long-march-cover.jpeg";
 const APP_NAME = "书脉";
 const APP_SLOGAN = "读得清脉络，记得住来处";
+
+function BrandMark({ size = 22 }) {
+  return (
+    <span className="brand-mark" aria-hidden="true">
+      <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
+        <path d="M5.5 9.2c3.4-1.8 6.6-1.7 10.5.6v13.4c-3.8-2.1-7-2.2-10.5-.3V9.2Z" stroke="currentColor" strokeWidth="1.75" strokeLinejoin="round" />
+        <path d="M26.5 9.2c-3.4-1.8-6.6-1.7-10.5.6v13.4c3.8-2.1 7-2.2 10.5-.3V9.2Z" stroke="currentColor" strokeWidth="1.75" strokeLinejoin="round" />
+        <path d="M8.8 15.2c2.4 2.1 4.1-.6 7.2 1.1 2.6 1.4 4.2 3 7.2 1.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
+        <circle cx="10.4" cy="15.8" r="1.35" fill="currentColor" />
+        <circle cx="16" cy="16.3" r="2.05" fill="currentColor" />
+        <circle cx="22.4" cy="17.5" r="1.35" fill="currentColor" />
+      </svg>
+    </span>
+  );
+}
+
 const SUPPORTED_IMPORT_ACCEPT = ".epub,.pdf,.txt,.html,.htm,.rtf,.doc,.docx,.mobi,.azw,.azw3,.fb2,.djvu,.cbz,.cbr,application/epub+zip,application/pdf,text/plain,text/html";
 const READABLE_IMPORT_FORMATS = new Set(["epub", "pdf"]);
 const TRACE_ANALYSIS_VERSION = "trace-v5";
@@ -91,12 +134,49 @@ const PLANNED_BOOK_FORMATS = new Map([
   ["cbr", "CBR 漫画书"],
 ]);
 const DEFAULT_CATEGORIES = ["历史纪实", "军事", "中国近现代史"];
-const DEFAULT_AI_SETTINGS = { provider: "deepseek", model: "deepseek-v4-flash", analysisMode: "read", autoPageThreshold: 5 };
+const DEFAULT_AI_SETTINGS = {
+  provider: "deepseek",
+  model: "deepseek-v4-flash",
+  analysisMode: "read",
+  autoPageThreshold: 5,
+  explainSpeed: "fast",
+};
 /** Continued-reading recovery cards default to DeepSeek Pro with thinking mode. */
 const RECOVERY_MODEL_BY_PROVIDER = {
   deepseek: "deepseek-v4-pro",
   openai: "gpt-4.1-mini",
 };
+const EXPLAIN_SPEED_MODES = [
+  { id: "fast", label: "快速", detail: "快速 · DeepSeek flash，较快整理", icon: Zap },
+  { id: "deep", label: "深思", detail: "深思 · DeepSeek pro + 思考模式", icon: Brain },
+];
+
+function resolveExplainRequest(settings = {}) {
+  const provider = settings.provider || "deepseek";
+  const speed = settings.explainSpeed === "deep" ? "deep" : "fast";
+  if (speed === "deep") {
+    return {
+      speed,
+      provider,
+      model: provider === "deepseek"
+        ? "deepseek-v4-pro"
+        : (RECOVERY_MODEL_BY_PROVIDER[provider] || settings.model || "gpt-4.1-mini"),
+      thinking: provider === "deepseek",
+    };
+  }
+  return {
+    speed,
+    provider,
+    model: provider === "deepseek"
+      ? "deepseek-v4-flash"
+      : (settings.model || "gpt-4.1-mini"),
+    thinking: false,
+  };
+}
+
+function explainCacheKey(mode, speed = "fast") {
+  return `${mode}:${speed === "deep" ? "deep" : "fast"}`;
+}
 const LIBRARY_DB_NAME = "shumai-library";
 const LIBRARY_DB_VERSION = 1;
 const LIBRARY_STORE = "books";
@@ -109,20 +189,25 @@ const READING_THEMES = [
   { id: "flower", name: "花枝", detail: "微粉春意", icon: Flower2 },
   { id: "bamboo", name: "竹林", detail: "疏竹晨雾", icon: Trees },
 ];
+const EXPLAIN_MODES = [
+  { id: "source", label: "书内出处", detail: "在已读范围定位相关原文", icon: Quote },
+  { id: "entity", label: "词条简介", detail: "人物、地点、组织或术语的身份与作用", icon: Tag },
+  { id: "meaning", label: "深意阐释", detail: "段落在论证或主题上的含义", icon: Lightbulb },
+  { id: "concept", label: "概念释义", detail: "本书语境下的概念用法", icon: CircleHelp },
+  { id: "context", label: "前后因果", detail: "此刻为何重要", icon: GitBranch },
+];
 
-function facetDescription(facet) {
-  const descriptions = {
-    "人物": "角色与关系", "地点": "关键空间", "时间线": "事件顺序", "组织": "参与主体", "关键事件": "主线转折", "原文证据": "定位出处",
-    "人物关系": "关系变化", "场景": "发生场所", "情节线": "叙事推进", "章节回顾": "已读摘要", "主题意象": "反复母题",
-    "案件": "案件进展", "线索": "可验证线索", "证据": "原文证据", "阵营": "角色阵营", "世界设定": "世界规则", "术语": "重要名词", "事件线": "事件推进",
-    "关系变化": "关系变化", "情感节点": "情感转折", "冲突与转折": "冲突转折", "概念": "核心概念", "公司与人物": "主体与角色", "案例": "案例", "框架": "分析框架", "决策": "关键决策", "数据指标": "关键指标",
-    "指标": "数据指标", "机构": "参与机构", "政策": "政策变化", "因果关系": "因果链", "理论": "理论框架", "论证": "论证结构", "出处": "引用出处", "命题": "核心命题", "思想家": "思想人物", "流派": "思想流派", "论证链": "推理链", "原典出处": "原典定位",
-    "规律": "科学规律", "实验": "实验设计", "公式": "公式", "科学家": "相关人物", "架构": "系统架构", "流程": "实现流程", "依赖": "依赖关系", "代码示例": "代码片段", "常见问题": "问题排查",
-    "知识点": "学习重点", "定义": "概念定义", "例题": "例题", "易错点": "易错提醒", "练习": "练习", "前置知识": "前置知识", "方法": "可用方法", "情境案例": "情境案例", "行动清单": "行动建议", "关键提问": "反思提问",
-    "路线": "行进路线", "地理特征": "地理特征", "历史背景": "背景说明", "体验": "体验记录", "实用信息": "实用信息", "作品": "相关作品", "作者": "作者", "技法": "表达技法", "时期": "相关时期", "风格": "风格特征", "作品关联": "作品关联",
-    "篇章": "篇章", "意象": "意象", "典故": "典故", "注释": "注释", "版本": "版本", "主题": "主题"
-  };
-  return descriptions[facet] || "阅读索引";
+function defaultExplainMode(selection = "", bookType = "") {
+  const text = String(selection || "").trim();
+  const type = String(bookType || "");
+  const shortTerm = text.length > 0 && text.length <= 12 && !/[。！？；\n]/.test(text);
+  if (shortTerm) {
+    if (/科普|教材|技术|科学|学习|商业/.test(type)) return "concept";
+    return "entity";
+  }
+  if (/哲学|思想|文学|随笔|商业/.test(type) && text.length > 24) return "meaning";
+  if (/科普|教材|技术|科学|学习/.test(type) && text.length <= 40) return "concept";
+  return "source";
 }
 
 function loadStored(name, fallback) {
@@ -295,6 +380,8 @@ export function App() {
   const [pageIndex, setPageIndex] = useState(0);
   const [pageCount, setPageCount] = useState(1);
   const [pageWidth, setPageWidth] = useState(900);
+  const [pageHeight, setPageHeight] = useState(720);
+  const [pagePackScale, setPagePackScale] = useState(1);
   const [activePanel, setActivePanel] = useState("目录");
   const [selectedParagraph, setSelectedParagraph] = useState(null);
   const [selectionBloom, setSelectionBloom] = useState(null);
@@ -308,7 +395,6 @@ export function App() {
   const [analysisSummaryOpen, setAnalysisSummaryOpen] = useState(false);
   const [selectionAssist, setSelectionAssist] = useState(null);
   const [relationshipOpen, setRelationshipOpen] = useState(false);
-  const [organizerOpen, setOrganizerOpen] = useState(null);
   const [readingProgress, setReadingProgress] = useState(() => ({ ...createReadingProgress(), ...loadStored("yuezhi-reading-progress", createReadingProgress()) }));
   const [aiIndex, setAiIndex] = useState(null);
   const [memoryEvidenceStore, setMemoryEvidenceStore] = useState(null);
@@ -319,17 +405,33 @@ export function App() {
   const [readPages, setReadPages] = useState([]);
   const [bookmarks, setBookmarks] = useState([]);
   const [notes, setNotes] = useState([]);
+  const [explains, setExplains] = useState([]);
+  const [explainPreview, setExplainPreview] = useState(null);
   const [noteComposerOpen, setNoteComposerOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState("");
+  const [noteContext, setNoteContext] = useState(null);
   const [analysisState, setAnalysisState] = useState({ status: "idle", message: "尚未使用大模型分析" });
   const [traceJob, setTraceJob] = useState({ status: "idle", message: "AI Trace 空闲" });
   const [notice, setNotice] = useState("");
   const inputRef = useRef(null);
   const pageCopyRef = useRef(null);
   const pageTrackRef = useRef(null);
-  const readingPositionRestoreRef = useRef(null);
+  const pageSizeRef = useRef({ width: 900, height: 720 });
+  const readingAnchorRef = useRef({ paragraphIndex: 0, charOffset: 0 });
+  const layoutMetricsRef = useRef({ width: 900, height: 720, packScale: 1 });
+  const layoutRestoreRef = useRef(false);
+  const didInitialPageMeasureRef = useRef(false);
+  // Chapter pack plan: settle once, then freeze so page turns cannot rewrite pageCount.
+  const packPlanRef = useRef({ locked: false, safetyApplied: false });
   const recoveryCardJobRef = useRef(0);
   const readingStartedAtRef = useRef(Date.now());
+
+  useEffect(() => {
+    didInitialPageMeasureRef.current = false;
+    layoutRestoreRef.current = false;
+    pageSizeRef.current = { width: 900, height: 720 };
+    layoutMetricsRef.current = { width: 900, height: 720, packScale: 1 };
+  }, [book?.id, screen]);
 
   useEffect(() => { localStorage.setItem("yuezhi-categories", JSON.stringify(categories)); }, [categories]);
   useEffect(() => { localStorage.setItem("yuezhi-book-categories", JSON.stringify(bookCategories)); }, [bookCategories]);
@@ -365,7 +467,7 @@ export function App() {
     const record = storedRecord ? hydrateAnalysisRecord(storedRecord, book) : null;
     setReadPages(loadStored(readPagesStorageKey(book), []));
     setAnalysisRecord(record);
-    setRecoveryCard(record?.recoveryCard || null);
+    setRecoveryCard(null);
     setAiIndex(record?.index || null);
     setBookProfile(record?.profile || (book.bookType ? { category: book.bookType, facets: book.indexSchema || findBookType(book.bookType).facets } : null));
     setAnalysisState(record ? { status: "done", message: "已加载上次增量分析结果" } : { status: "idle", message: "尚未使用大模型分析" });
@@ -382,6 +484,16 @@ export function App() {
     if (!book) return;
     setNotes(loadStored(notesStorageKey(book), []));
   }, [book?.id, book?.title, book?.creator, book?.chapters.length]);
+
+  useEffect(() => {
+    if (!book) return;
+    setExplains(loadExplains(book));
+    setExplainPreview(null);
+  }, [book?.id, book?.title, book?.creator, book?.chapters.length]);
+
+  useEffect(() => {
+    setExplainPreview(null);
+  }, [chapterIndex, pageIndex]);
 
   useEffect(() => {
     if (analysisSettings.analysisMode !== "auto" || analysisState.status === "loading" || traceJob.status === "running" || !book) return;
@@ -408,6 +520,11 @@ export function App() {
           setBook(activeCachedBook);
           setChapterIndex((current) => Math.min(Math.max(current, 0), activeCachedBook.chapters.length - 1));
         }
+        const staleEpubCount = importedBooks.filter((item) => needsEpubContentReparse(item)).length;
+        if (staleEpubCount > 0 && !loadStored("shumai-epub-image-reparse-hint", false)) {
+          localStorage.setItem("shumai-epub-image-reparse-hint", JSON.stringify(true));
+          showNotice(`${staleEpubCount} 本已导入 EPUB 仍是旧解析；重新导入同一文件即可显示插图`);
+        }
         if (cachedBuiltIn) {
           return;
         }
@@ -416,7 +533,19 @@ export function App() {
         const response = await fetch(BOOK_PATH);
         if (!response.ok) throw new Error("无法打开本地 EPUB 文件");
         const parsed = await parseEpubInWorker(await response.blob());
-        const builtIn = { ...parsed, id: BUILT_IN_BOOK_ID, fingerprint: "builtin:long-march", cover: COVER_PATH, bookType: "历史纪实 / 传记", indexSchema: findBookType("历史纪实 / 传记").facets, local: true, builtIn: true, builtInCacheVersion: BUILT_IN_CACHE_VERSION };
+        const builtIn = {
+          ...parsed,
+          id: BUILT_IN_BOOK_ID,
+          fingerprint: "builtin:long-march",
+          cover: COVER_PATH,
+          bookType: "历史纪实 / 传记",
+          indexSchema: findBookType("历史纪实 / 传记").facets,
+          local: true,
+          builtIn: true,
+          format: "EPUB",
+          builtInCacheVersion: BUILT_IN_CACHE_VERSION,
+          contentParseVersion: EPUB_CONTENT_PARSE_VERSION,
+        };
         await saveStoredLibraryBook(builtIn);
         const books = [builtIn, ...importedBooks];
         const activeBook = books.find((item) => item.id === activeBookId) || builtIn;
@@ -477,27 +606,60 @@ export function App() {
   }, [recoveryCard]);
 
   const chapter = book?.chapters[chapterIndex];
-  const chapterPage = useMemo(() => paginateChapterWindow(chapter, pageIndex, pageWidth), [chapter, pageIndex, pageWidth]);
+  const chapterPage = useMemo(
+    () => paginateChapterWindow(chapter, pageIndex, pageWidth, pageHeight, pagePackScale),
+    [chapter, pageIndex, pageWidth, pageHeight, pagePackScale],
+  );
   const visiblePageIndex = Math.min(pageIndex, Math.max(0, chapterPage.pageCount - 1));
   const currentPageParagraphs = chapterPage.items || [];
-  const hasPriorReadingContext = visiblePageIndex > 0;
+  const hasPriorReadingContext = chapterIndex > 0 || visiblePageIndex > 0;
   useEffect(() => {
-    function updatePageCount() {
+    function updatePageMetrics() {
       const viewport = pageCopyRef.current;
       if (!viewport) return;
       const width = Math.round(viewport.clientWidth);
-      if (width <= 0) return;
+      const style = window.getComputedStyle(viewport);
+      const padY = (Number.parseFloat(style.paddingTop) || 0) + (Number.parseFloat(style.paddingBottom) || 0);
+      // Budget against the content box only — padding is reserved for glyph clearance.
+      const height = Math.round(viewport.clientHeight - padY);
+      if (width <= 0 || height <= 0) return;
+      const prev = pageSizeRef.current;
+      // Ignore ±1–2px ResizeObserver jitter so charBudget / pageCount stay stable while flipping.
+      const PAGE_SIZE_HYSTERESIS_PX = 2;
+      if (
+        didInitialPageMeasureRef.current
+        && Math.abs(prev.width - width) < PAGE_SIZE_HYSTERESIS_PX
+        && Math.abs(prev.height - height) < PAGE_SIZE_HYSTERESIS_PX
+      ) {
+        return;
+      }
+      const sizeShifted = Math.abs(prev.width - width) >= 24 || Math.abs(prev.height - height) >= 24;
+      if (didInitialPageMeasureRef.current && sizeShifted) {
+        layoutRestoreRef.current = true;
+        packPlanRef.current = { locked: false, safetyApplied: false };
+        setPagePackScale(1);
+      }
+      didInitialPageMeasureRef.current = true;
+      pageSizeRef.current = { width, height };
       setPageWidth(width);
+      setPageHeight(height);
     }
 
-    const frame = requestAnimationFrame(updatePageCount);
-    const observer = new ResizeObserver(updatePageCount);
+    const frame = requestAnimationFrame(updatePageMetrics);
+    const observer = new ResizeObserver(updatePageMetrics);
     if (pageCopyRef.current) observer.observe(pageCopyRef.current);
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [chapter, screen]);
+  }, [chapter, screen, sidebarCollapsed, relationshipOpen]);
+
+  // Pack scale is chapter-scoped: reset only when chapter changes (or on meaningful viewport resize above).
+  // Never reset on pageIndex — that made totals oscillate as each page re-measured overflow.
+  useEffect(() => {
+    packPlanRef.current = { locked: false, safetyApplied: false };
+    setPagePackScale(1);
+  }, [chapter?.id]);
 
   useEffect(() => {
     const nextCount = Math.max(1, chapterPage.pageCount);
@@ -505,11 +667,166 @@ export function App() {
     setPageIndex((index) => Math.min(index, nextCount - 1));
   }, [chapterPage.pageCount]);
 
+  // Keep a paragraph/char anchor for the visible page so layout-driven repacks can restore position.
+  useLayoutEffect(() => {
+    if (!currentPageParagraphs.length) return;
+    const preferred = [
+      selectionAssist?.paragraphIndex,
+      selectionBloom?.paragraphIndex,
+      selectedParagraph,
+    ].find((value) => Number.isInteger(value));
+    const metrics = getLogicalPageMetrics(pageWidth, pageHeight, pagePackScale);
+
+    if (Number.isInteger(preferred)) {
+      const match = currentPageParagraphs.find((item) => item.paragraphIndex === preferred);
+      let charOffset = 0;
+      if (selectionAssist?.paragraphIndex === preferred && Number.isInteger(selectionAssist?.startOffset)) {
+        charOffset = selectionAssist.startOffset;
+      } else if (selectionBloom?.paragraphIndex === preferred && Number.isInteger(selectionBloom?.startOffset)) {
+        charOffset = selectionBloom.startOffset;
+      } else if (match) {
+        charOffset = Math.max(0, (Number(match.segmentIndex) || 0) * metrics.longSegmentSize);
+      }
+      readingAnchorRef.current = {
+        paragraphIndex: preferred,
+        charOffset: Math.max(0, charOffset),
+      };
+      return;
+    }
+
+    const first = currentPageParagraphs[0];
+    readingAnchorRef.current = {
+      paragraphIndex: first.paragraphIndex,
+      charOffset: Math.max(0, (Number(first.segmentIndex) || 0) * metrics.longSegmentSize),
+    };
+  }, [currentPageParagraphs, selectionAssist, selectionBloom, selectedParagraph, pageWidth, pageHeight, pagePackScale]);
+
+  // After .page-copy resizes (sidebar / relation panel) or pack-scale settles, remap pageIndex from the reading anchor.
+  useEffect(() => {
+    const prev = layoutMetricsRef.current;
+    const widthChanged = prev.width !== pageWidth;
+    const heightChanged = prev.height !== pageHeight;
+    const scaleChanged = prev.packScale !== pagePackScale;
+    layoutMetricsRef.current = { width: pageWidth, height: pageHeight, packScale: pagePackScale };
+    if (!chapter || !layoutRestoreRef.current) return;
+    if (!widthChanged && !heightChanged && !scaleChanged) return;
+
+    const anchor = readingAnchorRef.current;
+    if (!Number.isInteger(anchor?.paragraphIndex)) return;
+    const nextIndex = findPageForParagraphInChapter(
+      chapter,
+      anchor.paragraphIndex,
+      pageWidth,
+      pageHeight,
+      pagePackScale,
+      anchor.charOffset,
+    );
+    setPageIndex((current) => (current === nextIndex ? current : nextIndex));
+  }, [pageWidth, pageHeight, pagePackScale, chapter]);
+
   useEffect(() => {
     const viewport = pageCopyRef.current;
     if (!viewport || viewport.clientWidth <= 0) return;
     viewport.scrollLeft = 0;
-  }, [pageIndex, pageWidth]);
+  }, [pageIndex, pageWidth, pageHeight]);
+
+  useEffect(() => {
+    const viewport = pageCopyRef.current;
+    const track = pageTrackRef.current;
+    if (!viewport || !track || !currentPageParagraphs.length) return undefined;
+    // Avoid measuring mid page-turn animation (transform can skew rects).
+    if (pageTurn) return undefined;
+    let cancelled = false;
+    let frame = 0;
+
+    function shrinkPackScale(ratio) {
+      layoutRestoreRef.current = true;
+      packPlanRef.current.locked = false;
+      setPagePackScale((scale) => {
+        const next = Math.max(0.3, Math.min(scale * ratio, scale - 0.06));
+        return Math.round(next * 100) / 100;
+      });
+    }
+
+    function measureOverflow() {
+      if (cancelled) return;
+      const copyBox = viewport.getBoundingClientRect();
+      const blocks = track.querySelectorAll("p, figure.page-figure");
+      if (!blocks.length || copyBox.height <= 0) return;
+      const last = blocks[blocks.length - 1];
+      const lastBottom = last.getBoundingClientRect().bottom;
+      const style = window.getComputedStyle(viewport);
+      const padBottom = Number.parseFloat(style.paddingBottom) || 0;
+      // overflow:hidden clips at the padding edge; keep a one-line band above it.
+      const clipFloor = copyBox.bottom;
+      const safetyPx = Math.max(26, padBottom + 12);
+      const softLimit = clipFloor - safetyPx;
+      const fitsSoft = lastBottom <= softLimit + 0.5;
+      const hardClipped = lastBottom > clipFloor + 0.5;
+
+      // After the chapter pack plan locks, ignore soft overflow so page turns cannot rewrite totals.
+      // Still unlock + shrink on hard clipping past the padding edge.
+      if (packPlanRef.current.locked) {
+        if (!hardClipped) return;
+        const overflowPx = lastBottom - softLimit;
+        const usable = Math.max(copyBox.height, 1);
+        const ratio = Math.max(0.45, (usable - safetyPx - overflowPx) / usable);
+        shrinkPackScale(ratio);
+        return;
+      }
+
+      if (fitsSoft) {
+        const gap = softLimit - lastBottom;
+        // One-time tight-fit haircut so denser later pages are less likely to hard-clip.
+        if (!packPlanRef.current.safetyApplied && gap < 56) {
+          packPlanRef.current.safetyApplied = true;
+          layoutRestoreRef.current = true;
+          setPagePackScale((scale) => Math.max(0.3, Math.round(scale * 0.97 * 100) / 100));
+          return;
+        }
+        packPlanRef.current.safetyApplied = true;
+        packPlanRef.current.locked = true;
+        layoutRestoreRef.current = false;
+        return;
+      }
+
+      const overflowPx = lastBottom - softLimit;
+      const usable = Math.max(copyBox.height, 1);
+      // Shrink just enough to clear the clip; avoid the old *0.8 overshoot that re-underfilled pages.
+      const ratio = Math.max(0.45, (usable - safetyPx - overflowPx) / usable);
+      packPlanRef.current.safetyApplied = true;
+      shrinkPackScale(ratio);
+    }
+
+    function scheduleMeasure() {
+      frame = requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (cancelled) return;
+          const pendingImages = [...track.querySelectorAll("img.page-image")].filter((img) => !img.complete);
+          if (!pendingImages.length) {
+            measureOverflow();
+            return;
+          }
+          let remaining = pendingImages.length;
+          const onReady = () => {
+            remaining -= 1;
+            if (remaining > 0 || cancelled) return;
+            measureOverflow();
+          };
+          pendingImages.forEach((img) => {
+            img.addEventListener("load", onReady, { once: true });
+            img.addEventListener("error", onReady, { once: true });
+          });
+        });
+      });
+    }
+
+    scheduleMeasure();
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(frame);
+    };
+  }, [currentPageParagraphs, pageWidth, pageHeight, pagePackScale, pageTurn]);
 
   useEffect(() => {
     if (!pageTurn) return undefined;
@@ -566,6 +883,8 @@ export function App() {
     currentCursor: { chapterIndex, paragraphIndex: selectedParagraph ?? 0 },
     traceIndex: bookIndex,
     topK: 12,
+    // Reader search must show original-text hits only — never memory/entity/trace-only weak matches.
+    requireTextMatch: true,
   }), [memoryEvidenceStore, searchQuery, evidenceScopeCursor?.chapterIndex, evidenceScopeCursor?.paragraphIndex, chapterIndex, selectedParagraph, bookIndex]);
 
   useEffect(() => {
@@ -589,8 +908,6 @@ export function App() {
   const activeSkillConfig = getDomainConfig(activeSkillDomain);
   const activeDomainProgress = domainProgress(readingProgress, activeSkillDomain);
   const activeSpecialSkills = unlockedSpecialSkills(readingProgress, activeSkillDomain);
-  const organizerSuggestions = useMemo(() => suggestTraceOrganizers(bookIndex, bookMemory, activeTraceProfile), [bookIndex, bookMemory, activeTraceProfile]);
-
   useEffect(() => {
     if (screen !== "reader" || !book) return undefined;
     readingStartedAtRef.current = Date.now();
@@ -677,24 +994,100 @@ export function App() {
     setSelectedParagraph(null);
     setDrawerOpen(false);
     setRecoveryCard(null);
-    scheduleRecoveryCardBuild(nextBook, { ...saved, pageWidth }, lastActivity, jobId);
+    scheduleRecoveryCardBuild(nextBook, { ...saved, pageWidth, pageHeight }, lastActivity, jobId);
   }
 
   function scheduleRecoveryCardBuild(nextBook, saved, lastActivity, jobId) {
     const lastActivityTime = Number(lastActivity || 0);
     if (lastActivityTime && Date.now() - lastActivityTime < RECOVERY_CARD_MIN_ABSENCE_MS) return;
-    const run = () => {
+
+    const run = async () => {
       if (recoveryCardJobRef.current !== jobId) return;
       const storedRecord = hydrateAnalysisRecord(loadStored(analysisStorageKey(nextBook), null), nextBook);
       const memoryState = loadStored(recoveryMemoryStorageKey(nextBook), {});
-      const nextRecoveryCard = buildTraceRecoveryCard(nextBook, storedRecord?.bookMemory || storedRecord?.index, saved, lastActivity, storedRecord?.bookMemory || storedRecord?.traceMemory, memoryState) || buildRecoveryCard(nextBook, [], saved, lastActivity, memoryState);
-      if (recoveryCardJobRef.current === jobId) setRecoveryCard(nextRecoveryCard);
+      const persistedMemory = storedRecord?.bookMemory
+        ? normalizeBookMemory(storedRecord.bookMemory)
+        : bookMemoryFromLegacy({ index: storedRecord?.index, traceMemory: storedRecord?.traceMemory }, { bookId: nextBook.id || nextBook.title || "book" });
+      const cursor = { ...normalizeRecoveryCursor(nextBook, saved), pageWidth: saved.pageWidth, pageHeight: saved.pageHeight };
+      const localCard = buildTraceRecoveryCard(nextBook, persistedMemory, cursor, lastActivity, persistedMemory, memoryState)
+        || buildRecoveryCard(nextBook, [], cursor, lastActivity, memoryState);
+      if (recoveryCardJobRef.current !== jobId) return;
+      if (localCard) setRecoveryCard(localCard);
+      else if (storedRecord?.recoveryCard) setRecoveryCard(normalizeRecoveryCard(storedRecord.recoveryCard, null));
+
+      if (!hasBookMemoryContent(persistedMemory) && !(storedRecord?.index && Object.keys(storedRecord.index).length)) {
+        return;
+      }
+
+      const indexForEvidence = normalizeReadingIndex(storedRecord?.index || readingIndexFromBookMemory(persistedMemory), nextBook);
+      const evidenceStore = buildMemoryEvidenceStore(nextBook, indexForEvidence);
+      const candidateQuery = [
+        nextBook.title,
+        nextBook.creator,
+        storedRecord?.profile?.category || nextBook.bookType,
+        ...(persistedMemory.entities || []).slice(0, 12).map((item) => item.name),
+        ...(persistedMemory.episodic || []).slice(0, 6).map((item) => item.name || item.title),
+      ].filter(Boolean).join(" ");
+      const supportingEvidence = locateEvidence(evidenceStore, {
+        query: candidateQuery,
+        scopeCursor: cursor,
+        currentCursor: cursor,
+        traceIndex: indexForEvidence,
+        topK: 12,
+      }).map((item) => ({
+        cite: item.cite,
+        chapterIndex: item.chapterIndex,
+        paragraphIndex: item.paragraphIndex,
+        chapterTitle: item.chapterTitle,
+        quote: item.cite?.quote || item.excerpt,
+        score: Number(item.score.toFixed(3)),
+        matchSources: item.matchSources,
+      }));
+
+      if (recoveryCardJobRef.current !== jobId) return;
+      setTraceJob({ status: "running", message: "正在准备续读恢复…" });
+      const modelCard = await requestModelRecoveryCard({
+        targetBook: nextBook,
+        cursor,
+        traceProfile: storedRecord?.traceProfile || resolveTraceProfile(storedRecord?.profile?.category || nextBook.bookType, storedRecord?.profile?.facets || nextBook.indexSchema || []),
+        bookMemory: persistedMemory,
+        traceMemory: storedRecord?.traceMemory || compatibilityTraceMemory(persistedMemory),
+        supportingEvidence,
+        currentChapters: getRecoveryCurrentChapters(nextBook, cursor),
+        memoryState,
+        lastActivity,
+        localFallback: localCard || normalizeRecoveryCard(storedRecord?.recoveryCard, null),
+      });
+      if (recoveryCardJobRef.current !== jobId) return;
+      if (modelCard) {
+        setRecoveryCard(modelCard);
+        const nextRecord = {
+          ...(storedRecord || {}),
+          bookMemory: persistedMemory,
+          index: indexForEvidence,
+          profile: storedRecord?.profile || null,
+          traceProfile: storedRecord?.traceProfile || null,
+          traceMemory: storedRecord?.traceMemory || compatibilityTraceMemory(persistedMemory),
+          recoveryCard: modelCard,
+          summary: storedRecord?.summary || null,
+          cursor: storedRecord?.cursor || cursor,
+          updatedAt: new Date().toISOString(),
+        };
+        localStorage.setItem(analysisStorageKey(nextBook), JSON.stringify(nextRecord));
+        if (storageBookIdentity(book) === storageBookIdentity(nextBook)) {
+          setAnalysisRecord(nextRecord);
+        }
+        setTraceJob({ status: "done", message: "续读恢复已就绪" });
+      } else {
+        setTraceJob({ status: "done", message: localCard ? "已使用本地恢复材料" : "暂无续读恢复材料" });
+      }
     };
+
     if (typeof window !== "undefined" && "requestIdleCallback" in window) {
-      window.requestIdleCallback(run, { timeout: 1800 });
+      window.requestIdleCallback(() => { void run(); }, { timeout: 1800 });
       return;
     }
-    window.setTimeout(run, 600);
+    window.setTimeout(() => { void run(); }, 600);
   }
 
   function selectParagraph(index) {
@@ -703,6 +1096,7 @@ export function App() {
   }
 
   function selectChapter(index) {
+    layoutRestoreRef.current = false;
     markCurrentPageRead();
     setChapterIndex(index);
     setPageIndex(0);
@@ -711,20 +1105,43 @@ export function App() {
   }
 
   function turnPage(direction) {
+    layoutRestoreRef.current = false;
     markCurrentPageRead();
     setPageTurn(direction > 0 ? "next" : "previous");
-    setPageIndex((index) => Math.min(Math.max(index + direction, 0), pageCount - 1));
     setSelectedParagraph(null);
     setSelectionBloom(null);
     setDrawerOpen(false);
+
+    if (direction > 0) {
+      if (pageIndex < pageCount - 1) {
+        setPageIndex(pageIndex + 1);
+        return;
+      }
+      if (chapterIndex < book.chapters.length - 1) {
+        setChapterIndex(chapterIndex + 1);
+        setPageIndex(0);
+      }
+      return;
+    }
+
+    if (pageIndex > 0) {
+      setPageIndex(pageIndex - 1);
+      return;
+    }
+    if (chapterIndex > 0) {
+      const previousChapter = book.chapters[chapterIndex - 1];
+      const previousPageCount = Math.max(1, paginateChapterWindow(previousChapter, 0, pageWidth, pageHeight, pagePackScale).pageCount);
+      setChapterIndex(chapterIndex - 1);
+      setPageIndex(previousPageCount - 1);
+    }
   }
 
   function openCurrentRecoveryCard() {
     if (!hasPriorReadingContext) {
-      showNotice("第一页还没有前文可回忆");
+      showNotice("还没有前文可回忆");
       return;
     }
-    const cursor = { ...getReadCursor(), pageWidth };
+    const cursor = { ...getReadCursor(), pageWidth, pageHeight };
     const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
     const card = buildTraceRecoveryCard(book, bookMemory, cursor, null, bookMemory, memoryState) || buildRecoveryCard(book, [], cursor, null, memoryState) || buildRecoveryCard(book, readPages, cursor, null, memoryState);
     if (!card) {
@@ -735,8 +1152,9 @@ export function App() {
   }
 
   function openSearchResult(result) {
+    layoutRestoreRef.current = false;
     setChapterIndex(result.chapterIndex);
-    setPageIndex(findPageForParagraphInChapter(book.chapters[result.chapterIndex], result.paragraphIndex, pageWidth));
+    setPageIndex(findPageForParagraphInChapter(book.chapters[result.chapterIndex], result.paragraphIndex, pageWidth, pageHeight, pagePackScale));
     setSelectedParagraph(result.paragraphIndex);
     setDrawerOpen(false);
     setSearchOpen(false);
@@ -744,46 +1162,15 @@ export function App() {
   }
 
   function jumpToParagraph(index) {
-    setPageIndex(findPageForParagraphInChapter(chapter, index, pageWidth));
+    layoutRestoreRef.current = false;
+    setPageIndex(findPageForParagraphInChapter(chapter, index, pageWidth, pageHeight, pagePackScale));
     setSelectedParagraph(index);
     setDrawerOpen(false);
     showNotice(`已回到本章第 ${index + 1} 段`);
   }
 
   function goToParagraph(index) {
-    setPageIndex(findPageForParagraphInChapter(chapter, index, pageWidth));
-  }
-
-  function openIndexEntry(entry) {
-    const position = entry.occurrence || entry.occurrences?.[0];
-    if (!position || !Number.isInteger(position.chapterIndex) || !Number.isInteger(position.paragraphIndex)) {
-      showNotice("这条索引还没有可跳转的原文证据");
-      return;
-    }
-    recordProgress({ evidenceJumps: 1, xp: 1 });
-    setChapterIndex(position.chapterIndex);
-    setPageIndex(0);
-    setSelectedParagraph(position.paragraphIndex);
-    setDrawerOpen(false);
-    const related = (bookIndex.relationships || []).filter((item) => (
-      item.source === entry.name || item.target === entry.name
-    ));
-    if (related.length) {
-      const usable = contextualRelationships(related, {
-        chapterIndex: position.chapterIndex,
-        selectedParagraph: position.paragraphIndex,
-        pageParagraphs: [{ paragraphIndex: position.paragraphIndex }],
-        index: bookIndex,
-      });
-      if (usable.length) {
-        setOrganizerOpen(null);
-        setSidebarCollapsed(false);
-        setRelationshipOpen(true);
-        setActivePanel("目录");
-      }
-    }
-    requestAnimationFrame(() => requestAnimationFrame(() => goToParagraph(position.paragraphIndex)));
-    showNotice(`已定位到“${entry.name}”的原文证据`);
+    setPageIndex(findPageForParagraphInChapter(chapter, index, pageWidth, pageHeight, pagePackScale));
   }
 
   function openRelationshipEvidence(relationship) {
@@ -830,8 +1217,10 @@ export function App() {
     try {
       const existingFingerprints = new Set(libraryBooks.map((item) => item.fingerprint).filter(Boolean));
       const importedBooks = [];
+      const upgradedBooks = [];
       const duplicateBooks = [];
       let duplicateCount = 0;
+      let upgradedCount = 0;
       let failedCount = 0;
       let classifiedCount = 0;
       let firstFailureMessage = "";
@@ -841,10 +1230,30 @@ export function App() {
           setImportStatus((status) => ({ ...status, current: fileIndex + 1, title: file.name, stage: "解析书籍结构" }));
           const parsed = await parseImportedBook(file);
           const fingerprint = createBookFingerprint(parsed, file);
-          if (existingFingerprints.has(fingerprint)) {
+          const existingBook = libraryBooks.find((item) => item.fingerprint === fingerprint)
+            || upgradedBooks.find((item) => item.fingerprint === fingerprint);
+          if (existingFingerprints.has(fingerprint) && existingBook) {
+            if (needsEpubContentReparse(existingBook) && getFileExtension(file) === "epub") {
+              setImportStatus((status) => ({ ...status, title: parsed.title || file.name, stage: "升级插图解析" }));
+              const upgraded = {
+                ...existingBook,
+                ...parsed,
+                id: existingBook.id,
+                fingerprint: existingBook.fingerprint,
+                fileName: file.name,
+                cover: parsed.cover || existingBook.cover || "",
+                bookType: existingBook.bookType || "",
+                indexSchema: existingBook.indexSchema || [],
+                local: false,
+                format: "EPUB",
+                contentParseVersion: EPUB_CONTENT_PARSE_VERSION,
+              };
+              upgradedBooks.push(upgraded);
+              upgradedCount += 1;
+              continue;
+            }
             duplicateCount += 1;
-            const existingBook = libraryBooks.find((item) => item.fingerprint === fingerprint);
-            if (existingBook) duplicateBooks.push(existingBook);
+            duplicateBooks.push(existingBook);
             continue;
           }
           existingFingerprints.add(fingerprint);
@@ -852,6 +1261,7 @@ export function App() {
           const classification = await classifyImportedBook(parsed);
           if (classification) classifiedCount += 1;
           const profile = classification?.profile;
+          const extension = getFileExtension(file);
           importedBooks.push({
             ...parsed,
             id: `import:${fingerprint}`,
@@ -861,6 +1271,8 @@ export function App() {
             bookType: profile?.category || "",
             indexSchema: profile?.facets || [],
             local: false,
+            format: extension === "pdf" ? "PDF" : "EPUB",
+            ...(extension === "epub" ? { contentParseVersion: EPUB_CONTENT_PARSE_VERSION } : {}),
           });
           setImportStatus((status) => ({ ...status, classified: classifiedCount, stage: classification ? "完成分类" : "分类跳过，保留待识别" }));
         } catch (error) {
@@ -870,10 +1282,15 @@ export function App() {
         }
       }
 
-      if (importedBooks.length) {
-        await Promise.all(importedBooks.map((item) => saveStoredLibraryBook(item)));
-        setLibraryBooks((items) => [...items, ...importedBooks]);
-        const latest = importedBooks[importedBooks.length - 1];
+      const shelfUpdates = [...importedBooks, ...upgradedBooks];
+      if (shelfUpdates.length) {
+        await Promise.all(shelfUpdates.map((item) => saveStoredLibraryBook(item)));
+        setLibraryBooks((items) => {
+          const upgradedIds = new Set(upgradedBooks.map((item) => item.id));
+          const withoutUpgraded = items.filter((item) => !upgradedIds.has(item.id));
+          return [...withoutUpgraded, ...importedBooks, ...upgradedBooks];
+        });
+        const latest = shelfUpdates[shelfUpdates.length - 1];
         setBook(latest);
         setBookCategories([categories[0]].filter(Boolean));
         setActiveCategory("全部");
@@ -891,11 +1308,12 @@ export function App() {
 
       const messages = [];
       if (importedBooks.length) messages.push(`已导入 ${importedBooks.length} 本书`);
+      if (upgradedCount) messages.push(`已升级 ${upgradedCount} 本插图解析`);
       if (classifiedCount) messages.push(`已识别 ${classifiedCount} 本类型`);
       if (duplicateCount) messages.push(`${duplicateCount} 本已在书架中`);
       if (unsupported.length) messages.push(`${unsupported.length} 个暂不支持的文件已跳过`);
       if (failedCount) messages.push(`${failedCount} 本导入失败`);
-      if (!importedBooks.length && failedCount && firstFailureMessage) messages.push(firstFailureMessage);
+      if (!shelfUpdates.length && failedCount && firstFailureMessage) messages.push(firstFailureMessage);
       showNotice(messages.join("，") || "没有可导入的书籍");
     } catch (error) {
       setLoadError(error.message || "导入失败，请检查书籍文件");
@@ -1060,16 +1478,15 @@ export function App() {
       setBook((current) => current ? { ...current, bookType: result.profile.category, indexSchema: result.profile.facets } : current);
       setLibraryBooks((items) => items.map((item) => item.id === book.id ? { ...item, bookType: result.profile.category, indexSchema: result.profile.facets } : item));
       let nextRecoveryCard = null;
-      if (!isAutomatic) {
-        setTraceJob({ status: "running", message: "正在生成续读恢复卡" });
-        nextRecoveryCard = await requestModelRecoveryCard({
-          cursor,
-          traceProfile: result.traceProfile || traceProfile,
-          bookMemory: nextBookMemory,
-          supportingEvidence,
-          currentChapters: newChapters,
-        });
-      }
+      setTraceJob({ status: "running", message: "正在生成续读恢复卡" });
+      nextRecoveryCard = await requestModelRecoveryCard({
+        targetBook: book,
+        cursor,
+        traceProfile: result.traceProfile || traceProfile,
+        bookMemory: nextBookMemory,
+        supportingEvidence,
+        currentChapters: newChapters,
+      });
       const record = {
         bookMemory: nextBookMemory,
         index: nextIndex,
@@ -1083,7 +1500,7 @@ export function App() {
       };
       setAnalysisRecord(record);
       localStorage.setItem(analysisStorageKey(book), JSON.stringify(record));
-      if (nextRecoveryCard) setRecoveryCard(nextRecoveryCard);
+      if (nextRecoveryCard && !isAutomatic) setRecoveryCard(nextRecoveryCard);
       setAnalysisState({ status: "done", message: `已由 ${result.model} 更新续读恢复材料` });
       setTraceJob({ status: "done", message: `恢复材料已更新到第 ${cursor.pageIndex + 1} 页` });
       showNotice(isAutomatic ? "已根据新增已读内容自动准备恢复材料" : "续读恢复材料已更新");
@@ -1093,9 +1510,22 @@ export function App() {
     }
   }
 
-  async function requestModelRecoveryCard({ cursor, traceProfile, bookMemory, traceMemory, supportingEvidence, currentChapters }) {
-    const localFallback = buildRecoveryCard(book, readPages, cursor, null);
-    if (!supportingEvidence?.length) return localFallback;
+  async function requestModelRecoveryCard({
+    targetBook = book,
+    cursor,
+    traceProfile,
+    bookMemory,
+    traceMemory,
+    supportingEvidence,
+    currentChapters,
+    memoryState = {},
+    lastActivity = null,
+    localFallback = null,
+  }) {
+    const fallback = localFallback
+      || buildTraceRecoveryCard(targetBook, bookMemory || {}, cursor, lastActivity, bookMemory, memoryState)
+      || buildRecoveryCard(targetBook, targetBook === book ? readPages : [], cursor, lastActivity, memoryState);
+    if (!supportingEvidence?.length) return fallback;
     try {
       const response = await fetch("/api/recovery-card", {
         method: "POST",
@@ -1105,10 +1535,10 @@ export function App() {
           model: RECOVERY_MODEL_BY_PROVIDER[analysisSettings.provider] || RECOVERY_MODEL_BY_PROVIDER.deepseek,
           thinking: analysisSettings.provider === "deepseek",
           book: {
-            id: book.id,
-            title: book.title,
-            creator: book.creator,
-            bookType: bookProfile?.category || book.bookType,
+            id: targetBook.id,
+            title: targetBook.title,
+            creator: targetBook.creator,
+            bookType: targetBook.bookType || bookProfile?.category || book?.bookType,
           },
           cursor,
           traceProfile,
@@ -1120,10 +1550,10 @@ export function App() {
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || "Recovery card failed");
-      return normalizeRecoveryCard(result.card, localFallback);
+      return normalizeRecoveryCard(result.card, fallback) || fallback;
     } catch (error) {
       console.warn("Recovery card fallback:", error);
-      return localFallback;
+      return fallback;
     }
   }
 
@@ -1154,22 +1584,92 @@ export function App() {
     const paragraphId = paragraphElement?.id?.replace("paragraph-", "");
     const paragraphIndexFromSelection = Number(paragraphId);
     if (Number.isInteger(paragraphIndexFromSelection)) setSelectedParagraph(paragraphIndexFromSelection);
+    let startOffset = null;
+    let endOffset = null;
+    const paragraphIndex = Number.isInteger(paragraphIndexFromSelection)
+      ? paragraphIndexFromSelection
+      : (selectedParagraph ?? null);
+    if (Number.isInteger(paragraphIndex)) {
+      const fullText = paragraphPlainText(chapter?.paragraphs?.[paragraphIndex] || "").trim();
+      const found = fullText.indexOf(text);
+      if (found >= 0) {
+        startOffset = found;
+        endOffset = found + text.length;
+      } else if (paragraphElement) {
+        try {
+          const pre = range.cloneRange();
+          pre.selectNodeContents(paragraphElement);
+          pre.setEnd(range.startContainer, range.startOffset);
+          const localStart = pre.toString().length;
+          const pageItem = currentPageParagraphs.find((item) => item.paragraphIndex === paragraphIndex);
+          const segmentStart = pageItem
+            ? Math.max(0, fullText.indexOf(pageItem.text))
+            : 0;
+          startOffset = segmentStart + localStart;
+          endOffset = startOffset + text.length;
+        } catch {
+          startOffset = null;
+          endOffset = null;
+        }
+      }
+    }
     const horizontalPadding = 190;
     const x = Math.min(Math.max(rect.left + rect.width / 2, horizontalPadding), window.innerWidth - horizontalPadding);
     const canFloatAbove = rect.top > 84;
     const y = canFloatAbove ? rect.top - 18 : Math.min(rect.bottom + 58, window.innerHeight - 76);
-    setSelectionBloom({ text: text.length > 20 ? `${text.slice(0, 20)}…` : text, fullText: text, x, y, placement: canFloatAbove ? "above" : "below" });
+    setSelectionBloom({
+      text: text.length > 20 ? `${text.slice(0, 20)}…` : text,
+      fullText: text,
+      x,
+      y,
+      placement: canFloatAbove ? "above" : "below",
+      chapterIndex,
+      pageIndex,
+      paragraphIndex: Number.isInteger(paragraphIndex) ? paragraphIndex : null,
+      startOffset,
+      endOffset,
+    });
   }
 
   function handleBloomAction(action) {
+    if (action === "delete") {
+      const bloom = selectionBloom;
+      const matches = findExplainsForSelection(explains, {
+        chapterIndex: Number.isInteger(bloom?.chapterIndex) ? bloom.chapterIndex : chapterIndex,
+        paragraphIndex: Number.isInteger(bloom?.paragraphIndex) ? bloom.paragraphIndex : selectedParagraph,
+        selection: bloom?.fullText || "",
+        startOffset: bloom?.startOffset ?? null,
+        endOffset: bloom?.endOffset ?? null,
+      });
+      if (matches.length) {
+        deletePersistedExplain(matches.map((item) => item.id));
+      }
+      setSelectionBloom(null);
+      return;
+    }
     if (action === "note") {
+      const bloom = selectionBloom;
+      if (!bloom?.fullText) {
+        showNotice("请先选中要记笔记的文字");
+        return;
+      }
+      setNoteContext({
+        selection: bloom.fullText,
+        chapterIndex: Number.isInteger(bloom.chapterIndex) ? bloom.chapterIndex : chapterIndex,
+        pageIndex: Number.isInteger(bloom.pageIndex) ? bloom.pageIndex : pageIndex,
+        chapterTitle: chapter?.title || "",
+        paragraphIndex: Number.isInteger(bloom.paragraphIndex) ? bloom.paragraphIndex : selectedParagraph,
+        startOffset: Number.isInteger(bloom.startOffset) ? bloom.startOffset : null,
+        endOffset: Number.isInteger(bloom.endOffset) ? bloom.endOffset : null,
+      });
       setNoteDraft("");
       setNoteComposerOpen(true);
+      setSelectionBloom(null);
       return;
     }
     if (action === "source") {
       const cites = selectedParagraph !== null ? locateEvidence(memoryEvidenceStore, {
-        selectedText: selectionBloom?.fullText || chapter.paragraphs[selectedParagraph] || "",
+        selectedText: selectionBloom?.fullText || paragraphPlainText(chapter.paragraphs[selectedParagraph]) || "",
         scopeCursor: evidenceScopeCursor,
         currentCursor: { chapterIndex, paragraphIndex: selectedParagraph },
         traceIndex: bookIndex,
@@ -1180,9 +1680,9 @@ export function App() {
         openSearchResult(best);
         showNotice("已跳转到相关出处");
       } else {
-        setActivePanel("阅读索引");
-        setSidebarCollapsed(false);
-        showNotice("暂无直接出处，可从阅读索引继续查找");
+        setSearchQuery((selectionBloom?.fullText || "").slice(0, 40));
+        setSearchOpen(true);
+        showNotice("暂无直接出处，可搜索相关原文");
       }
     } else if (action === "relation") {
       if (!contextRelationships.length) {
@@ -1192,21 +1692,37 @@ export function App() {
       }
       setActivePanel("目录");
       setSidebarCollapsed(false);
-      setOrganizerOpen(null);
       setRelationshipOpen(true);
       showNotice("已打开上下文关系");
     } else if (action === "recall") {
       openCurrentRecoveryCard();
     } else if (action === "question") {
+      const text = selectionBloom?.fullText || "";
+      const paragraphIndex = Number.isInteger(selectionBloom?.paragraphIndex)
+        ? selectionBloom.paragraphIndex
+        : selectedParagraph;
+      const cites = paragraphIndex !== null && paragraphIndex !== undefined ? locateEvidence(memoryEvidenceStore, {
+        selectedText: text || paragraphPlainText(chapter.paragraphs[paragraphIndex]) || "",
+        scopeCursor: evidenceScopeCursor,
+        currentCursor: { chapterIndex, paragraphIndex },
+        traceIndex: bookIndex,
+        topK: 4,
+      }).slice(0, 4) : [];
+      if (Number.isInteger(paragraphIndex)) {
+        readingAnchorRef.current = {
+          paragraphIndex,
+          charOffset: Math.max(0, Number(selectionBloom?.startOffset) || 0),
+        };
+      }
       setSelectionAssist({
-        text: selectionBloom?.fullText || "",
-        cites: selectedParagraph !== null ? locateEvidence(memoryEvidenceStore, {
-          selectedText: selectionBloom?.fullText || chapter.paragraphs[selectedParagraph] || "",
-          scopeCursor: evidenceScopeCursor,
-          currentCursor: { chapterIndex, paragraphIndex: selectedParagraph },
-          traceIndex: bookIndex,
-          topK: 4,
-        }).slice(0, 3) : [],
+        text,
+        mode: defaultExplainMode(text, bookProfile?.category || book?.bookType),
+        cites,
+        chapterIndex,
+        pageIndex,
+        paragraphIndex: Number.isInteger(paragraphIndex) ? paragraphIndex : 0,
+        startOffset: selectionBloom?.startOffset ?? null,
+        endOffset: selectionBloom?.endOffset ?? null,
       });
       setActivePanel("解惑");
       setSidebarCollapsed(false);
@@ -1218,17 +1734,118 @@ export function App() {
     setSelectionBloom(null);
   }
 
+  function persistSelectionExplain(payload) {
+    if (!book || !payload?.selection) return;
+    setExplains((current) => upsertExplain(current, {
+      ...payload,
+      bookId: book.id || book.title,
+    }, book));
+  }
+
+  function openExplainFromMarker(records, preferred = null) {
+    const record = preferred || records?.[0];
+    if (!record) return;
+    setExplainPreview(null);
+    if (record.explainSpeed === "fast" || record.explainSpeed === "deep") {
+      setAnalysisSettings((current) => ({
+        ...current,
+        explainSpeed: record.explainSpeed,
+      }));
+    }
+    if (Number.isInteger(record.paragraphIndex)) {
+      readingAnchorRef.current = {
+        paragraphIndex: record.paragraphIndex,
+        charOffset: Math.max(0, Number(record.startOffset) || 0),
+      };
+    }
+    setSelectionAssist(buildAssistFromExplain(record));
+    setSelectedParagraph(record.paragraphIndex);
+    setActivePanel("解惑");
+    setSidebarCollapsed(false);
+    setRelationshipOpen(false);
+  }
+
+  function deletePersistedExplain(idOrIds) {
+    if (!book) return;
+    const ids = (Array.isArray(idOrIds) ? idOrIds : [idOrIds]).map(String).filter(Boolean);
+    if (!ids.length) return;
+    const idSet = new Set(ids);
+    const closingOpenAssist = idSet.has(String(selectionAssist?.fromExplainId || ""));
+    setExplains((current) => removeExplains(current, ids, book));
+    setExplainPreview((preview) => {
+      if (!preview?.records?.length) return null;
+      const remaining = preview.records.filter((item) => !idSet.has(String(item.id)));
+      if (!remaining.length) return null;
+      const primary = remaining.find((item) => String(item.id) === String(preview.primary?.id)) || remaining[0];
+      return { ...preview, records: remaining, primary };
+    });
+    if (closingOpenAssist) {
+      setSelectionAssist(null);
+      setActivePanel("目录");
+    }
+    showNotice("已删除解惑标注");
+  }
+
+  function scheduleExplainPreview(event, group) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const records = group.records || [];
+    const primary = records[0];
+    window.clearTimeout(scheduleExplainPreview.timer);
+    scheduleExplainPreview.timer = window.setTimeout(() => {
+      setExplainPreview({
+        x: Math.min(Math.max(rect.left + rect.width / 2, 120), window.innerWidth - 120),
+        y: Math.max(72, rect.top - 10),
+        records,
+        primary,
+      });
+    }, 500);
+  }
+
+  function clearExplainPreviewSoon() {
+    window.clearTimeout(scheduleExplainPreview.timer);
+    window.clearTimeout(clearExplainPreviewSoon.timer);
+    clearExplainPreviewSoon.timer = window.setTimeout(() => setExplainPreview(null), 120);
+  }
+
+  function toggleReaderPanel(panel) {
+    if (activePanel === panel && !sidebarCollapsed) {
+      setSidebarCollapsed(true);
+      return;
+    }
+    setActivePanel(panel);
+    setSidebarCollapsed(false);
+  }
+
+  function closeNoteComposer() {
+    setNoteComposerOpen(false);
+    setNoteDraft("");
+    setNoteContext(null);
+  }
+
   function saveNote() {
     const content = noteDraft.trim();
-    if (!content || !selectionBloom) return;
-    const note = { id: `${Date.now()}`, chapterIndex, pageIndex, chapterTitle: chapter.title, selection: selectionBloom.fullText, content, createdAt: Date.now() };
+    const context = noteContext;
+    if (!content || !context?.selection || !book) return;
+    const note = {
+      id: `${Date.now()}`,
+      chapterIndex: Number.isInteger(context.chapterIndex) ? context.chapterIndex : chapterIndex,
+      pageIndex: Number.isInteger(context.pageIndex) ? context.pageIndex : pageIndex,
+      chapterTitle: context.chapterTitle || chapter?.title || "",
+      paragraphIndex: Number.isInteger(context.paragraphIndex) ? context.paragraphIndex : null,
+      startOffset: Number.isInteger(context.startOffset) ? context.startOffset : null,
+      endOffset: Number.isInteger(context.endOffset) ? context.endOffset : null,
+      selection: context.selection,
+      content,
+      createdAt: Date.now(),
+    };
     setNotes((items) => {
       const next = [...items, note];
       localStorage.setItem(notesStorageKey(book), JSON.stringify(next));
       return next;
     });
-    setNoteComposerOpen(false);
-    setSelectionBloom(null);
+    closeNoteComposer();
+    setActivePanel("笔记");
+    setSidebarCollapsed(false);
     recordProgress({ notes: 1, xp: 5 });
     showNotice("笔记已保存");
   }
@@ -1236,8 +1853,25 @@ export function App() {
   function openNote(note) {
     markCurrentPageRead();
     setChapterIndex(note.chapterIndex);
-    setPageIndex(note.pageIndex);
-    setSelectedParagraph(null);
+    if (Number.isInteger(note.paragraphIndex) && book?.chapters?.[note.chapterIndex]) {
+      const targetPage = findPageForParagraphInChapter(
+        book.chapters[note.chapterIndex],
+        note.paragraphIndex,
+        pageWidth,
+        pageHeight,
+        pagePackScale,
+        Number.isInteger(note.startOffset) ? note.startOffset : 0,
+      );
+      setPageIndex(Number.isInteger(targetPage) ? targetPage : note.pageIndex);
+      setSelectedParagraph(note.paragraphIndex);
+      readingAnchorRef.current = {
+        paragraphIndex: note.paragraphIndex,
+        charOffset: Math.max(0, Number(note.startOffset) || 0),
+      };
+    } else {
+      setPageIndex(note.pageIndex);
+      setSelectedParagraph(null);
+    }
     setDrawerOpen(false);
     showNotice(`已跳转到笔记 · ${note.chapterTitle}`);
   }
@@ -1280,7 +1914,7 @@ export function App() {
       const exists = items.some((item) => item.id === id);
       const next = exists
         ? items.filter((item) => item.id !== id)
-        : [...items, { id, chapterIndex, pageIndex, chapterTitle: chapter.title, excerpt: chapter.paragraphs[0]?.slice(0, 46) || "", createdAt: Date.now() }];
+        : [...items, { id, chapterIndex, pageIndex, chapterTitle: chapter.title, excerpt: paragraphPlainText(chapter.paragraphs[0]).slice(0, 46) || (isImageParagraph(chapter.paragraphs[0]) ? "插图" : ""), createdAt: Date.now() }];
       localStorage.setItem(bookmarkStorageKey(book), JSON.stringify(next));
       if (!exists) recordProgress({ bookmarks: 1, xp: 2 });
       showNotice(exists ? "已取消书签" : "已添加书签");
@@ -1321,7 +1955,7 @@ export function App() {
     return (
       <main className={typeBrowserExpanded ? "library-shell panel-open" : "library-shell"}>
         <header className="library-topbar">
-          <div className="brand"><span className="brand-mark brand-wordmark">脉</span>{APP_NAME} <small>{APP_SLOGAN}</small></div>
+          <div className="brand" title={`${APP_NAME} · ${APP_SLOGAN}`} aria-label={`${APP_NAME}，${APP_SLOGAN}`}><BrandMark size={24} /><span className="sr-only">{APP_NAME}</span></div>
           <label className={shelfSearchOpen ? "library-search active" : "library-search"} role="search" aria-label="搜索书架" title="搜索书架"><Search size={18} /><input value={shelfSearchQuery} placeholder="搜索" onFocus={() => setShelfSearchOpen(true)} onChange={(event) => { setShelfSearchQuery(event.target.value); setShelfSearchOpen(true); }} onKeyDown={(event) => { if (event.key === "Escape") setShelfSearchOpen(false); }} /><button type="button" title="图片搜索" aria-label="图片搜索"><Camera size={22} /></button></label>
           <div className="library-actions"><button className="text-action" title="管理分类" aria-label="管理分类" onClick={() => setCategoryModalOpen(true)}><Tag size={16} /><span>管理分类</span></button><button className="primary-button" title={importStatus ? "正在导入" : "导入书籍"} aria-label={importStatus ? "正在导入" : "导入书籍"} disabled={Boolean(importStatus)} onClick={() => inputRef.current?.click()}><Upload size={16} /><span>{importStatus ? "正在导入" : "导入书籍"}</span></button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></div>
         </header>
@@ -1362,38 +1996,72 @@ export function App() {
     selectedParagraph,
     index: bookIndex,
   });
-  const readerTabs = ["目录", ...new Set([...(bookProfile?.facets || []).slice(0, 6)])];
+  const pageMetrics = getLogicalPageMetrics(pageWidth, pageHeight, pagePackScale);
   return (
-    <main className={`reader-shell theme-${readingTheme}${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen || organizerOpen ? " relationship-open" : ""}`}>
+    <main className={`reader-shell theme-${readingTheme}${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}`}>
       <header className="reader-topbar">
         <div className="book-title" title={`${book.title} · ${book.creator}`}><BookOpen size={17} /><span>{book.title}</span><small>{book.creator}</small>{bookProfile && <small>{bookProfile.category}</small>}</div>
-        <label className={searchOpen ? "reader-search-box active" : "reader-search-box"} role="search" aria-label="搜索书内内容" title="搜索书内内容">
-          <Search size={18} />
-          <input value={searchQuery} placeholder="搜索书内内容" onFocus={() => setSearchOpen(true)} onChange={(event) => { setSearchQuery(event.target.value); setSearchOpen(true); }} onKeyDown={(event) => { if (event.key === "Escape") setSearchOpen(false); }} />
-          <kbd>Ctrl K</kbd>
-        </label>
         <div className="reader-status">
+          <div className="reader-search-anchor">
+            <button
+              type="button"
+              className={searchOpen ? "reader-search-trigger active" : "reader-search-trigger"}
+              onClick={() => setSearchOpen((open) => !open)}
+              title="搜索书内内容 (Ctrl K)"
+              aria-label="搜索书内内容"
+              aria-expanded={searchOpen}
+              aria-controls="reader-search-dialog"
+            >
+              <Search size={18} />
+            </button>
+            {searchOpen && (
+              <SearchDialog
+                book={book}
+                query={searchQuery}
+                setQuery={setSearchQuery}
+                results={searchResults}
+                onSelect={(result) => {
+                  rememberSearchQuery(book, searchQuery);
+                  openSearchResult(result);
+                }}
+                onClose={() => setSearchOpen(false)}
+              />
+            )}
+          </div>
           <TraceStatusPill job={traceJob} />
           <div className="reader-progress" title={`阅读进度 ${progress}%`} aria-label={`阅读进度 ${progress}%`}><i><b style={{ width: `${progress}%` }} /></i><span>{progress}%</span></div>
           <span title="本地阅读 · 无剧透" aria-label="本地阅读 · 无剧透"><ShieldCheck size={16} /></span>
         </div>
       </header>
       <aside className="reader-sidebar">
-        <nav className="reader-tabs"><button className="back-to-shelf" title="返回书架" aria-label="返回书架" onClick={() => setScreen("shelf")}><ArrowLeft size={20} /><span>书架</span></button><button className={activePanel === "主题" ? "active theme-toolbar-trigger" : "theme-toolbar-trigger"} onClick={() => { setActivePanel("主题"); setSidebarCollapsed(false); }} title="阅读主题" aria-label="阅读主题"><Palette size={20} /><span>主题</span></button><button className={activePanel === "目录" ? "active directory-tab" : "directory-tab"} title="目录" aria-label="目录" onClick={() => { setActivePanel("目录"); setSidebarCollapsed(false); }}><ListFilter size={20} /><span>目录</span></button><button className={activePanel === "书签" ? "active reader-rail-button" : "reader-rail-button"} title="书签" aria-label={`书签（${bookmarks.length}）`} onClick={() => { setActivePanel("书签"); setSidebarCollapsed(false); }}><Bookmark size={20} /><span>书签</span></button><button className={activePanel === "笔记" ? "active reader-rail-button" : "reader-rail-button"} title="笔记" aria-label={`笔记（${notes.length}）`} onClick={() => { setActivePanel("笔记"); setSidebarCollapsed(false); }}><FileText size={20} /><span>笔记</span></button>{readerTabs.length > 1 && <div className="facet-picker"><button className={activePanel === "阅读索引" || readerTabs.includes(activePanel) && activePanel !== "目录" ? "facet-trigger active" : "facet-trigger"} title="按需图谱" aria-label="按需图谱" onClick={() => { setActivePanel("阅读索引"); setSidebarCollapsed(false); }}><Sparkles size={18} /><span>按需图谱</span></button></div>}<button className={activePanel === "AI 阅读" ? "active analysis-settings-trigger ai-rail-trigger" : "analysis-settings-trigger ai-rail-trigger"} onClick={() => { setActivePanel("AI 阅读"); setSidebarCollapsed(false); }} title="续读恢复" aria-label="续读恢复"><Bot size={21} /> <span>续读恢复</span></button><button className="analysis-settings-trigger rail-toggle" onClick={() => setSidebarCollapsed((value) => !value)} title={sidebarCollapsed ? "展开侧栏" : "收起侧栏"} aria-label={sidebarCollapsed ? "展开侧栏" : "收起侧栏"}>{sidebarCollapsed ? <PanelLeftOpen size={20} /> : <PanelLeftClose size={20} />}</button></nav>
+        <nav className="reader-tabs">
+          <button className={activePanel === "主题" && !sidebarCollapsed ? "active theme-toolbar-trigger" : "theme-toolbar-trigger"} onClick={() => toggleReaderPanel("主题")} title="阅读主题" aria-label="阅读主题"><Palette size={20} /><span>主题</span></button>
+          <button className={activePanel === "目录" && !sidebarCollapsed ? "active directory-tab" : "directory-tab"} title="目录" aria-label="目录" onClick={() => toggleReaderPanel("目录")}><ListFilter size={20} /><span>目录</span></button>
+          <button className={activePanel === "书签" && !sidebarCollapsed ? "active reader-rail-button" : "reader-rail-button"} title="书签" aria-label={`书签（${bookmarks.length}）`} onClick={() => toggleReaderPanel("书签")}><Bookmark size={20} /><span>书签</span></button>
+          <button className={activePanel === "笔记" && !sidebarCollapsed ? "active reader-rail-button" : "reader-rail-button"} title="笔记" aria-label={`笔记（${notes.length}）`} onClick={() => toggleReaderPanel("笔记")}><FileText size={20} /><span>笔记</span></button>
+          <button className={activePanel === "AI 阅读" && !sidebarCollapsed ? "active analysis-settings-trigger ai-rail-trigger" : "analysis-settings-trigger ai-rail-trigger"} onClick={() => toggleReaderPanel("AI 阅读")} title="续读恢复" aria-label="续读恢复"><Bot size={21} /> <span>续读恢复</span></button>
+          <button className="back-to-shelf" title="返回书架" aria-label="返回书架" onClick={() => setScreen("shelf")}><ArrowLeft size={20} /><span>书架</span></button>
+        </nav>
         <div className="reader-side-content">
           {activePanel === "目录" && <div className="toc-list">{book.chapters.map((item, index) => <button className={index === chapterIndex ? "toc-row active" : "toc-row"} key={item.id} onClick={() => selectChapter(index)}><span>{index + 1}</span>{item.title}</button>)}</div>}
           {activePanel === "主题" && <ReaderThemePanel theme={readingTheme} onChange={setReadingTheme} />}
           {activePanel === "AI 阅读" && <ReaderAnalysisPanel settings={analysisSettings} setSettings={setAnalysisSettings} state={analysisState} onAnalyze={analyzeBook} />}
-          {activePanel === "阅读索引" && <ReaderIndexPicker tabs={readerTabs.filter((tab) => tab !== "目录")} activePanel={activePanel} onSelect={(tab) => { setActivePanel(tab); setSidebarCollapsed(false); }} />}
-          {activePanel === "图形组织器" && <OrganizerPicker suggestions={organizerSuggestions.filter((item) => item.type !== "relationship")} active={organizerOpen || ""} onSelect={(type) => { setSidebarCollapsed(false); setRelationshipOpen(false); setOrganizerOpen(type); }} />}
           {activePanel === "书签" && <BookmarkList items={bookmarks} onOpen={openBookmark} onRemove={removeBookmark} />}
           {activePanel === "笔记" && <NoteList items={notes} onOpen={openNote} onRemove={removeNote} />}
-          {activePanel === "人物" && <EntityIndexList title="人物" kind="person" items={bookIndex.people} icon={<Network size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠人物实体。" />}
-          {activePanel === "组织" && <EntityIndexList title="组织" kind="organization" items={bookIndex.organizations || []} icon={<Network size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠组织实体。" />}
-          {activePanel === "时间线" && <TimelineList items={bookIndex.timeline} activeChapter={chapterIndex} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} />}
-          {activePanel === "地点" && <EntityIndexList title="地点" kind="place" items={bookIndex.places} icon={<MapPin size={16} />} activeCursor={getLatestReadCursor()} onItem={openIndexEntry} empty="尚未从正文结构中识别到可靠地点实体。" />}
-          {activePanel === "解惑" && <SelectionAssistPanel assist={selectionAssist} onEvidence={openSearchResult} onClose={() => { setSelectionAssist(null); setActivePanel("目录"); }} />}
-          {activePanel !== "目录" && activePanel !== "主题" && activePanel !== "AI 阅读" && activePanel !== "阅读索引" && activePanel !== "图形组织器" && activePanel !== "书签" && activePanel !== "笔记" && activePanel !== "人物" && activePanel !== "组织" && activePanel !== "时间线" && activePanel !== "地点" && activePanel !== "解惑" && <FacetIndexPanel title={activePanel} category={bookProfile?.category} />}
+          {activePanel === "解惑" && <SelectionAssistPanel
+            assist={selectionAssist}
+            book={book}
+            bookProfile={bookProfile}
+            bookMemory={bookMemory}
+            settings={analysisSettings}
+            setSettings={setAnalysisSettings}
+            cursor={getReadCursor()}
+            onAssistChange={setSelectionAssist}
+            onPersistExplain={persistSelectionExplain}
+            onDeleteExplain={deletePersistedExplain}
+            onEvidence={openSearchResult}
+            onClose={() => { setSelectionAssist(null); setActivePanel("目录"); }}
+          />}
         </div>
         <div className="side-book-meta"><span>共 {book.chapters.length} 节</span><span>{localFormatLabel(book)}</span></div>
       </aside>
@@ -1416,15 +2084,107 @@ export function App() {
         <header className="chapter-toolbar"><button className="chapter-step" disabled={chapterIndex === 0} onClick={() => selectChapter(chapterIndex - 1)} title="上一章" aria-label="上一章"><ChevronsLeft size={18} /></button><span>{chapter.title}</span><button className="chapter-step" disabled={chapterIndex === book.chapters.length - 1} onClick={() => selectChapter(chapterIndex + 1)} title="下一章" aria-label="下一章"><ChevronsRight size={18} /></button></header>
         <article className="epub-page">
           <div className="page-title-row"><h1>{chapter.title}</h1><span>{hasPriorReadingContext && <button className="page-recall" onClick={openCurrentRecoveryCard} title="主动回忆当前页之前的内容" aria-label="主动回忆"><History size={15} /></button>}{pageIndex + 1} / {pageCount} 页 {currentPageRead && <b className="read-page-tag">已读</b>}<button className={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "page-bookmark active" : "page-bookmark"} onClick={toggleBookmark} title={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "取消书签" : "添加书签"} aria-label="切换书签"><Bookmark size={16} /></button></span></div>
-          <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}><div className="page-track" ref={pageTrackRef} style={{ "--page-width": `${pageWidth}px` }}>{currentPageParagraphs.map(({ text, paragraphIndex, segmentIndex }) => <p className={selectedParagraph === paragraphIndex ? "is-selected" : ""} id={`paragraph-${paragraphIndex}`} key={`${chapter.id}-${paragraphIndex}-${segmentIndex}`} onClick={() => selectParagraph(paragraphIndex)}>{text}</p>)}</div></div>
+          <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}><div className="page-track" ref={pageTrackRef} style={{ "--page-width": `${pageWidth}px` }}>{currentPageParagraphs.map((item) => {
+            const { text, paragraphIndex, segmentIndex, type, src, alt } = item;
+            if (type === "image" || src) {
+              return (
+                <figure
+                  id={`paragraph-${paragraphIndex}`}
+                  key={`${chapter.id}-${paragraphIndex}-image`}
+                  className="page-figure"
+                >
+                  <img className="page-image" src={src} alt={alt || ""} draggable={false} />
+                </figure>
+              );
+            }
+            const segmentStart = Math.max(0, (Number(segmentIndex) || 0) * pageMetrics.longSegmentSize);
+            return (
+              <p
+                id={`paragraph-${paragraphIndex}`}
+                key={`${chapter.id}-${paragraphIndex}-${segmentIndex}`}
+                onClick={() => selectParagraph(paragraphIndex)}
+              >
+                <ParagraphWithExplainMarks
+                  text={text}
+                  chapterIndex={chapterIndex}
+                  paragraphIndex={paragraphIndex}
+                  segmentStart={segmentStart}
+                  explains={explains}
+                  notes={notes}
+                  onPreviewEnter={scheduleExplainPreview}
+                  onPreviewLeave={clearExplainPreviewSoon}
+                  onOpen={openExplainFromMarker}
+                />
+              </p>
+            );
+          })}</div></div>
         </article>
-        <footer className="reader-footer"><button className="page-step" disabled={pageIndex === 0} onClick={() => turnPage(-1)} title="上一页" aria-label="上一页"><ChevronLeft size={17} /></button><span>第 {pageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button className="page-step" disabled={pageIndex === pageCount - 1} onClick={() => turnPage(1)} title="下一页" aria-label="下一页"><ChevronRight size={17} /></button></footer>
+        <footer className="reader-footer"><button className="page-step" disabled={pageIndex === 0 && chapterIndex === 0} onClick={() => turnPage(-1)} title="上一页" aria-label="上一页"><ChevronLeft size={17} /></button><span>第 {pageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button className="page-step" disabled={pageIndex === pageCount - 1 && chapterIndex === book.chapters.length - 1} onClick={() => turnPage(1)} title="下一页" aria-label="下一页"><ChevronRight size={17} /></button></footer>
       </section>
-      {searchOpen && <ReaderSearchOverlay bookTitle={book.title} query={searchQuery} setQuery={setSearchQuery} results={searchResults} onSelect={openSearchResult} onClose={() => setSearchOpen(false)} />}
-      {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} relationAvailable={contextRelationships.length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
-      {noteComposerOpen && <NoteComposer draft={noteDraft} setDraft={setNoteDraft} selection={selectionBloom?.text || ""} onClose={() => setNoteComposerOpen(false)} onSave={saveNote} />}
+      {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} relationAvailable={contextRelationships.length > 0} canDeleteExplain={findExplainsForSelection(explains, selectionBloom).length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
+      {explainPreview?.primary && (
+        <div
+          className="explain-mark-preview"
+          style={{ left: explainPreview.x, top: explainPreview.y }}
+          onMouseEnter={() => window.clearTimeout(clearExplainPreviewSoon.timer)}
+          onMouseLeave={clearExplainPreviewSoon}
+          role="tooltip"
+        >
+          <div className="explain-mark-preview-head">
+            <strong>{previewMetaLabel(explainPreview.primary)}</strong>
+            <button
+              type="button"
+              className="explain-mark-preview-delete"
+              title="删除此解惑标注"
+              aria-label="删除此解惑标注"
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                deletePersistedExplain(explainPreview.primary.id);
+              }}
+            >
+              <X size={13} />
+            </button>
+          </div>
+          {explainPreview.records.length > 1 && (
+            <div className="explain-mark-preview-switch" role="tablist" aria-label="同段解惑">
+              {explainPreview.records.map((record) => (
+                <button
+                  key={record.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={record.id === explainPreview.primary.id}
+                  className={record.id === explainPreview.primary.id ? "active" : ""}
+                  onClick={(event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    setExplainPreview((current) => current ? { ...current, primary: record } : current);
+                  }}
+                >
+                  {explainModeLabel(record.mode)}
+                </button>
+              ))}
+            </div>
+          )}
+          <p>{previewConclusion(explainPreview.primary)}</p>
+          <button
+            type="button"
+            onClick={() => openExplainFromMarker(explainPreview.records, explainPreview.primary)}
+          >
+            依据 ×{(explainPreview.primary.evidence?.length || explainPreview.primary.cites?.length || 0)} · 点击展开
+          </button>
+        </div>
+      )}
+      {noteComposerOpen && noteContext && (
+        <NoteComposer
+          draft={noteDraft}
+          setDraft={setNoteDraft}
+          selection={noteContext.selection}
+          onClose={closeNoteComposer}
+          onSave={saveNote}
+        />
+      )}
       {relationshipOpen && <RelationshipWorkspace relationships={contextRelationships} onEvidence={openRelationshipEvidence} onClose={() => { setRelationshipOpen(false); setActivePanel("目录"); }} />}
-      {organizerOpen && <OrganizerWorkspace type={organizerOpen} suggestions={organizerSuggestions} index={bookIndex} traceMemory={bookMemory} onEvidence={openSearchResult} onClose={() => { setOrganizerOpen(null); setActivePanel("目录"); }} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </main>
   );
@@ -1644,7 +2404,7 @@ function relationshipNodeColor(type) {
   return type === "organization" ? "#b89066" : type === "event" ? "#8e789d" : "#5b9070";
 }
 
-function SelectionBloom({ selection, theme, relationAvailable = true, onAction, onClose }) {
+function SelectionBloom({ selection, theme, relationAvailable = true, canDeleteExplain = false, onAction, onClose }) {
   const actions = [
     { id: "question", label: "解惑", icon: Sparkles, className: "question" },
     { id: "recall", label: "回忆", icon: History, className: "recall" },
@@ -1652,6 +2412,7 @@ function SelectionBloom({ selection, theme, relationAvailable = true, onAction, 
     relationAvailable && { id: "relation", label: "关系", icon: Network, className: "relation" },
     { id: "note", label: "笔记", icon: Lightbulb, className: "note" },
     { id: "favorite", label: "收藏", icon: Bookmark, className: "favorite" },
+    canDeleteExplain && { id: "delete", label: "删除", icon: Trash2, className: "delete" },
   ].filter(Boolean);
   return <div className={`selection-bloom selection-popover theme-${theme} ${selection.placement || "above"}`} style={{ left: selection.x, top: selection.y }} role="dialog" aria-label="选中文本辅助" onMouseDown={(event) => event.stopPropagation()}>
     <div className="selection-popover-bar" role="toolbar" aria-label={`针对“${selection.text}”的阅读操作`}>
@@ -1661,29 +2422,386 @@ function SelectionBloom({ selection, theme, relationAvailable = true, onAction, 
   </div>;
 }
 
-function SelectionAssistPanel({ assist, onEvidence, onClose }) {
+function SelectionAssistPanel({
+  assist,
+  book,
+  bookProfile,
+  bookMemory,
+  settings,
+  setSettings,
+  cursor,
+  onAssistChange,
+  onPersistExplain,
+  onDeleteExplain,
+  onEvidence,
+  onClose,
+}) {
   const text = summaryText(assist?.text);
+  const mode = assist?.mode || "source";
+  const explainRequest = resolveExplainRequest(settings);
+  const speed = explainRequest.speed;
+  const cacheKey = explainCacheKey(mode, speed);
   const cites = Array.isArray(assist?.cites) ? assist.cites : [];
+  const explanation = assist?.explanations?.[cacheKey] || null;
+  const status = assist?.statusByMode?.[cacheKey] || (mode === "source" ? "ready" : "idle");
+  const error = assist?.errorByMode?.[cacheKey] || "";
+  const [evidenceOpen, setEvidenceOpen] = useState(mode === "source");
+  const persistStampRef = useRef("");
+
+  useEffect(() => {
+    setEvidenceOpen(mode === "source");
+  }, [mode, text]);
+
+  useEffect(() => {
+    if (!assist?.text || mode === "source") return;
+    if (assist?.explanations?.[cacheKey]?.answer) return;
+    if (!cites.length) {
+      onAssistChange?.((current) => current ? {
+        ...current,
+        statusByMode: { ...current.statusByMode, [cacheKey]: "empty" },
+        errorByMode: { ...current.errorByMode, [cacheKey]: "暂无可用原文证据，可先看「书内出处」。" },
+      } : current);
+      return;
+    }
+    let cancelled = false;
+    onAssistChange?.((current) => current ? {
+      ...current,
+      statusByMode: { ...current.statusByMode, [cacheKey]: "loading" },
+      errorByMode: { ...current.errorByMode, [cacheKey]: "" },
+    } : current);
+    (async () => {
+      try {
+        const response = await fetch("/api/explain-selection", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            provider: explainRequest.provider,
+            model: explainRequest.model,
+            thinking: explainRequest.thinking,
+            mode,
+            selection: assist.text,
+            book: {
+              id: book?.id,
+              title: book?.title,
+              creator: book?.creator,
+              bookType: bookProfile?.category || book?.bookType,
+            },
+            cursor,
+            bookMemory: bookMemory || null,
+            evidence: cites,
+          }),
+        });
+        const result = await response.json();
+        if (cancelled) return;
+        if (!response.ok || !result.explanation?.answer) {
+          throw new Error(result.error || "解惑生成失败");
+        }
+        onAssistChange?.((current) => current ? {
+          ...current,
+          explanations: { ...current.explanations, [cacheKey]: result.explanation },
+          statusByMode: { ...current.statusByMode, [cacheKey]: "ready" },
+          errorByMode: { ...current.errorByMode, [cacheKey]: "" },
+        } : current);
+      } catch (err) {
+        if (cancelled) return;
+        onAssistChange?.((current) => current ? {
+          ...current,
+          statusByMode: { ...current.statusByMode, [cacheKey]: "error" },
+          errorByMode: { ...current.errorByMode, [cacheKey]: err.message || "解惑暂不可用，可先查看原文依据。" },
+        } : current);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [mode, speed, cacheKey, assist?.text, cites.length, explainRequest.provider, explainRequest.model, explainRequest.thinking]);
+
+  useEffect(() => {
+    if (!text || !onPersistExplain) return;
+    const stamp = `${text}|${mode}|${speed}|${mode === "source" ? cites.length : (explanation?.answer || "")}`;
+    if (persistStampRef.current === stamp) return;
+
+    if (mode === "source") {
+      if (!cites.length) return;
+      persistStampRef.current = stamp;
+      onPersistExplain({
+        selection: assist.text,
+        mode,
+        explainSpeed: speed,
+        chapterIndex: assist.chapterIndex ?? cursor?.chapterIndex ?? 0,
+        pageIndex: assist.pageIndex ?? cursor?.pageIndex ?? 0,
+        paragraphIndex: assist.paragraphIndex ?? cursor?.paragraphIndex ?? 0,
+        startOffset: assist.startOffset ?? null,
+        endOffset: assist.endOffset ?? null,
+        title: "书内出处",
+        answer: `已读范围内找到 ${cites.length} 处相关原文。`,
+        highlights: [],
+        evidence: cites,
+        cites,
+        explanations: {
+          ...(assist.explanations || {}),
+          [cacheKey]: {
+            mode: "source",
+            title: "书内出处",
+            answer: `已读范围内找到 ${cites.length} 处相关原文。`,
+            evidence: cites,
+          },
+        },
+        createdAt: Date.now(),
+      });
+      return;
+    }
+
+    if (status !== "ready" || !explanation?.answer) return;
+    persistStampRef.current = stamp;
+    onPersistExplain({
+      selection: assist.text,
+      mode,
+      explainSpeed: speed,
+      chapterIndex: assist.chapterIndex ?? cursor?.chapterIndex ?? 0,
+      pageIndex: assist.pageIndex ?? cursor?.pageIndex ?? 0,
+      paragraphIndex: assist.paragraphIndex ?? cursor?.paragraphIndex ?? 0,
+      startOffset: assist.startOffset ?? null,
+      endOffset: assist.endOffset ?? null,
+      title: explanation.title || "",
+      answer: explanation.answer,
+      highlights: explanation.highlights || [],
+      evidence: explanation.evidence?.length ? explanation.evidence : cites,
+      cites,
+      explanations: {
+        ...(assist.explanations || {}),
+        [cacheKey]: explanation,
+      },
+      createdAt: Date.now(),
+    });
+  }, [text, mode, speed, status, explanation, cites, cacheKey, assist, cursor, onPersistExplain]);
+
+  function setMode(nextMode) {
+    onAssistChange?.((current) => current ? { ...current, mode: nextMode } : current);
+  }
+
+  function setSpeed(nextSpeed) {
+    setSettings?.((current) => ({
+      ...current,
+      explainSpeed: nextSpeed === "deep" ? "deep" : "fast",
+    }));
+  }
+
+  const answerReady = mode !== "source" && status === "ready" && !!explanation?.answer;
+  const answerBody = (() => {
+    if (mode === "source") {
+      return cites.length
+        ? <p className="selection-assist-answer">以下是已读范围内与选文最相关的原文依据，可点选跳回。</p>
+        : <p className="reader-panel-empty">暂无直接相关的原文证据。</p>;
+    }
+    if (status === "loading") {
+      return <p className="selection-assist-status">{speed === "deep" ? "正在深思…" : "正在整理…"}</p>;
+    }
+    if (status === "empty" || status === "error") {
+      return <p className="reader-panel-empty">{error || "暂无可用解释。"}</p>;
+    }
+    if (!explanation?.answer) return <p className="reader-panel-empty">切换模式后将生成说明。</p>;
+    return <>
+      <span className="selection-assist-well-kicker">豁然开朗</span>
+      {explanation.title && <h3 className="selection-assist-answer-title">{explanation.title}</h3>}
+      <p className="selection-assist-answer">{explanation.answer}</p>
+      {!!explanation.highlights?.length && <ul className="selection-assist-highlights">
+        {explanation.highlights.map((item) => <li key={item}>{item}</li>)}
+      </ul>}
+    </>;
+  })();
+
+  const evidenceItems = mode === "source"
+    ? cites
+    : (explanation?.evidence?.length ? explanation.evidence : cites);
+
+  const wellClass = [
+    "selection-assist-well",
+    mode === "source" ? "is-source" : "",
+    status === "loading" ? "is-loading" : "",
+    answerReady ? "is-ready" : "",
+    (status === "empty" || status === "error" || (!explanation?.answer && mode !== "source" && status !== "loading")) ? "is-quiet" : "",
+  ].filter(Boolean).join(" ");
+
   return <section className="selection-assist-panel">
-    <header className="reader-ai-hero">
-      <i><Lightbulb size={20} /></i>
-      <div>
-        <strong>选文解惑</strong>
-        <span>先看选中原文，再按需跳回证据。</span>
+    <header className="selection-assist-header">
+      <strong>选文解惑</strong>
+      <div className="selection-assist-header-actions">
+        {assist?.fromExplainId && (
+          <button
+            type="button"
+            className="selection-assist-delete"
+            onClick={() => onDeleteExplain?.(assist.fromExplainId)}
+            title="删除此解惑标注"
+            aria-label="删除此解惑标注"
+          >
+            <Trash2 size={15} />
+          </button>
+        )}
+        <button type="button" className="icon-button" onClick={onClose} title="关闭解惑" aria-label="关闭解惑"><X size={16} /></button>
       </div>
-      <button type="button" className="icon-button" onClick={onClose} title="关闭解惑" aria-label="关闭解惑"><X size={16} /></button>
     </header>
-    {text ? <blockquote className="selection-assist-quote">{text}</blockquote> : <p className="reader-panel-empty">还没有选中文本。</p>}
+    <div className="selection-assist-toolbar">
+      <div className="selection-assist-modes" role="tablist" aria-label="解惑方式">
+        {EXPLAIN_MODES.map((item) => {
+          const Icon = item.icon;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              role="tab"
+              aria-selected={mode === item.id}
+              className={mode === item.id ? "active" : ""}
+              title={`${item.label} · ${item.detail}`}
+              aria-label={`${item.label}：${item.detail}`}
+              onClick={() => setMode(item.id)}
+            >
+              <Icon size={17} strokeWidth={mode === item.id ? 2.15 : 1.85} />
+            </button>
+          );
+        })}
+      </div>
+      <div className="selection-assist-speeds" role="group" aria-label="解惑速度">
+        {EXPLAIN_SPEED_MODES.map((item) => {
+          const Icon = item.icon;
+          return (
+            <button
+              key={item.id}
+              type="button"
+              className={speed === item.id ? "active" : ""}
+              title={item.detail}
+              aria-label={item.detail}
+              aria-pressed={speed === item.id}
+              onClick={() => setSpeed(item.id)}
+            >
+              <Icon size={15} strokeWidth={speed === item.id ? 2.15 : 1.85} />
+            </button>
+          );
+        })}
+      </div>
+    </div>
+    {!text ? <p className="reader-panel-empty">还没有选中文本。</p> : (
+      <div
+        key={`${cacheKey}:${explanation?.answer ? "ready" : status}`}
+        className={wellClass}
+        aria-live="polite"
+      >
+        <blockquote className="selection-assist-quote">{text}</blockquote>
+        <div className="selection-assist-body">
+          {answerBody}
+        </div>
+      </div>
+    )}
     <div className="selection-assist-cites">
-      <h3>相关出处</h3>
-      {cites.length ? cites.map((item) => (
-        <button type="button" key={item.id || `${item.chapterIndex}-${item.paragraphIndex}`} onClick={() => onEvidence(item)}>
-          <small>{item.cite?.label || "出处"} · {item.chapterTitle || `第 ${(item.chapterIndex || 0) + 1} 节`}</small>
+      <button
+        type="button"
+        className="selection-assist-evidence-toggle"
+        onClick={() => setEvidenceOpen((value) => !value)}
+        title={evidenceOpen ? "收起原文依据" : "展开原文依据"}
+        aria-label={`${evidenceOpen ? "收起" : "展开"}原文依据，共 ${evidenceItems.length || 0} 条`}
+        aria-expanded={evidenceOpen}
+      >
+        <FileText size={14} />
+        <small>{evidenceItems.length || 0}</small>
+        <ChevronDown size={14} className={evidenceOpen ? "open" : ""} />
+      </button>
+      {evidenceOpen && (evidenceItems.length ? evidenceItems.map((item) => (
+        <button type="button" className="selection-assist-cite" key={item.id || `${item.chapterIndex}-${item.paragraphIndex}-${item.cite?.label}`} onClick={() => onEvidence(item)}>
+          <small>{item.cite?.label || item.ref || "出处"} · {item.chapterTitle || `第 ${(item.chapterIndex || 0) + 1} 节`}</small>
           <span>{summaryText(item.excerpt || item.quote || item.cite?.quote)}</span>
         </button>
-      )) : <p className="reader-panel-empty">暂无直接相关的原文证据。</p>}
+      )) : <p className="reader-panel-empty">暂无直接相关的原文证据。</p>)}
     </div>
   </section>;
+}
+
+function ParagraphWithExplainMarks({
+  text,
+  chapterIndex,
+  paragraphIndex,
+  segmentStart = 0,
+  explains = [],
+  notes = [],
+  onPreviewEnter,
+  onPreviewLeave,
+  onOpen,
+}) {
+  const explainGroups = groupExplainMarkersForSegment(explains, {
+    chapterIndex,
+    paragraphIndex,
+    segmentText: text,
+    segmentStart,
+  });
+  const noteGroups = groupNoteMarksForSegment(notes, {
+    chapterIndex,
+    paragraphIndex,
+    segmentText: text,
+    segmentStart,
+  });
+  if (!explainGroups.length && !noteGroups.length) return text;
+
+  const cuts = new Set([0, text.length]);
+  explainGroups.forEach((group) => {
+    cuts.add(group.start);
+    cuts.add(group.end);
+  });
+  noteGroups.forEach((group) => {
+    cuts.add(group.start);
+    cuts.add(group.end);
+  });
+  const points = [...cuts].sort((left, right) => left - right);
+
+  const nodes = [];
+  for (let index = 0; index < points.length - 1; index += 1) {
+    const start = points[index];
+    const end = points[index + 1];
+    if (end <= start) continue;
+    const slice = text.slice(start, end);
+    const explainHit = explainGroups.find((group) => group.start <= start && group.end >= end);
+    const noteHit = noteGroups.find((group) => group.start <= start && group.end >= end);
+    const isExplainEnd = Boolean(explainHit && explainHit.end === end);
+
+    if (!explainHit && !noteHit) {
+      nodes.push(slice);
+      continue;
+    }
+
+    const className = [
+      noteHit ? "note-mark-span" : "",
+      explainHit ? "explain-mark-span" : "",
+    ].filter(Boolean).join(" ");
+
+    nodes.push(
+      <span className={className} key={`ann-${start}-${end}-${explainHit?.key || noteHit?.key || "x"}`}>
+        {slice}
+        {isExplainEnd && (
+          <button
+            type="button"
+            className="explain-mark"
+            title="查看解惑"
+            aria-label={explainHit.records.length > 1 ? `解惑 ${explainHit.records.length} 条` : "解惑"}
+            onMouseEnter={(event) => {
+              event.stopPropagation();
+              onPreviewEnter?.(event, explainHit);
+            }}
+            onMouseLeave={(event) => {
+              event.stopPropagation();
+              onPreviewLeave?.(event);
+            }}
+            onClick={(event) => {
+              event.preventDefault();
+              event.stopPropagation();
+              onOpen?.(explainHit.records);
+            }}
+            onMouseDown={(event) => event.stopPropagation()}
+          >
+            {explainHit.records.length > 1
+              ? `${markerShortLabel(explainHit.records)}·${explainHit.records.length}`
+              : markerShortLabel(explainHit.records)}
+          </button>
+        )}
+      </span>,
+    );
+  }
+  return nodes;
 }
 
 function ReaderThemePanel({ theme, onChange }) {
@@ -1743,7 +2861,7 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
   useEffect(() => {
     onTrack?.("shown", card);
   }, [onTrack]);
-  const hint = card.question?.hint || buildRecoveryQuestionHint(card.question?.evidence || evidence[0]);
+  const hint = sanitizeRecoveryHint(card.question?.hint) || buildRecoveryQuestionHint(card.question?.evidence || evidence[0]);
   return <aside className={`recall-sheet ${card.intensity === "deep" ? "deep" : ""}`} role="dialog" aria-modal="true" aria-label="续读恢复卡">
     <header className="recall-sheet-head">
       <div className="recall-sheet-title">
@@ -1838,61 +2956,52 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
 
 function buildRecoveryQuestionHint(evidence) {
   const excerpt = cleanRecoveryText(evidence?.excerpt || evidence?.quote || "");
-  if (!excerpt) return "先从上一段主线变化开始想，不必回忆所有细节。";
-  return `提示：回到这条线索——${recoveryPointTitle(excerpt, 0)}。`;
+  if (!excerpt || isIncidentalRecoveryText(excerpt)) {
+    return "提示：先从上一段具体的主线变化开始想，不必回忆所有细节。";
+  }
+  const fromExcerpt = hintFromEvidenceExcerpt(excerpt);
+  if (fromExcerpt && !isWeakRecoveryHint(fromExcerpt)) return fromExcerpt;
+  return "提示：先从这段原文里刚发生的具体变化想起，不必背下全部细节。";
 }
 
-function ReaderSearchOverlay({ bookTitle, query, setQuery, results, onSelect, onClose }) {
-  const suggestions = ["湘江", "遵义", "红军"];
-  const hasQuery = query.trim();
-  return <div className="library-search-panel reader-search-panel-overlay">
-    <div className="search-panel-head"><h2>{hasQuery ? "搜索结果" : `在《${bookTitle}》中查找`}</h2><button onClick={onClose} aria-label="关闭搜索"><X size={20} /></button></div>
-    {hasQuery ? <div className="search-suggestion-grid reader-search-result-grid">{results.length ? results.map((result) => <button className="search-suggestion-card reader-search-result-card" key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span>{result.cite?.label || ""} {result.chapterTitle}</span><small>第 {result.paragraphIndex + 1} 段 · {(result.matchSources || ["keyword"]).join(" · ")}</small><b>{highlightMatch(result.excerpt, query.trim())}</b></button>) : <div className="reader-search-empty"><Search size={22} /><strong>没有找到“{query}”</strong><span>试试更短的关键词。</span></div>}</div> : <div className="search-suggestion-grid">{suggestions.map((item) => <button className="search-suggestion-card type-result" key={item} onClick={() => setQuery(item)}><i /><span>{item}</span><small>常用检索词</small></button>)}</div>}
-  </div>;
+function sanitizeRecoveryHint(value) {
+  const text = summaryText(value);
+  if (!text) return "";
+  if (looksTruncatedRecoveryHint(text)) return "";
+  if (isWeakRecoveryHint(text)) return "";
+  return text.slice(0, 96);
 }
 
-function ReaderSearchPanel({ bookTitle, query, setQuery, results, onSelect }) {
+function looksTruncatedRecoveryHint(value) {
+  const text = String(value || "")
+    .replace(/^提示[：:]\s*/, "")
+    .replace(/^回到这条线索[—\-–]+\s*/, "")
+    .replace(/^先回想[—\-–]+\s*/, "")
+    .trim();
+  if (!text || text.length < 4) return true;
+  if (/^(undefined|null|nan)$/i.test(text)) return true;
+  // Peel a trailing stop so wrappers like 「……是清。」 still fail.
+  const core = text.replace(/[。！？…]+$/g, "").trim();
+  if (!core || core.length < 4) return true;
+  if (/[，、：:；;（(\[\{「『《【]$/.test(core)) return true;
+  if (/(?:其余的是|除了|以及|还有|就是|乃是|并非|不是)[\u4e00-\u9fff]?$/.test(core)) return true;
+  if (/[的地得了着过与和及以于]$/.test(core)) return true;
+  if (/(?:人外，|外，其余|是清|是湖|是四|是贵|是江)$/.test(core)) return true;
+  const comma = Math.max(core.lastIndexOf("，"), core.lastIndexOf(","));
+  if (comma >= 0) {
+    const tail = core.slice(comma + 1).trim();
+    if (tail.length > 0 && tail.length <= 6 && !/(什么|何处|哪|谁|如何|为何|哪一步)$/.test(tail)) return true;
+  }
+  return false;
+}
+
+function ReaderSearchPanel({ query, setQuery, results, onSelect, recent = [] }) {
   const inputRef = useRef(null);
   useEffect(() => { inputRef.current?.focus(); }, []);
+  const trimmed = query.trim();
   return <section className="reader-search-panel">
-    <label className="reader-panel-search"><Search size={17} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索人物、地点、事件或文字" /></label>
-    {query.trim() ? <div className="reader-search-results">{results.length ? results.map((result) => <button key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><small>{result.chapterTitle} · 第 {result.paragraphIndex + 1} 段</small><span>{highlightMatch(result.excerpt, query.trim())}</span></button>) : <p className="reader-panel-empty">没有找到“{query}”</p>}</div> : <div className="reader-panel-start"><strong>在《{bookTitle}》中查找</strong><span>输入关键词，或从下面开始。</span><div><button onClick={() => setQuery("湘江")}>湘江</button><button onClick={() => setQuery("遵义")}>遵义</button><button onClick={() => setQuery("红军")}>红军</button></div></div>}
-  </section>;
-}
-
-function ReaderIndexPicker({ tabs, activePanel, onSelect }) {
-  return <section className="reader-index-picker">
-    {tabs.map((tab) => <button className={activePanel === tab ? "active" : ""} key={tab} onClick={() => onSelect(tab)}><span>{tab}</span><small>{facetDescription(tab)}</small></button>)}
-  </section>;
-}
-
-function OrganizerPicker({ suggestions, active, onSelect }) {
-  return <section className="reader-index-picker organizer-picker">
-    {suggestions.length ? suggestions.map((item) => <button className={active === item.type ? "active" : ""} key={item.type} onClick={() => onSelect(item.type)}>
-      <span>{item.label}</span>
-      <small>{item.reason}</small>
-    </button>) : <p className="panel-empty">当前已读内容还不需要图形组织器。</p>}
-  </section>;
-}
-
-function OrganizerWorkspace({ type, suggestions, index, traceMemory, onEvidence, onClose }) {
-  const suggestion = suggestions.find((item) => item.type === type) || suggestions[0] || { label: "图形组织器", reason: "整理可回忆结构" };
-  const items = organizerItemsForType(type, index, traceMemory);
-  return <section className="relationship-workspace organizer-workspace" aria-label={suggestion.label}>
-    <header className="relationship-header"><div><span>阅读图谱</span><h2>{suggestion.label}</h2><small>{suggestion.reason}</small></div><button onClick={onClose} title="关闭图形组织器"><X size={18} /></button></header>
-    <div className="organizer-canvas">
-      <div className={`organizer-chain organizer-${type}`}>
-        {items.map((item, index) => <article key={`${type}-${item.title}-${index}`}>
-          <i>{index + 1}</i>
-          <div>
-            <strong>{item.title}</strong>
-            <span>{item.detail}</span>
-            {item.evidence && <button onClick={() => onEvidence(item.evidence)}>查看原文 <ChevronRight size={14} /></button>}
-          </div>
-        </article>)}
-      </div>
-      {!items.length && <div className="relationship-empty">当前已读范围还没有足够可靠证据生成这个图形组织器。</div>}
-    </div>
+    <label className="reader-panel-search"><Search size={17} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="人名、地名、事件或原文" /></label>
+    {trimmed ? <div className="reader-search-results">{results.length ? results.map((result) => <button key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><small>{result.chapterTitle} · 第 {result.paragraphIndex + 1} 段</small><span>{highlightMatch(result.excerpt, trimmed)}</span></button>) : <p className="reader-panel-empty">没有找到「{trimmed}」</p>}</div> : recent.length ? <div className="reader-search-results">{recent.map((term) => <button key={term} onClick={() => setQuery(term)}><small>最近搜索</small><span>{term}</span></button>)}</div> : <div className="reader-panel-start"><strong>查找书内原文</strong><span>输入关键词即可定位章节与出处。</span></div>}
   </section>;
 }
 
@@ -1906,16 +3015,21 @@ function BookmarkList({ items, onOpen, onRemove }) {
 function NoteList({ items, onOpen, onRemove }) {
   return <section className="bookmark-list note-list">
     <header><span><FileText size={14} /> 笔记</span><small>{items.length}</small></header>
-    {items.length ? <div>{[...items].sort((left, right) => right.createdAt - left.createdAt).map((item) => <article key={item.id}><button onClick={() => onOpen(item)}><b>{item.content}</b><span>{item.chapterTitle} · 第 {item.pageIndex + 1} 页</span></button><button className="remove-bookmark" onClick={() => onRemove(item.id)} title="删除笔记" aria-label={`删除 ${item.chapterTitle} 的笔记`}><X size={14} /></button></article>)}</div> : <p>选中文字后，可在辅助工具盘中添加笔记。</p>}
+    {items.length ? <div>{[...items].sort((left, right) => right.createdAt - left.createdAt).map((item) => (
+      <article key={item.id}>
+        <button onClick={() => onOpen(item)}>
+          <b>{item.selection || item.content}</b>
+          <span>{item.chapterTitle} · 第 {item.pageIndex + 1} 页</span>
+          {item.selection ? <em className="note-list-body">{item.content}</em> : null}
+        </button>
+        <button className="remove-bookmark" onClick={() => onRemove(item.id)} title="删除笔记" aria-label={`删除 ${item.chapterTitle} 的笔记`}><X size={14} /></button>
+      </article>
+    ))}</div> : <p>选中文字后，可在辅助工具盘中添加笔记。</p>}
   </section>;
 }
 
 function NoteComposer({ draft, setDraft, selection, onClose, onSave }) {
   return <div className="modal-backdrop" role="presentation" onMouseDown={onClose}><section className="note-composer" role="dialog" aria-modal="true" aria-label="添加笔记" onMouseDown={(event) => event.stopPropagation()}><header><div><span>选中文本</span><strong>{selection}</strong></div><button onClick={onClose} title="关闭"><X size={18} /></button></header><textarea value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="写下你的想法…" autoFocus /><footer><button className="text-action" onClick={onClose}>取消</button><button className="primary-button" disabled={!draft.trim()} onClick={onSave}>保存笔记</button></footer></section></div>;
-}
-
-function IndexList({ title, items, icon, onItem, empty }) {
-  return <div className="index-list"><h2>{icon}{title}</h2>{items.length ? items.map((item) => <button key={item.id} onClick={() => onItem(item)}><b>{item.name}</b><small>{item.subtitle}</small><span>{item.detail}</span></button>) : <p className="index-empty">{empty}</p>}</div>;
 }
 
 function BookCover({ book }) {
@@ -1927,53 +3041,6 @@ function DeleteBookConfirmModal({ book, onCancel, onConfirm }) {
   return <div className="modal-backdrop" role="presentation" onMouseDown={onCancel}><section className="delete-book-modal" role="dialog" aria-modal="true" aria-label="确认删除书籍" onMouseDown={(event) => event.stopPropagation()}><header><div><span>删除书籍</span><h2>确认删除《{book.title}》？</h2></div><button onClick={onCancel} title="关闭"><X size={18} /></button></header><p>这会从当前书架移除这本书。你的本地原始文件不会被删除，但本应用内与该导入项关联的入口会消失。</p><footer><button className="text-action" onClick={onCancel}>取消</button><button className="danger-button" onClick={onConfirm}>确认删除</button></footer></section></div>;
 }
 
-function FacetIndexPanel({ title, category }) {
-  return <div className="facet-index"><span>{category || "阅读索引"}</span><h2>{title}</h2><p>本书将围绕“{title}”整理可追溯内容；完成模型分析后，这里会展示对应条目与原文证据。</p></div>;
-}
-
-function EntityIndexList({ title, kind, items, icon, activeCursor, onItem, empty }) {
-  const grouped = prioritizeIndexEntries(items, activeCursor, kind);
-  const featured = grouped.important.length ? grouped.important.slice(0, 4) : grouped.recent.slice(0, 4);
-  const featuredIds = new Set(featured.map((item) => item.id));
-  const recent = grouped.important.length ? grouped.recent.filter((item) => !featuredIds.has(item.id)).slice(0, 3) : [];
-  const recentIds = new Set(recent.map((item) => item.id));
-  const rest = [...grouped.important.slice(4), ...grouped.secondary].filter((item) => !featuredIds.has(item.id) && !recentIds.has(item.id));
-  const heading = grouped.important.length ? `重大${title}` : `最近出现的${title}`;
-  return <div className="entity-index"><header>{icon}<div><strong>{heading}</strong><span>{grouped.important.length} 个主线项 · {grouped.recent.length} 个最近项</span></div></header>{featured.length ? <div className="entity-group">{featured.map((item) => <EntityRow key={item.id} item={item} onItem={onItem} kind={kind} />)}</div> : <p className="index-empty">{empty}</p>}{recent.length > 0 && <section className="recent-entities"><h3>最近已读</h3>{recent.map((item) => <EntityRow key={item.id} item={item} onItem={onItem} kind={kind} compact />)}</section>}{rest.length > 0 && <details className="secondary-entities"><summary>展开其余{title} <span>{rest.length}</span></summary><div>{rest.map((item) => <EntityRow key={item.id} item={item} onItem={onItem} kind={kind} compact />)}</div></details>}</div>;
-}
-
-function EntityRow({ item, onItem, kind, compact = false }) {
-  const description = kind === "place" && item.subtitle && !/^地点实体/.test(item.subtitle) ? item.subtitle : item.detail;
-  return <button className={compact ? "entity-row compact" : "entity-row"} onClick={() => onItem(item)}><div className="entity-row-heading"><b>{item.name}</b>{kind === "person" && item.attributes?.length > 0 && <em className="entity-attributes">{item.attributes.map((attribute) => <i key={attribute}>{attribute}</i>)}</em>}</div><span>{description}</span></button>;
-}
-
-function TimelineList({ items, activeChapter, activeCursor, onItem }) {
-  const readableItems = normalizeTimelineItems(items);
-  if (!readableItems.length) return <div className="timeline-list"><header><Clock3 size={16} /><div><strong>正文时间线</strong><span>尚未识别到明确日期</span></div></header></div>;
-
-  const grouped = prioritizeIndexEntries(readableItems, activeCursor, "timeline");
-  const featured = grouped.important.length ? grouped.important : grouped.recent.slice(0, 8);
-  const featuredIds = new Set(featured.map((item) => item.id));
-  const recent = grouped.important.length ? grouped.recent.filter((item) => !featuredIds.has(item.id)).slice(0, 4) : [];
-  const rest = [...recent, ...grouped.secondary].filter((item, index, list) => !featuredIds.has(item.id) && list.findIndex((candidate) => candidate.id === item.id) === index);
-
-  return <div className="timeline-list">
-    <header><Clock3 size={16} /><div><strong>{grouped.important.length ? "重大时间线" : "最近时间线"}</strong><span>{grouped.important.length} 个历史节点 · {grouped.recent.length} 个最近项</span></div></header>
-    <div className="timeline-track">
-      {featured.map((item) => {
-        const isCurrent = item.occurrence.chapterIndex === activeChapter;
-        return <button className={isCurrent ? "timeline-event active" : "timeline-event"} key={item.id} onClick={() => onItem(item)}>
-          <span className="timeline-node" aria-hidden="true" />
-          <time>{item.name}</time>
-          <strong>{item.subtitle}</strong>
-          <p>{item.detail}</p>
-          <small>第 {item.occurrence.chapterIndex + 1} 节 · 原文证据</small>
-        </button>;
-      })}
-    </div>
-    {rest.length > 0 && <details className="secondary-entities timeline-secondary"><summary>展开其余时间 <span>{rest.length}</span></summary><div>{rest.map((item) => <button className="entity-row compact" key={item.id} onClick={() => onItem(item)}><div className="entity-row-heading"><b>{item.name}</b></div><span>{item.subtitle}</span></button>)}</div></details>}
-  </div>;
-}
 function normalizeReadingIndex(index = {}, book = null) {
   const people = [];
   const organizations = [];
@@ -2124,20 +3191,6 @@ function normalizeTimelineItems(items = []) {
   });
 }
 
-function prioritizeIndexEntries(items, activeCursor, kind) {
-  const important = items
-    .filter((item, index) => isImportantEntry(item, index, kind))
-    .sort(compareIndexEntries);
-  const importantIds = new Set(important.map((item) => item.id));
-  const recent = getRecentIndexEntries(items, activeCursor)
-    .filter((item) => !importantIds.has(item.id));
-  const recentIds = new Set(recent.map((item) => item.id));
-  const secondary = items
-    .filter((item) => !importantIds.has(item.id) && !recentIds.has(item.id))
-    .sort(compareIndexEntries);
-  return { important, recent, secondary };
-}
-
 function isImportantEntry(item, index, kind) {
   if (item.priority === "primary") return true;
   if (item.priority === "secondary") return false;
@@ -2193,11 +3246,13 @@ function searchBook(chapters, query) {
   const results = [];
   chapters.forEach((chapter, chapterIndex) => {
     chapter.paragraphs.forEach((paragraph, paragraphIndex) => {
-      const matchIndex = paragraph.indexOf(keyword);
+      const text = paragraphPlainText(paragraph);
+      if (!text) return;
+      const matchIndex = text.indexOf(keyword);
       if (matchIndex < 0) return;
       const start = Math.max(0, matchIndex - 32);
-      const end = Math.min(paragraph.length, matchIndex + keyword.length + 54);
-      results.push({ chapterIndex, chapterTitle: chapter.title, paragraphIndex, excerpt: `${start ? "…" : ""}${paragraph.slice(start, end)}${end < paragraph.length ? "…" : ""}` });
+      const end = Math.min(text.length, matchIndex + keyword.length + 54);
+      results.push({ chapterIndex, chapterTitle: chapter.title, paragraphIndex, excerpt: `${start ? "…" : ""}${text.slice(start, end)}${end < text.length ? "…" : ""}` });
     });
   });
   return results.slice(0, 50);
@@ -2218,6 +3273,18 @@ function createBookFingerprint(parsed, file) {
   return `${extension || "book"}:${basis}`;
 }
 
+function isEpubLibraryBook(book) {
+  if (!book || book.format === "PDF") return false;
+  if (book.builtIn || book.format === "EPUB") return true;
+  if (String(book.fingerprint || "").startsWith("epub:")) return true;
+  return String(book.fileName || "").toLowerCase().endsWith(".epub");
+}
+
+/** True when an IndexedDB EPUB was parsed before inline images were kept. */
+function needsEpubContentReparse(book) {
+  return isEpubLibraryBook(book) && book.contentParseVersion !== EPUB_CONTENT_PARSE_VERSION;
+}
+
 function createClassificationPayload(book) {
   return {
     title: book.title,
@@ -2227,7 +3294,7 @@ function createClassificationPayload(book) {
     tableOfContents: book.chapters.slice(0, 18).map((chapter) => chapter.title),
     sampleText: book.chapters.slice(0, 4).map((chapter) => ({
       title: chapter.title,
-      paragraphs: chapter.paragraphs.slice(0, 4).map((paragraph) => paragraph.slice(0, 360)),
+      paragraphs: chapter.paragraphs.slice(0, 4).map((paragraph) => paragraphPlainText(paragraph).slice(0, 360)).filter(Boolean),
     })),
   };
 }
@@ -2240,21 +3307,201 @@ function localFormatLabel(book) {
   return `本地 ${book?.format || "EPUB"}`;
 }
 
-function SearchDialog({ bookTitle, query, setQuery, results, onSelect, onClose }) {
+function SearchDialog({ book, query, setQuery, results, onSelect, onClose }) {
   const inputRef = useRef(null);
-  useEffect(() => { inputRef.current?.focus(); const onKey = (event) => { if (event.key === "Escape") onClose(); }; window.addEventListener("keydown", onKey); return () => window.removeEventListener("keydown", onKey); }, [onClose]);
-  return <div className="search-backdrop reader-search-popover" role="presentation" onMouseDown={onClose}>
-    <section className="search-dialog reader-search-dialog" role="dialog" aria-modal="true" aria-label="搜索书内内容" onMouseDown={(event) => event.stopPropagation()}>
-      <header><Search size={19} /><input ref={inputRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索人物、地点、事件或任意文字" /><button onClick={onClose} title="关闭搜索" aria-label="关闭搜索"><X size={18} /></button></header>
-      {query.trim() ? <div className="search-results">{results.length ? results.map((result) => <button key={`${result.chapterIndex}-${result.paragraphIndex}`} onClick={() => onSelect(result)}><span><small>{result.chapterTitle} · 第 {result.paragraphIndex + 1} 段</small><b>{highlightMatch(result.excerpt, query.trim())}</b></span><ChevronRight size={16} /></button>) : <div className="search-empty compact"><Search size={20} /><strong>没有找到“{query}”</strong><span>试试更短的关键词。</span></div>}</div> : <div className="reader-search-start"><span>在《{bookTitle}》中查找</span><div className="search-suggestions"><button onClick={() => setQuery("湘江")}>湘江</button><button onClick={() => setQuery("遵义")}>遵义</button><button onClick={() => setQuery("红军")}>红军</button></div></div>}
-      <footer><span>本地图书结果</span><kbd>Esc</kbd></footer>
+  const listRef = useRef(null);
+  const [activeIndex, setActiveIndex] = useState(0);
+  const [recent, setRecent] = useState(() => loadSearchRecent(book));
+  const trimmed = query.trim();
+  const hasQuery = Boolean(trimmed);
+
+  useEffect(() => {
+    inputRef.current?.focus();
+    const onKey = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  useEffect(() => {
+    setActiveIndex(0);
+  }, [trimmed, results.length]);
+
+  useEffect(() => {
+    const active = listRef.current?.querySelector?.("[aria-selected='true']");
+    active?.scrollIntoView?.({ block: "nearest" });
+  }, [activeIndex, hasQuery, results.length]);
+
+  function clearRecent() {
+    saveSearchRecent(book, []);
+    setRecent([]);
+  }
+
+  function handleKeyDown(event) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+    if (!hasQuery || !results.length) return;
+    if (event.key === "ArrowDown") {
+      event.preventDefault();
+      setActiveIndex((index) => Math.min(index + 1, results.length - 1));
+    } else if (event.key === "ArrowUp") {
+      event.preventDefault();
+      setActiveIndex((index) => Math.max(index - 1, 0));
+    } else if (event.key === "Enter") {
+      event.preventDefault();
+      const item = results[activeIndex];
+      if (item) onSelect(item);
+    }
+  }
+
+  return <>
+    <div className="reader-search-backdrop" role="presentation" onMouseDown={onClose} />
+    <section
+      id="reader-search-dialog"
+      className="reader-search-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label="搜索书内内容"
+      onMouseDown={(event) => event.stopPropagation()}
+    >
+      <header className="reader-search-dialog-head">
+        <Search size={17} aria-hidden="true" />
+        <div className="reader-search-field">
+          <input
+            ref={inputRef}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="人名、地名、事件或原文"
+            aria-label="搜索书内内容"
+            autoComplete="off"
+            spellCheck={false}
+          />
+          {hasQuery ? (
+            <button
+              type="button"
+              className="reader-search-clear"
+              onClick={() => setQuery("")}
+              title="清空搜索词"
+              aria-label="清空搜索词"
+            >
+              清空
+            </button>
+          ) : null}
+        </div>
+        <button
+          type="button"
+          className="reader-search-close"
+          onClick={onClose}
+          title="关闭搜索 (Esc)"
+          aria-label="关闭搜索面板"
+        >
+          <X size={16} aria-hidden="true" />
+        </button>
+      </header>
+
+      {hasQuery ? (
+        <div className="reader-search-dialog-body" ref={listRef}>
+          {results.length ? (
+            <>
+              <div className="reader-search-meta"><span>{results.length} 处出处</span><span className="reader-search-hint" title="方向键选择，回车打开">↑↓ Enter</span></div>
+              <div className="reader-search-hit-list" role="listbox" aria-label="搜索结果">
+                {results.map((result, index) => (
+                  <button
+                    key={`${result.chapterIndex}-${result.paragraphIndex}`}
+                    type="button"
+                    role="option"
+                    aria-selected={index === activeIndex}
+                    className={index === activeIndex ? "active" : undefined}
+                    onMouseEnter={() => setActiveIndex(index)}
+                    onClick={() => onSelect(result)}
+                  >
+                    <small><span>{result.chapterTitle}</span><i>第 {result.paragraphIndex + 1} 段</i></small>
+                    <b>{highlightMatch(result.excerpt, trimmed)}</b>
+                  </button>
+                ))}
+              </div>
+            </>
+          ) : (
+            <div className="reader-search-dialog-empty">
+              <strong>没有找到「{trimmed}」</strong>
+              <span>试试更短的词，或换一个称呼。</span>
+            </div>
+          )}
+        </div>
+      ) : (
+        <div className="reader-search-dialog-body idle">
+          {recent.length ? (
+            <div className="reader-search-recent">
+              <header>
+                <span>最近搜索</span>
+                <button type="button" onClick={clearRecent} title="清空最近搜索" aria-label="清空最近搜索">清空</button>
+              </header>
+              <ul>
+                {recent.map((term) => (
+                  <li key={term}>
+                    <button type="button" onClick={() => setQuery(term)}>
+                      <Clock3 size={14} aria-hidden="true" />
+                      <span>{term}</span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ) : (
+            <div className="reader-search-dialog-empty quiet">
+              <strong>查找书内原文</strong>
+              <span>输入关键词即可定位章节与出处。定位原文，不是回忆。</span>
+            </div>
+          )}
+        </div>
+      )}
     </section>
-  </div>;
+  </>;
+}
+
+function loadSearchRecent(book) {
+  return loadStored(searchRecentStorageKey(book), []).filter((item) => typeof item === "string" && item.trim()).slice(0, 8);
+}
+
+function saveSearchRecent(book, items) {
+  if (!book) return;
+  localStorage.setItem(searchRecentStorageKey(book), JSON.stringify(items));
+}
+
+function rememberSearchQuery(book, query) {
+  const trimmed = String(query || "").trim();
+  if (!book || !trimmed) return;
+  const next = [trimmed, ...loadSearchRecent(book).filter((item) => item !== trimmed)].slice(0, 8);
+  saveSearchRecent(book, next);
+}
+
+function searchRecentStorageKey(book) {
+  return `shumai-search-recent:${storageBookIdentity(book)}`;
 }
 
 function highlightMatch(text, query) {
-  const parts = text.split(query);
-  return parts.map((part, index) => <span key={`${part}-${index}`}>{part}{index < parts.length - 1 && <mark>{query}</mark>}</span>);
+  const source = String(text || "");
+  const needle = String(query || "").trim();
+  if (!needle) return source;
+  const lowerSource = source.toLowerCase();
+  const lowerNeedle = needle.toLowerCase();
+  const nodes = [];
+  let cursor = 0;
+  let index = lowerSource.indexOf(lowerNeedle);
+  let key = 0;
+  while (index >= 0) {
+    if (index > cursor) nodes.push(<span key={`t-${key++}`}>{source.slice(cursor, index)}</span>);
+    nodes.push(<mark key={`m-${key++}`}>{source.slice(index, index + needle.length)}</mark>);
+    cursor = index + needle.length;
+    index = lowerSource.indexOf(lowerNeedle, cursor);
+  }
+  if (cursor < source.length) nodes.push(<span key={`t-${key++}`}>{source.slice(cursor)}</span>);
+  return nodes;
 }
 
 function ImportProgressModal({ status }) {
@@ -2314,7 +3561,11 @@ function normalizeRecoveryCard(card, fallback = null) {
       detail: summaryText(item?.detail) || "",
       evidence: resolveItemEvidence(item),
     }))
-    .filter((item) => item.detail && item.evidence)
+    .filter((item) => {
+      if (!item.detail || !item.evidence) return false;
+      if (isBroadMegaTopic(item.title) && !hasConcreteEpisodeCue(`${item.title} ${item.detail}`)) return false;
+      return true;
+    })
     .slice(0, 3);
   if (keyPoints.length < 2) return fallback;
   const prerequisites = (Array.isArray(card.prerequisites) ? card.prerequisites : [])
@@ -2327,6 +3578,45 @@ function normalizeRecoveryCard(card, fallback = null) {
     .filter((item) => item.text && item.evidence)
     .slice(0, 2);
   const questionEvidence = resolveItemEvidence(card.question) || normalizeRecoveryEvidence(fallback?.question?.evidence);
+  const chapterTitle = questionEvidence?.chapterTitle
+    || keyPoints[0]?.evidence?.chapterTitle
+    || fallback?.question?.prompt?.match(/《([^》]+)》/)?.[1]
+    || "当前章节";
+  const fallbackAnchor = preferQuestionAnchor(
+    keyPoints.map((item) => ({
+      name: item.title,
+      title: item.title,
+      summary: item.detail,
+      detail: item.detail,
+      kind: /概念|定义|机制/.test(`${item.title}${item.detail}`) ? "concept" : "event",
+      priority: "primary",
+      evidence: item.evidence,
+    })),
+  ) || {
+    name: keyPoints[0]?.title,
+    title: keyPoints[0]?.title,
+    summary: keyPoints[0]?.detail || questionEvidence?.excerpt,
+    detail: keyPoints[0]?.detail || questionEvidence?.excerpt,
+    kind: "event",
+  };
+  const repaired = sanitizeModelRecoveryQuestion(
+    {
+      prompt: summaryText(card.question?.prompt) || fallback?.question?.prompt || "",
+      hint: summaryText(card.question?.hint) || fallback?.question?.hint || "",
+      answer: summaryText(card.question?.answer) || fallback?.question?.answer || "",
+    },
+    {
+      chapterTitle,
+      fallbackAnchor,
+      evidenceExcerpt: questionEvidence?.excerpt || keyPoints[0]?.detail || "",
+    },
+  );
+  const hint = sanitizeRecoveryHint(repaired.hint) || "";
+  const prompt = summaryText(repaired.prompt)
+    || (!isWeakRecoveryQuestion(fallback?.question?.prompt, { answer: fallback?.question?.answer })
+      ? summaryText(fallback?.question?.prompt)
+      : "")
+    || questionFromEpisodeAnchor(fallbackAnchor, chapterTitle);
   return {
     intensity: ["light", "medium", "deep", "fresh"].includes(card.intensity) ? card.intensity : fallback?.intensity || "medium",
     absenceLabel: summaryText(card.absenceLabel) || fallback?.absenceLabel || "继续阅读前",
@@ -2335,8 +3625,9 @@ function normalizeRecoveryCard(card, fallback = null) {
     prerequisites: prerequisites.length ? prerequisites : fallback?.prerequisites || [],
     question: {
       memoryKey: card.question?.memoryKey || questionEvidence?.memoryKey || fallback?.question?.memoryKey,
-      prompt: summaryText(card.question?.prompt) || fallback?.question?.prompt || "继续前，先回想上一阶段的主线变化是什么？",
-      answer: summaryText(card.question?.answer) || fallback?.question?.answer || "",
+      prompt,
+      hint,
+      answer: summaryText(repaired.answer) || fallback?.question?.answer || "",
       evidence: questionEvidence || fallback?.question?.evidence || null,
     },
     evidence,
@@ -2413,7 +3704,12 @@ function buildTraceRecoveryCard(book, indexOrMemory = {}, savedPosition = {}, la
 function normalizeRecoveryCursor(book, savedPosition = {}) {
   const chapterIndex = Math.min(Math.max(Number(savedPosition.chapterIndex || 0), 0), book.chapters.length - 1);
   const pageIndex = Math.max(Number(savedPosition.pageIndex || 0), 0);
-  const pageWindow = paginateChapterWindow(book.chapters[chapterIndex], pageIndex, savedPosition.pageWidth || 900);
+  const pageWindow = paginateChapterWindow(
+    book.chapters[chapterIndex],
+    pageIndex,
+    savedPosition.pageWidth || 900,
+    savedPosition.pageHeight || 720,
+  );
   const pageParagraphs = pageWindow.items.map((item) => item.paragraphIndex).filter(Number.isInteger);
   return {
     chapterIndex,
@@ -2489,87 +3785,6 @@ function traceMemoryEntries(traceMemory = null) {
   })).filter((item) => item.title && item.detail && item.evidence);
 }
 
-function suggestTraceOrganizers(index = {}, bookMemoryOrTrace = null, traceProfile = null) {
-  const bookMemory = normalizeBookMemory(
-    bookMemoryOrTrace?.version || hasBookMemoryContent(bookMemoryOrTrace)
-      ? bookMemoryOrTrace
-      : bookMemoryFromLegacy({ index, traceMemory: bookMemoryOrTrace }),
-  );
-  const anchors = compatibilityTraceMemory(bookMemory).anchors || [];
-  const suggestions = [];
-  if ((index.relationships || []).length >= 2) {
-    suggestions.push({ type: "relationship", label: "关系图", reason: `${index.relationships.length} 条可追溯关系` });
-  }
-  if ((index.timeline || []).filter((item) => item.priority === "primary" || item.importance === "primary").length >= 3 || (index.timeline || []).length >= 5) {
-    suggestions.push({ type: "timeline", label: "时间链", reason: "事件顺序会影响理解" });
-  }
-  const conceptCount = anchors
-    .filter((anchor) => /concept|definition|mechanism|framework|knowledge|formula|api|flow|prerequisite/i.test(anchor.id || ""))
-    .reduce((sum, anchor) => sum + (anchor.items || []).length, 0);
-  if (conceptCount >= 3 || /science|technology|business|learning/i.test(traceProfile?.id || "")) {
-    suggestions.push({ type: "concept", label: "概念图", reason: "当前类型更依赖概念结构" });
-  }
-  const argumentCount = anchors
-    .filter((anchor) => /argument|proposition|objection|conclusion|decision|pitfall/i.test(anchor.id || ""))
-    .reduce((sum, anchor) => sum + (anchor.items || []).length, 0);
-  if (argumentCount >= 2 || /philosophy|business/i.test(traceProfile?.id || "")) {
-    suggestions.push({ type: "argument", label: "论证链", reason: "适合按观点与因果回忆" });
-  }
-  return uniqueBy(suggestions, (item) => item.type).slice(0, 4);
-}
-
-function organizerItemsForType(type, index = {}, bookMemoryOrTrace = null) {
-  const bookMemory = normalizeBookMemory(
-    bookMemoryOrTrace?.version || hasBookMemoryContent(bookMemoryOrTrace)
-      ? bookMemoryOrTrace
-      : bookMemoryFromLegacy({ index, traceMemory: bookMemoryOrTrace }),
-  );
-  if (type === "timeline") {
-    return (bookMemory.timeline || index.timeline || []).slice(0, 8).map((item) => traceEntryToRecoveryAnchor({ ...item, kind: "timeline", name: item.name || item.title, summary: item.summary || item.detail, evidence: item.evidence || item.occurrence }));
-  }
-  if (type === "concept") {
-    return (bookMemory.topics || []).slice(0, 8).map((item) => traceEntryToRecoveryAnchor({
-      ...item,
-      kind: item.kind || "concept",
-      name: item.name,
-      summary: item.summary,
-      evidence: item.evidence,
-      occurrence: item.evidence,
-    }));
-  }
-  if (type === "argument") {
-    return (bookMemory.arguments || []).slice(0, 8).map((item) => traceEntryToRecoveryAnchor({
-      ...item,
-      kind: item.kind || "argument",
-      name: item.name,
-      summary: item.summary,
-      evidence: item.evidence,
-      occurrence: item.evidence,
-    }));
-  }
-  return collectTraceRecoveryAnchors(index, getMaxIndexCursor(index), bookMemory).slice(0, 8);
-}
-
-function getMaxIndexCursor(index = {}) {
-  const entries = [
-    ...traceEntries(index.timeline, "timeline"),
-    ...traceEntries(index.relationships, "relationship"),
-    ...traceEntries(index.organizations, "organization"),
-    ...traceEntries(index.people, "person"),
-    ...traceEntries(index.places, "place"),
-  ];
-  return entries.reduce((cursor, item) => {
-    const occurrence = item.occurrence || item.evidence || {};
-    const chapterIndex = Number(occurrence.chapterIndex);
-    const paragraphIndex = Number(occurrence.paragraphIndex);
-    if (!Number.isInteger(chapterIndex) || !Number.isInteger(paragraphIndex)) return cursor;
-    if (chapterIndex > cursor.chapterIndex || (chapterIndex === cursor.chapterIndex && paragraphIndex > cursor.paragraphIndex)) {
-      return { chapterIndex, paragraphIndex, pageIndex: 0 };
-    }
-    return cursor;
-  }, { chapterIndex: 0, paragraphIndex: 0, pageIndex: 0 });
-}
-
 function traceEntries(items = [], kind) {
   return (Array.isArray(items) ? items : []).map((item) => ({ ...item, kind })).filter((item) => summaryText(item.name || item.title || item.source || item.target));
 }
@@ -2584,15 +3799,17 @@ function isTraceEntryBeforeCursor(item, cursor) {
 
 function recoveryAnchorScore(item, cursor, memoryState = {}) {
   const occurrence = item.occurrence || item.evidence || {};
-  const primary = item.priority === "primary" || item.importance === "primary" ? 100 : 25;
+  const primary = item.priority === "primary" || item.importance === "primary" ? 100 : item.priority === "recent" ? 78 : 25;
   const kindWeight = { events: 42, plot: 40, concepts: 38, mechanisms: 38, timeline: 36, relationship: 34, organizations: 28, organization: 28, people: 24, person: 24, places: 16, place: 16 }[item.kind] || 30;
   const detail = summaryText(item.detail || item.summary || item.subtitle || item.relation || item.evidenceQuote || item.evidence?.quote);
+  const title = summaryText(item.name || item.title);
   const mainline = recoveryMainlineScore(detail);
   const chapterDistance = Math.max(0, cursor.chapterIndex - Number(occurrence.chapterIndex || 0));
   const proximity = Math.max(0, 24 - chapterDistance * 8);
   const memoryKey = recoveryMemoryKey(item.kind || "trace", item.name || item.title || `${item.source || ""}-${item.target || ""}`, occurrence);
   const memoryBoost = recoveryForgettingBoost(memoryState[memoryKey], occurrence, cursor);
-  return primary + kindWeight + mainline + proximity + memoryBoost;
+  const broadPenalty = isBroadMegaTopic(title) && !hasConcreteEpisodeCue(`${title} ${detail}`) ? -40 : 0;
+  return primary + kindWeight + mainline + proximity + memoryBoost + broadPenalty;
 }
 
 function uniqueTraceAnchors(items) {
@@ -2659,8 +3876,7 @@ function recoveryPrerequisiteFromAnchor(item, title) {
 }
 
 function recoveryQuestionFromAnchor(anchor, chapterTitle = "当前章节") {
-  if (!anchor) return `继续读《${chapterTitle}》前，上一阶段最关键的变化是什么？`;
-  return `继续读《${chapterTitle}》前，你还记得“${anchor.title}”为什么会影响后面的内容吗？`;
+  return questionFromEpisodeAnchor(anchor, chapterTitle);
 }
 
 function flattenRecoverySource(chapters = []) {
@@ -2669,10 +3885,21 @@ function flattenRecoverySource(chapters = []) {
     return (chapter.paragraphs || []).map((item, paragraphIndex) => ({
       chapterIndex,
       chapterTitle: chapter.title,
-      paragraphIndex: typeof item === "object" ? item.paragraphIndex ?? paragraphIndex : paragraphIndex,
-      text: typeof item === "object" ? item.text : item,
+      paragraphIndex: typeof item === "object" && Number.isInteger(item.paragraphIndex) ? item.paragraphIndex : paragraphIndex,
+      text: paragraphPlainText(item),
     }));
   }).filter((item) => summaryText(item.text));
+}
+
+function isImageParagraph(item) {
+  return Boolean(item && typeof item === "object" && item.type === "image" && item.src);
+}
+
+function paragraphPlainText(item) {
+  if (typeof item === "string") return item;
+  if (isImageParagraph(item)) return String(item.alt || "").trim();
+  if (item && typeof item === "object" && typeof item.text === "string") return item.text;
+  return "";
 }
 
 function summaryText(item) {
@@ -2685,6 +3912,7 @@ function summaryText(item) {
     return text && !/^undefined(?:s*[·路-]s*undefined)?$/i.test(text) ? text : "";
   }
   if (!item || typeof item !== "object") return "";
+  if (item.type === "image") return clean(item.alt);
   return [item.name || item.date || item.title, item.subtitle || item.summary || item.detail]
     .map(clean)
     .filter(Boolean)
@@ -2713,7 +3941,12 @@ function getNewReadingContent(chapters, previousCursor, currentCursor) {
     const end = chapterIndex === currentCursor.chapterIndex ? currentCursor.paragraphIndex + 1 : chapter.paragraphs.length;
     const paragraphs = chapter.paragraphs
       .slice(Math.max(0, start), Math.max(0, end))
-      .map((text, offset) => ({ paragraphIndex: Math.max(0, start) + offset, text }));
+      .map((paragraph, offset) => ({
+        paragraphIndex: Math.max(0, start) + offset,
+        text: paragraphPlainText(paragraph),
+        ...(isImageParagraph(paragraph) ? { type: "image", src: paragraph.src, alt: paragraph.alt || "" } : {}),
+      }))
+      .filter((item) => item.text || item.type === "image");
     if (paragraphs.length) source.push({ sourceChapterIndex: chapterIndex, title: chapter.title, paragraphs });
   }
   return source;
@@ -2723,8 +3956,18 @@ function getFullBookContent(chapters) {
   return chapters.map((chapter, sourceChapterIndex) => ({
     sourceChapterIndex,
     title: chapter.title,
-    paragraphs: chapter.paragraphs.map((text, paragraphIndex) => ({ paragraphIndex, text })),
+    paragraphs: chapter.paragraphs.map((paragraph, paragraphIndex) => ({
+      paragraphIndex,
+      text: paragraphPlainText(paragraph),
+      ...(isImageParagraph(paragraph) ? { type: "image", src: paragraph.src, alt: paragraph.alt || "" } : {}),
+    })),
   }));
+}
+
+function getRecoveryCurrentChapters(book, cursor = {}) {
+  const chapterIndex = Math.min(Math.max(Number(cursor.chapterIndex) || 0, 0), Math.max(0, (book?.chapters?.length || 1) - 1));
+  const paragraphIndex = Math.max(0, Number(cursor.paragraphIndex) || 0);
+  return getNewReadingContent(book?.chapters || [], { chapterIndex: 0, paragraphIndex: -1 }, { chapterIndex, paragraphIndex });
 }
 
 function getFullBookCursor(book) {
@@ -2733,26 +3976,74 @@ function getFullBookCursor(book) {
   return { chapterIndex, paragraphIndex, pageIndex: 0, pageCount: 1, scope: "full" };
 }
 
-function getLogicalPageMetrics(pageWidth = 900) {
-  const charBudget = Math.max(700, Math.min(980, Math.round((Number(pageWidth) || 900) * 0.86)));
-  return { charBudget, longSegmentSize: Math.max(340, Math.round(charBudget * 0.86)) };
+function getLogicalPageMetrics(pageWidth = 900, pageHeight = 720, packScale = 1) {
+  const width = Math.max(320, Number(pageWidth) || 900);
+  const height = Math.max(200, Number(pageHeight) || 720);
+  const scale = Math.min(1, Math.max(0.3, Number(packScale) || 1));
+  // Match .epub-page: 18px / 1.68. Pack densely; the measure effect shrinks on overflow.
+  // Do not stack extra density haircuts here — pageHeight already excludes page-copy padding,
+  // and the overflow guard reserves a bottom safety band. A prior 0.8× factor left pages ~half empty.
+  const fontSize = 18;
+  const lineHeightPx = fontSize * 1.68;
+  // CJK glyphs are ~1em; letter-spacing (.018em) is a small adder only.
+  const charWidthPx = fontSize * 1.02;
+  const charsPerLine = Math.max(18, Math.floor(width / charWidthPx));
+  // One-line reserve in the estimate; padBottom + measure safetyPx cover the clip edge.
+  const usableHeight = Math.max(160, height - lineHeightPx);
+  const lines = Math.max(5, Math.floor(usableHeight / lineHeightPx));
+  const estimated = Math.round(charsPerLine * lines * 1.06 * scale);
+  const charBudget = Math.max(220, Math.min(2200, estimated));
+  // Images are atomic; estimate ~48% of usable height so a figure can share a page with text.
+  const imageHeightPx = Math.min(usableHeight * 0.48, lineHeightPx * 12);
+  const imageLines = Math.max(4, Math.ceil(imageHeightPx / lineHeightPx) + 1);
+  const paragraphOverhead = 14;
+  return {
+    charBudget,
+    longSegmentSize: Math.max(160, Math.min(charBudget, Math.round(charBudget * 0.9))),
+    paragraphOverhead,
+    imageCharCost: Math.round(imageLines * charsPerLine) + paragraphOverhead,
+  };
 }
 
-function paginateChapterWindow(chapter, pageIndex = 0, pageWidth = 900) {
+function paginateChapterWindow(chapter, pageIndex = 0, pageWidth = 900, pageHeight = 720, packScale = 1) {
   const paragraphs = chapter?.paragraphs || [];
   if (!paragraphs.length) return { pageCount: 1, items: [] };
   const targetPage = Math.max(0, Number(pageIndex) || 0);
-  const { charBudget, longSegmentSize } = getLogicalPageMetrics(pageWidth);
+  const { charBudget, longSegmentSize, paragraphOverhead, imageCharCost } = getLogicalPageMetrics(pageWidth, pageHeight, packScale);
   const items = [];
   let currentSize = 0;
   let currentPage = 0;
 
   paragraphs.forEach((paragraph, paragraphIndex) => {
-    const text = summaryText(paragraph).trim();
+    if (isImageParagraph(paragraph)) {
+      const size = imageCharCost;
+      if (currentSize && currentSize + size > charBudget) {
+        currentPage += 1;
+        currentSize = 0;
+      }
+      if (currentPage === targetPage) {
+        items.push({
+          type: "image",
+          src: paragraph.src,
+          alt: paragraph.alt || "",
+          text: "",
+          paragraphIndex,
+          segmentIndex: 0,
+        });
+      }
+      currentSize += size;
+      if (currentSize >= charBudget * 0.92) {
+        currentPage += 1;
+        currentSize = 0;
+      }
+      return;
+    }
+
+    const text = paragraphPlainText(paragraph).trim();
     if (!text) return;
     for (let offset = 0; offset < text.length; offset += longSegmentSize) {
       const segment = text.slice(offset, offset + longSegmentSize);
-      const size = segment.length + 42;
+      const size = segment.length + paragraphOverhead;
       if (currentSize && currentSize + size > charBudget) {
         currentPage += 1;
         currentSize = 0;
@@ -2769,23 +4060,40 @@ function paginateChapterWindow(chapter, pageIndex = 0, pageWidth = 900) {
   return { pageCount: Math.max(1, currentPage + (currentSize > 0 ? 1 : 0)), items };
 }
 
-function findPageForParagraphInChapter(chapter, paragraphIndex = 0, pageWidth = 900) {
+function findPageForParagraphInChapter(chapter, paragraphIndex = 0, pageWidth = 900, pageHeight = 720, packScale = 1, charOffset = 0) {
   const paragraphs = chapter?.paragraphs || [];
   const target = Number(paragraphIndex) || 0;
-  const { charBudget, longSegmentSize } = getLogicalPageMetrics(pageWidth);
+  const targetOffset = Math.max(0, Number(charOffset) || 0);
+  const { charBudget, longSegmentSize, paragraphOverhead, imageCharCost } = getLogicalPageMetrics(pageWidth, pageHeight, packScale);
   let currentSize = 0;
   let currentPage = 0;
   for (let index = 0; index < paragraphs.length; index += 1) {
-    const text = summaryText(paragraphs[index]).trim();
-    if (!text) continue;
-    for (let offset = 0; offset < text.length; offset += longSegmentSize) {
-      const segment = text.slice(offset, offset + longSegmentSize);
-      const size = segment.length + 42;
+    const paragraph = paragraphs[index];
+    if (isImageParagraph(paragraph)) {
+      const size = imageCharCost;
       if (currentSize && currentSize + size > charBudget) {
         currentPage += 1;
         currentSize = 0;
       }
-      if (index >= target) return currentPage;
+      if (index === target) return currentPage;
+      currentSize += size;
+      if (currentSize >= charBudget * 0.92) {
+        currentPage += 1;
+        currentSize = 0;
+      }
+      continue;
+    }
+    const text = paragraphPlainText(paragraph).trim();
+    if (!text) continue;
+    for (let offset = 0; offset < text.length; offset += longSegmentSize) {
+      const segment = text.slice(offset, offset + longSegmentSize);
+      const size = segment.length + paragraphOverhead;
+      if (currentSize && currentSize + size > charBudget) {
+        currentPage += 1;
+        currentSize = 0;
+      }
+      if (index > target) return currentPage;
+      if (index === target && offset + segment.length > targetOffset) return currentPage;
       currentSize += size;
       if (size >= charBudget) {
         currentPage += 1;
@@ -2802,7 +4110,7 @@ function buildRecoveryCard(book, readPages = [], savedPosition = {}, lastActivit
   if (lastActivityTime && Date.now() - lastActivityTime < RECOVERY_CARD_MIN_ABSENCE_MS) return null;
   const cursor = normalizeRecoveryCursor(book, savedPosition);
   if (!hasRecoverablePriorContext(book, cursor) && !readPages.length) return null;
-  const evidence = collectRecoveryEvidence(book, cursor, memoryState);
+  const evidence = sortEvidenceByCursorProximity(collectRecoveryEvidence(book, cursor, memoryState), cursor);
   if (evidence.length < 2) return null;
   const absence = describeReadingAbsence(lastActivity);
   const keyPoints = evidence.slice(0, 3).map((item, index) => ({
@@ -2814,6 +4122,14 @@ function buildRecoveryCard(book, readPages = [], savedPosition = {}, lastActivit
   }));
   const prerequisites = buildRecoveryPrerequisites(book, cursor, evidence);
   const questionEvidence = evidence[0];
+  const questionAnchor = {
+    name: keyPoints[0]?.title,
+    title: keyPoints[0]?.title,
+    summary: keyPoints[0]?.detail || questionEvidence?.excerpt,
+    detail: keyPoints[0]?.detail || questionEvidence?.excerpt,
+    kind: recoveryKindFromExcerpt(questionEvidence?.excerpt),
+    priority: "recent",
+  };
   return {
     intensity: absence.intensity,
     absenceLabel: absence.label,
@@ -2822,8 +4138,9 @@ function buildRecoveryCard(book, readPages = [], savedPosition = {}, lastActivit
     prerequisites,
     question: {
       memoryKey: questionEvidence?.memoryKey,
-      prompt: buildRecoveryQuestion(book, cursor, evidence),
-      answer: questionEvidence?.excerpt || "先回想上一阶段的主线变化，再继续阅读当前页。",
+      prompt: buildRecoveryQuestion(book, cursor, evidence, questionAnchor),
+      hint: hintFromEvidenceExcerpt(questionEvidence?.excerpt || ""),
+      answer: questionEvidence?.excerpt || "先回想上一阶段具体的主线变化，再继续阅读当前页。",
       evidence: questionEvidence,
     },
     evidence,
@@ -2849,7 +4166,7 @@ function collectRecoveryEvidence(book, cursor, memoryState = {}) {
     if (!chapter || isNonNarrativeChapter(chapter.title)) continue;
     const maxParagraph = chapterIndex === cursor.chapterIndex ? Math.min(cursor.paragraphIndex ?? chapter.paragraphs.length - 1, chapter.paragraphs.length - 1) : chapter.paragraphs.length - 1;
     for (let paragraphIndex = maxParagraph; paragraphIndex >= 0; paragraphIndex -= 1) {
-      const text = cleanRecoveryText(chapter.paragraphs[paragraphIndex]);
+      const text = cleanRecoveryText(paragraphPlainText(chapter.paragraphs[paragraphIndex]));
       if (!text || text.length < 24 || isPublicationMetadata(text) || isIncidentalRecoveryText(text)) continue;
       const occurrence = { chapterIndex, paragraphIndex };
       const memoryKey = recoveryMemoryKey("paragraph", recoveryPointTitle(text, candidates.length), occurrence);
@@ -2892,9 +4209,9 @@ function scoreRecoveryParagraph(text, chapterTitle, cursor, chapterIndex, paragr
 function recoveryMainlineScore(text) {
   let score = 0;
   const groups = [
-    [18, /转折|决定|命令|部署|会议|冲突|突破|重围|撤退|转移|进攻|防守|会师|围剿|起义|谈判|分裂|危机|失败|胜利|牺牲|被俘|追击|主力|战略|战役|形势|原因|导致|因此|于是|为了/],
-    [12, /主张|观点|结论|概念|机制|模型|定义|原则|问题|矛盾|线索|铺垫|承接|影响|关键|核心|重要/],
-    [8, /红军|国民党|中央|军团|军委|政委|司令|组织|部队|政府|委员会|根据地/],
+    [18, /转折|决定|命令|部署|会议|冲突|突破|撤退|转移|进攻|防守|起义|谈判|分裂|危机|失败|胜利|牺牲|被俘|追击|战略|战役|形势|原因|导致|因此|于是|为了|实验|证明|推导|反驳|假设|成立|失效/],
+    [12, /主张|观点|结论|概念|机制|模型|定义|原则|问题|矛盾|线索|铺垫|承接|关键|核心|重要|框架|例证/],
+    [8, /司令|政委|军团|军委|部队|组织|政府|委员会|总部|议会|董事会|课题组|实验室|学派|同盟/],
     [4, /说|认为|指出|表示|要求|宣布|计划|准备|开始|继续/],
   ];
   groups.forEach(([weight, pattern]) => {
@@ -3019,26 +4336,56 @@ function recoveryForgettingBoost(state = null, occurrence = {}, cursor = {}) {
   return Math.max(0, Math.min(36, distanceBoost + overdueBoost + struggleBoost - rememberedPenalty));
 }
 
-function buildRecoveryQuestion(book, cursor, evidence) {
+function buildRecoveryQuestion(book, cursor, evidence, preferredAnchor = null) {
   const chapterTitle = book.chapters[cursor.chapterIndex]?.title || "当前章节";
   const first = evidence[0]?.excerpt || "";
-  if (/原因|因为|导致|因此|于是|为了|影响/.test(first)) return `继续读《${chapterTitle}》前，上一阶段最关键的因果变化是什么？`;
-  if (/命令|决定|部署|会议|计划|准备/.test(first)) return `继续读《${chapterTitle}》前，前文哪个决定或部署正在影响当前局势？`;
-  if (/冲突|危机|失败|胜利|突破|撤退|转移/.test(first)) return `继续读《${chapterTitle}》前，上一阶段的主要冲突推进到了哪一步？`;
-  return `继续读《${chapterTitle}》前，前文留下的主线变化是什么？`;
+  const anchor = preferredAnchor || {
+    name: recoveryPointTitle(first, 0),
+    title: recoveryPointTitle(first, 0),
+    summary: recoveryPointDetail(first),
+    detail: recoveryPointDetail(first),
+    kind: recoveryKindFromExcerpt(first),
+    priority: "recent",
+  };
+  const prompt = questionFromEpisodeAnchor(anchor, chapterTitle);
+  if (!isWeakRecoveryQuestion(prompt, { answer: first, detail: first })) return prompt;
+  if (/原因|因为|导致|因此|于是|为了/.test(first) && hasConcreteEpisodeCue(first)) {
+    return `继续读《${chapterTitle}》前，上一阶段最具体的因果变化是什么？`;
+  }
+  if (/命令|决定|部署|会议|计划|准备/.test(first) && hasConcreteEpisodeCue(first)) {
+    return `继续读《${chapterTitle}》前，前文哪个具体决定或部署正在影响当前局势？`;
+  }
+  if (/冲突|危机|失败|胜利|突破|撤退|转移/.test(first) && hasConcreteEpisodeCue(first)) {
+    return `继续读《${chapterTitle}》前，上一阶段的冲突推进到了哪一步？`;
+  }
+  return `继续读《${chapterTitle}》前，前文留下的最具体主线变化是什么？`;
+}
+
+function recoveryKindFromExcerpt(text) {
+  const clean = cleanRecoveryText(text);
+  if (/概念|定义|机制|模型|原则/.test(clean)) return "concept";
+  if (/主张|结论|判断|证明/.test(clean)) return "claim";
+  if (/决定|命令|冲突|突破|撤退|转移|会议|部署|战役|战斗/.test(clean)) return "event";
+  return "event";
 }
 
 function recoveryPointTitle(text, index) {
   const clean = cleanRecoveryText(text);
-  if (/赤匪来了|陷入混乱|逃进深山|空荡荡/.test(clean)) return "小镇陷入混乱";
-  if (/巨大灾难|影响深远|恶战|后果/.test(clean)) return "灾难即将展开";
-  if (/不安|空旷|闪现|土黄色|镇口/.test(clean)) return "红军察觉异常";
-  if (/决定|命令|部署|会议|计划/.test(clean)) return "关键决策形成";
-  if (/冲突|危机|突破|撤退|转移|失败|胜利/.test(clean)) return "主线冲突推进";
-  if (/原因|导致|因此|于是|为了|影响/.test(clean)) return "因果线索明确";
-  if (/概念|定义|机制|模型|原则/.test(clean)) return "核心概念出现";
-  const sentence = clean.split(/[。！？；]/).find((item) => item.trim().length >= 8) || clean;
-  return sentence.slice(0, 22) || `关键点 ${index + 1}`;
+  const clause = pickRecoveryTitleClause(clean);
+  if (clause && !isBroadMegaTopic(clause)) return clause;
+  return `关键点 ${index + 1}`;
+}
+
+function pickRecoveryTitleClause(text) {
+  const clean = cleanRecoveryText(text);
+  if (!clean) return "";
+  const sentence = (clean.split(/[。！？；]/).find((item) => item.trim().length >= 8 && hasConcreteEpisodeCue(item)) || "")
+    .trim();
+  if (!sentence) return "";
+  // Prefer a short concrete span from the sentence, never book-specific slogans.
+  const clipped = sentence.length <= 18 ? sentence : `${sentence.slice(0, 16)}…`;
+  if (looksTruncatedRecoveryHint(clipped.replace(/…$/, ""))) return "";
+  return clipped;
 }
 
 function recoveryPointDetail(text) {

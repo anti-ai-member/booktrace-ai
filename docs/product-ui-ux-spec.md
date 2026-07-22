@@ -90,28 +90,29 @@ Chrome, transient reading tools, and recovery/memory cards share one control lan
 ### Reader
 
 - Left icon rail controls primary tools:
-  - Back
   - Theme
   - Directory
   - Bookmarks
   - Notes
-  - Reading index / memory aids
   - AI reading / recovery
-  - Collapse
+  - Back to shelf (bottom of rail)
+
+- Rail icons toggle side content: click once to expand that panel; click the same active icon again to collapse. No standalone collapse-sidebar control. Opening 解惑 from selection bloom still expands the side panel.
 
 - Topbar:
-  - Wide home-style search field.
+  - Icon-only search trigger opens a quiet paper panel anchored under the icon (`Ctrl K`); not a centered marketing modal.
   - Secondary progress/status controls on the right.
 
 - Reading stage:
   - Page-turn reading, no internal scrolling in the page body.
+  - In-book EPUB figures render inline in the page track (quiet centered images); packing reserves their height so glyphs and figures are not clipped.
   - Stable top chapter navigation and bottom page navigation.
   - Chapter controls and page controls must use distinct icons.
   - Chapter/page step controls, page recall, Trace status, and top-right status cluster are **icon-only**; labels appear only via `title` / `aria-label` on hover/focus.
   - Top-right status cluster (Trace + progress + shield) shares one baseline/height.
 
 - Side panels:
-  - Directory, bookmarks, notes, themes, AI settings, and reading indexes use the same left-panel behavior.
+  - Directory, bookmarks, notes, themes, AI settings, and reading indexes use the same left-panel toggle behavior.
   - No floating popovers for primary reader tools.
 
 ## Core Flows
@@ -196,7 +197,10 @@ Rules:
 
 ### Search
 
-- Search opens like home search.
+- Reader search uses an icon-only topbar trigger (and `Ctrl K`), then opens a quiet paper panel anchored under the search icon.
+- Empty query: show this book's recent searches when available; otherwise short guidance only. Do not hard-code book-specific suggestion chips.
+- With a query: clear chapter + quote result list; arrow keys move selection, Enter opens, Esc closes.
+- Shortcut hints stay in tooltips / aria (and a quiet in-panel hint while results show); no noisy Ctrl K / Esc footer chrome.
 - It is for locating original text, entities, or evidence.
 - Search should not become the recall mechanism.
 
@@ -206,12 +210,40 @@ The selection menu is transient.
 
 Actions:
 
-- 解惑
+- 解惑 — opens a left panel with typed assist modes:
+  - 书内出处: locate related passages in the already-read range
+  - 词条简介: short identity/role for a person, place, org, or term
+  - 深意阐释: contextual meaning of a dense / philosophical passage
+  - 概念释义: plain definition of a technical or scholarly concept as used here
+  - 前后因果: why this beat matters given prior read events
 - 回忆
 - 出处
 - 关系 only when local relationship evidence exists
 - 笔记
 - 收藏
+- 删除 — only when the current selection matches one or more persisted 解惑 annotations for this book (same chapter/paragraph + exact or overlapping selection). Hidden when nothing to delete. Click removes the matching explain record(s), clears in-text markers immediately, and closes the bloom.
+
+笔记 rules:
+
+- Saving a note on selected text persists the selection plus paragraph/offset anchors when available, and underlines the annotated span in the page with a quiet solid bottom underline (rose/ink, theme-aware) — distinct from 「解」badges (no badge, no wash).
+- Deleting a note from the sidebar clears storage and the underline immediately.
+- Notes sidebar list order: selection excerpt first, chapter/page source second, note content third. Click still jumps to the annotated location.
+
+解惑 panel rules:
+
+- Chrome is icon-first (少文字、多 icon), matching home/reader rails: mode row and 快速/深思 are icon-only controls with full Chinese labels in `title` / `aria-label` tooltips — not always-on text chips. Active mode/speed uses underline and quiet tint. Header keeps a short「选文解惑」title only; delete and evidence toggle prefer icon affordances (evidence: icon + count). Keep air between header → modes → speed → well with comfortable icon hit targets — never packed micro-type.
+- Mode icons are peer controls; one active mode. Labels remain 书内出处 / 词条简介 / 深意阐释 / 概念释义 / 前后因果 (tooltips only in chrome).
+- Secondary speed icons: 快速 (`deepseek-v4-flash`, thinking off) and 深思 (`deepseek-v4-pro`, thinking on for DeepSeek). Persist preference with AI settings.
+- The answer is the visual prize and stays readable Chinese prose (do not icon-ify the explanation body): soft paper well / inset with serif quote + title, richer line-height, quiet left accent; quote lives inside the well as part of the reveal. Soft opacity/translateY when ready (respect `prefers-reduced-motion`). Optional「豁然开朗」kicker — literary ceremony, not AI dashboard chrome. Paper/ink, restrained green only.
+- Evidence stays secondary, collapsed, and quieter at the bottom — never compete with the answer.
+- Non-source modes may call a read-bounded model; source mode is local cites only.
+- Switching speed refetches non-source answers (cache keyed by mode + speed).
+- Persist every successful 解惑 result per book. Closing the panel must not discard stored explains.
+- Mark the original selection in the page with a quiet badge (default「解」). Multiple explains on the same span collapse to one badge + count.
+- Long hover (~500ms) on a marker shows a compact preview only: mode (+ speed), one-line conclusion (title or first sentence, max ~2 lines), and「依据 ×N · 点击展开」— never the full answer.
+- Preview, reopened 解惑 panel, and the selection bloom (when the selection matches stored explains) all allow deleting; delete removes localStorage and clears the in-text marker immediately. Grouped badges (`解·N`) delete the currently shown item from preview; bloom delete removes all matching explains for that selection group.
+- Click marker reopens the left 解惑 panel with the stored explanation and evidence; do not force a refetch when the mode+speed cache already has an answer.
+- Markers must stay reading-native and low-reflow so page packing / clipping is not emptied.
 
 Dismiss on:
 

@@ -3,8 +3,9 @@ export function buildMemoryEvidenceStore(book, traceIndex = {}) {
   const entityMap = buildEntityMap(traceIndex);
 
   (book?.chapters || []).forEach((chapter, chapterIndex) => {
-    (chapter.paragraphs || []).forEach((text, paragraphIndex) => {
-      const cleanText = normaliseText(text);
+    (chapter.paragraphs || []).forEach((paragraph, paragraphIndex) => {
+      if (paragraph && typeof paragraph === "object" && paragraph.type === "image") return;
+      const cleanText = normaliseText(typeof paragraph === "object" ? paragraph.text : paragraph);
       if (!cleanText) return;
       const id = `${book.id || "book"}:${chapterIndex}:${paragraphIndex}`;
       const entities = entitiesForPosition(entityMap, chapterIndex, paragraphIndex, cleanText);
@@ -41,11 +42,13 @@ export function locateEvidence(store, options = {}) {
   const queryTokens = tokenize(query);
   const queryEntities = extractCandidateEntities(query);
   const scopeCursor = options.scopeCursor || null;
+  const requireTextMatch = Boolean(options.requireTextMatch);
   const candidates = new Map();
 
   addKeywordCandidates(candidates, store, queryTokens);
   addInvertedCandidates(candidates, store, queryEntities);
-  addNearbyTraceCandidates(candidates, store, options.traceIndex);
+  if (!requireTextMatch) addNearbyTraceCandidates(candidates, store, options.traceIndex);
+  if (requireTextMatch) addLiteralTextCandidates(candidates, store, query);
 
   const queryTokenSet = new Set(queryTokens);
   const queryEntitySet = new Set(queryEntities);
@@ -53,10 +56,11 @@ export function locateEvidence(store, options = {}) {
     .map((candidate) => {
       const chunk = store.chunkMap.get(candidate.id);
       if (!chunk || !isWithinScope(chunk, scopeCursor)) return null;
+      if (requireTextMatch && !textIncludesQuery(chunk.text, query)) return null;
       const keywordScore = scoreKeyword(chunk, queryTokenSet, store.keywordIndex.idf);
       const entityScore = scoreEntityOverlap(chunk.entities, queryEntitySet);
       const proximityScore = scoreReadingProximity(chunk, options.currentCursor);
-      const traceScore = scoreTraceImportance(chunk, options.traceIndex);
+      const traceScore = requireTextMatch ? 0 : scoreTraceImportance(chunk, options.traceIndex);
       const score = (0.48 * keywordScore) + (0.22 * entityScore) + (0.18 * proximityScore) + (0.12 * traceScore);
       return {
         ...chunk,
@@ -88,7 +92,9 @@ export function buildMemoryCandidates(chapters = [], traceProfile = null) {
   chapters.forEach((chapter, localChapterIndex) => {
     const chapterIndex = chapter.sourceChapterIndex ?? chapter.chapterIndex ?? localChapterIndex;
     (chapter.paragraphs || []).forEach((item, paragraphIndex) => {
-      const text = typeof item === "string" ? item : item.text;
+      if (item && typeof item === "object" && item.type === "image") return;
+      const text = typeof item === "string" ? item : item?.text;
+      if (!text) return;
       const sourceParagraphIndex = typeof item === "object" ? item.paragraphIndex ?? paragraphIndex : paragraphIndex;
       const occurrence = { chapterIndex, paragraphIndex: sourceParagraphIndex, chapterTitle: chapter.title };
       extractCandidateEntities(text).forEach((entity) => add(classifyCandidateType(entity, traceProfile), entity, occurrence, text));
@@ -192,6 +198,20 @@ function addNearbyTraceCandidates(candidates, store, index = {}) {
     .filter(Boolean)
     .slice(0, 40)
     .forEach((occurrence) => addCandidate(candidates, `${store.bookId}:${occurrence.chapterIndex}:${occurrence.paragraphIndex}`, "trace"));
+}
+
+function addLiteralTextCandidates(candidates, store, query) {
+  const needle = normaliseText(query);
+  if (!needle) return;
+  store.chunks.forEach((chunk) => {
+    if (textIncludesQuery(chunk.text, needle)) addCandidate(candidates, chunk.id, "keyword");
+  });
+}
+
+function textIncludesQuery(text, query) {
+  const needle = normaliseText(query);
+  if (!needle) return false;
+  return normaliseText(text).includes(needle);
 }
 
 function addCandidate(candidates, id, source) {

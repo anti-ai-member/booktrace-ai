@@ -12,12 +12,64 @@ function normalisePath(base, href) {
   return resolved.join("/");
 }
 
-function textFromDocument(source) {
+function imageHrefFromElement(element) {
+  return element.getAttribute("src")
+    || element.getAttribute("href")
+    || element.getAttributeNS("http://www.w3.org/1999/xlink", "href")
+    || element.getAttribute("xlink:href")
+    || "";
+}
+
+async function resolveImageDataUrl(zip, chapterPath, src) {
+  if (!src) return "";
+  if (/^data:/i.test(src)) return src;
+  if (/^(https?:|file:|blob:)/i.test(src)) return "";
+  const chapterDir = chapterPath.split("/").slice(0, -1).join("/");
+  const path = normalisePath(chapterDir, src.split("#")[0]);
+  const entry = zip.file(path);
+  if (!entry) return "";
+  const ext = path.split(".").pop()?.toLowerCase() || "";
+  const mime = ext === "png" ? "image/png"
+    : ext === "gif" ? "image/gif"
+      : ext === "webp" ? "image/webp"
+        : ext === "svg" ? "image/svg+xml"
+          : "image/jpeg";
+  const base64 = await entry.async("base64");
+  return `data:${mime};base64,${base64}`;
+}
+
+async function blocksFromDocument(source, zip, chapterPath) {
   const document = new DOMParser().parseFromString(source, "application/xhtml+xml");
   const heading = document.querySelector("h1, h2, h3")?.textContent?.trim() || "";
-  const paragraphs = [...document.querySelectorAll("p")]
-    .map((paragraph) => paragraph.textContent.replace(/\s+/g, " ").trim())
-    .filter((paragraph) => paragraph.length > 18);
+  const paragraphs = [];
+  const seenSrc = new Set();
+
+  const pushImage = async (element) => {
+    const href = imageHrefFromElement(element);
+    if (!href || seenSrc.has(href)) return;
+    const dataUrl = await resolveImageDataUrl(zip, chapterPath, href);
+    if (!dataUrl) return;
+    seenSrc.add(href);
+    paragraphs.push({
+      type: "image",
+      src: dataUrl,
+      alt: element.getAttribute("alt") || "",
+    });
+  };
+
+  for (const paragraph of document.querySelectorAll("p")) {
+    for (const image of paragraph.querySelectorAll("img, image")) {
+      await pushImage(image);
+    }
+    const text = (paragraph.textContent || "").replace(/\s+/g, " ").trim();
+    if (text.length > 18) paragraphs.push(text);
+  }
+
+  const body = document.querySelector("body") || document.documentElement;
+  for (const image of body.querySelectorAll("img, image")) {
+    if (image.closest("p")) continue;
+    await pushImage(image);
+  }
 
   return { heading, paragraphs };
 }
@@ -53,7 +105,7 @@ export async function parseEpub(file) {
     const path = normalisePath(basePath, item.href);
     const entry = zip.file(path);
     if (!entry) continue;
-    const { heading, paragraphs } = textFromDocument(await entry.async("text"));
+    const { heading, paragraphs } = await blocksFromDocument(await entry.async("text"), zip, path);
     if (paragraphs.length) {
       chapters.push({
         id: `chapter-${index}`,

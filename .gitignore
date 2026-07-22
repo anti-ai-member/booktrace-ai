@@ -5,3 +5,9 @@ dist/
 books/
 public/books/
 audit/
+reports/
+scripts/clipping-verify/
+data/
+*.local.json
+.DS_Store
+Thumbs.db

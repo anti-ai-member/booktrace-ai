@@ -10,6 +10,15 @@ import {
   normalizeBookMemory,
   readingIndexFromBookMemory,
 } from "./src/memoryModels.js";
+import {
+  hasConcreteEpisodeCue,
+  isBroadMegaTopic,
+  isWeakRecoveryHint,
+  preferQuestionAnchor,
+  questionFromEpisodeAnchor,
+  sanitizeModelRecoveryQuestion,
+  sortEvidenceByCursorProximity,
+} from "./src/recoveryQuality.js";
 
 const app = express();
 app.use(express.json({ limit: "12mb" }));
@@ -120,7 +129,7 @@ app.post("/api/recovery-card", async (request, response) => {
     });
     const memory = normalizeBookMemory(bookMemory || traceMemory || {}, { bookId: book.id || book.title, cursor, traceProfile });
     const result = await modelClient.invoke([
-      ["system", "You create concise, evidence-backed continued-reading memory cards. Use only supplied ContextCite evidence. Return JSON only, no Markdown."],
+      ["system", "You create concise, evidence-backed continued-reading memory cards. Use only supplied ContextCite evidence. Prefer concrete near-checkpoint episodes over mega-topics. Return JSON only, no Markdown."],
       ["human", buildRecoveryCardPrompt({ book, cursor, traceProfile, bookMemory: memory, evidence, currentText })],
     ]);
     const parsed = parseJson(messageContent(result));
@@ -141,6 +150,61 @@ app.post("/api/recovery-card", async (request, response) => {
     });
   } catch (error) {
     response.status(502).json({ error: error.message || "Recovery card generation failed" });
+  }
+});
+
+app.post("/api/explain-selection", async (request, response) => {
+  const {
+    provider = "deepseek",
+    model,
+    thinking = false,
+    mode = "meaning",
+    selection = "",
+    book,
+    cursor,
+    bookMemory,
+    evidence = [],
+  } = request.body || {};
+  const allowed = new Set(["entity", "meaning", "concept", "context"]);
+  if (!allowed.has(mode)) return response.status(400).json({ error: "Unsupported explain mode" });
+  const config = PROVIDERS[provider];
+  if (!config) return response.status(400).json({ error: "Unsupported model provider" });
+  const text = String(selection || "").trim();
+  if (!text) return response.status(400).json({ error: "Missing selection text" });
+  if (!book?.title) return response.status(400).json({ error: "Missing book metadata" });
+  if (!Array.isArray(evidence) || !evidence.length) return response.status(400).json({ error: "Missing ContextCite evidence" });
+
+  const apiKey = process.env[config.apiKey];
+  if (!apiKey) return response.status(400).json({ error: `Please configure ${config.apiKey} in .env first` });
+
+  const useThinking = provider === "deepseek" && thinking === true;
+  const resolvedRequestModel = model
+    || (useThinking ? (config.recoveryModel || DEFAULT_RECOVERY_MODEL) : config.defaultModel);
+
+  try {
+    const { client: modelClient, model: resolvedModel } = createModelClient({
+      provider,
+      model: resolvedRequestModel,
+      thinking: useThinking,
+    });
+    const memory = normalizeBookMemory(bookMemory || {}, { bookId: book.id || book.title, cursor });
+    const result = await modelClient.invoke([
+      ["system", "You are a quiet reading assistant for Shumai. Explain only from the selection, supplied evidence, and read-bounded memory. Return JSON only, no Markdown."],
+      ["human", buildSelectionExplainPrompt({ mode, selection: text, book, cursor, bookMemory: memory, evidence })],
+    ]);
+    const parsed = parseJson(messageContent(result));
+    const explanation = normaliseSelectionExplanation(parsed, mode, evidence);
+    if (!explanation?.answer) {
+      return response.status(422).json({
+        error: "Explain selection failed contract",
+        fallback: true,
+        model: resolvedModel,
+        thinking: useThinking,
+      });
+    }
+    response.json({ provider, model: resolvedModel, thinking: useThinking, explanation });
+  } catch (error) {
+    response.status(502).json({ error: error.message || "Explain selection failed" });
   }
 });
 
@@ -209,8 +273,105 @@ app.post("/api/analyze", async (request, response) => {
   }
 });
 
+function buildSelectionExplainPrompt({ mode, selection, book, cursor, bookMemory, evidence }) {
+  const cites = evidence.slice(0, 12).map((item, index) => ({
+    ref: item.cite?.label || item.ref || `[C${index + 1}]`,
+    id: item.cite?.id || item.id || `C${index + 1}`,
+    chapterIndex: item.chapterIndex,
+    paragraphIndex: item.paragraphIndex,
+    chapterTitle: item.chapterTitle,
+    quote: item.quote || item.cite?.quote || item.excerpt,
+  }));
+  const modeGuide = {
+    entity:
+      "Mode entity: give a short introduction for the selected person/place/organization/term as it appears in THIS book. Prefer role, affiliation, and narrative function over encyclopedic biography.",
+    meaning:
+      "Mode meaning: explain the deeper meaning, implication, or philosophical/thematic force of the selected passage. Stay faithful to the text; do not invent doctrines not grounded in evidence.",
+    concept:
+      "Mode concept: define the selected concept or term as used in this book. Distinguish book-local usage from general dictionary sense when evidence supports it.",
+    context:
+      "Mode context: explain the immediate causal frame around the selection — what led here and what it sets up within the read range. Do not spoil unread content.",
+  };
+  return `Explain a reader selection for the reading app "Shumai".
+
+${modeGuide[mode] || modeGuide.meaning}
+
+Rules:
+- Use only the selection, Book Memory, and ContextCite evidence. Do not invent unread spoilers.
+- Every factual claim should prefer citing a supplied evidenceRef such as "C1".
+- Keep the answer quiet and reading-native: clear prose, not a report dashboard.
+- Never output the literal strings undefined, null, or nan.
+
+Return JSON exactly:
+{
+  "mode":"${mode}",
+  "title":"short title <= 12 Chinese chars",
+  "answer":"main explanation, 2-5 short sentences",
+  "highlights":["optional short bullet <= 24 Chinese chars"],
+  "evidenceRefs":["C1","C2"]
+}
+
+Constraints:
+- highlights: 0-3 items only when they add scan value (roles, definitions, causal steps).
+- evidenceRefs: subset of supplied refs that support the answer.
+- answer must be non-empty and grounded.
+
+Book:
+${JSON.stringify(book)}
+
+Checkpoint:
+${JSON.stringify(cursor)}
+
+Book Memory:
+${JSON.stringify(bookMemory || null)}
+
+Selection:
+${JSON.stringify(selection)}
+
+ContextCite evidence:
+${JSON.stringify(cites)}`;
+}
+
+function normaliseSelectionExplanation(raw, mode, evidence) {
+  const evidenceList = (evidence || []).slice(0, 12).map((item, index) => {
+    const ref = item.cite?.label || item.ref || `[C${index + 1}]`;
+    const id = item.cite?.id || item.id || `C${index + 1}`;
+    return {
+      ...item,
+      ref,
+      id,
+      cite: item.cite || { id, label: ref, quote: item.quote || item.excerpt || "" },
+    };
+  });
+  const byRef = new Map();
+  evidenceList.forEach((item) => {
+    [item.ref, item.ref?.replace(/[\[\]]/g, ""), item.id, item.cite?.id, item.cite?.label]
+      .filter(Boolean)
+      .forEach((key) => byRef.set(String(key), item));
+  });
+  const resolveRefs = (refs) =>
+    (Array.isArray(refs) ? refs : [])
+      .map((ref) => byRef.get(String(ref)) || byRef.get(String(ref).replace(/[\[\]]/g, "")))
+      .filter(Boolean);
+  const answer = displayText(raw?.answer || "");
+  if (!answer) return null;
+  const highlights = (Array.isArray(raw?.highlights) ? raw.highlights : [])
+    .map((item) => displayText(item))
+    .filter(Boolean)
+    .slice(0, 3);
+  const resolved = resolveRefs(raw?.evidenceRefs);
+  return {
+    mode: mode || raw?.mode || "meaning",
+    title: displayText(raw?.title || "") || null,
+    answer,
+    highlights,
+    evidence: resolved.length ? resolved : evidenceList.slice(0, 3),
+  };
+}
+
 function buildRecoveryCardPrompt({ book, cursor, traceProfile, bookMemory, traceMemory, evidence, currentText }) {
-  const cites = evidence.slice(0, 16).map((item, index) => ({
+  const ordered = sortEvidenceByCursorProximity(evidence.slice(0, 16), cursor);
+  const cites = ordered.map((item, index) => ({
     ref: item.cite?.label || `[C${index + 1}]`,
     id: item.cite?.id || `C${index + 1}`,
     chapterIndex: item.chapterIndex,
@@ -218,16 +379,18 @@ function buildRecoveryCardPrompt({ book, cursor, traceProfile, bookMemory, trace
     chapterTitle: item.chapterTitle,
     quote: item.quote || item.cite?.quote || item.excerpt,
     matchSources: item.matchSources || [],
+    nearCheckpoint: index < 6,
   }));
   return `Create a continued-reading recovery card for the reading app "Shumai".
 
 Goal:
 - Help the reader quickly restore the MAIN THREAD needed to understand the current checkpoint.
 - The output is not an entity index. It should answer: what prior mainline context matters now, what the current page depends on, and one active-recall question.
-- Be book-type adaptive. For science/textbook books, prefer concepts, mechanisms, definitions, unresolved questions, examples, and argument structure. For history/military/fiction/biography, prefer central actors, organizations, decisions, conflicts, places, timeline turns, and causal links.
+- Be book-type adaptive via the Trace profile. For science/textbook books, prefer concepts, mechanisms, definitions, unresolved questions, examples, and argument structure. For history/military/fiction/biography, prefer central actors, organizations, decisions, conflicts, places, timeline turns, and causal links.
 - Keep only the top 80% high-value memory anchors. Omit minor names, birth/death dates, publication metadata, incidental historical mentions, and place names that do not change understanding of the current page.
 - Do not spoil unread content. Use only the supplied ContextCite evidence and the checkpoint.
 - Every claim must cite one supplied evidenceRef such as "C1". If evidence is weak, omit the claim.
+- BOOK-AGNOSTIC: never invent book-specific templates, fixed entity lists, or year ranges. Ground every field in the supplied evidence and Memory only.
 
 Return JSON exactly:
 {
@@ -236,14 +399,18 @@ Return JSON exactly:
   "positionLabel":"上次读到 ...",
   "keyPoints":[{"title":"","detail":"","evidenceRef":"C1"}],
   "prerequisites":[{"text":"","evidenceRef":"C2"}],
-  "question":{"prompt":"","answer":"","evidenceRef":"C3"},
+  "question":{"prompt":"","hint":"","answer":"","evidenceRef":"C3"},
   "evidenceRefs":["C1","C2","C3"]
 }
 
 Constraints:
-- keyPoints: 2-3 items, each title <= 12 Chinese chars or 5 English words, detail <= 48 Chinese chars or 24 English words.
+- keyPoints: 2-3 items, each title <= 12 Chinese chars or 5 English words, detail <= 48 Chinese chars or 24 English words. Titles must name a concrete episode, decision, person-action, place-beat, concept, or causal link from evidence — not a bare mega-institution.
 - prerequisites: 1-2 items, focused on what must be recalled to understand the current page.
-- question: one active-recall question. Include a "hint" string that nudges the reader without giving the full answer. The answer must be directly supported by cited evidence.
+- question: ONE active-recall question the reader could answer ONLY after reading the cited evidence near the checkpoint. Prefer Memory primary/recent anchors and cites marked nearCheckpoint.
+- question MUST target a concrete recall object: named person action, turning decision, place/battle beat, causal link, definition/mechanism, or unresolved problem — with a specific evidenceRef.
+- FORBIDDEN question centers: mega-topics alone such as 党 / 国家 / 人民 / 历史 / 中国共产党 / 政府 / 军队 / 战争 / 革命 (or English equivalents) unless the SAME prompt also names a concrete evidenced episode.
+- FORBIDDEN templates / slogans: 「X 为什么会影响后面的内容」「关键决策如何形成」「对后续有什么影响」「在历史中的意义」and any encyclopedic prompt answerable without reading this book.
+- hint rules: write one complete Chinese clause or short sentence (or equivalent English) that nudges toward the SAME concrete episode (who/where/what happened). Never hard-cut mid-word or mid-clause. Do not end on fragments such as 「其余的是清」「是湖」「人外，」. Do NOT use abstract process slogans. If evidence is too weak for a clean hint, omit "hint" or set it to "".
 - Every keyPoint, prerequisite, and the question MUST use a real evidenceRef from the supplied list (for example "C1"). Never invent refs. If a claim has no matching cite, omit it.
 - If a quote only mentions incidental names/dates/places, do not turn them into key points.
 - Prefer causal summaries, decisions, conflicts, concepts, unresolved problems, and turning points over raw entity mentions.
@@ -264,12 +431,13 @@ ${JSON.stringify(bookMemory || traceMemory || null)}
 Current newly-read text near checkpoint:
 ${JSON.stringify((currentText || []).slice(-10))}
 
-ContextCite evidence:
+ContextCite evidence (ordered near checkpoint first):
 ${JSON.stringify(cites)}`;
 }
 
 function normaliseRecoveryCard(raw, evidence, book, cursor) {
-  const evidenceList = evidence.slice(0, 16).map((item, index) => normaliseRecoveryEvidence(item, index, book)).filter(Boolean);
+  const orderedEvidence = sortEvidenceByCursorProximity(evidence.slice(0, 16), cursor);
+  const evidenceList = orderedEvidence.map((item, index) => normaliseRecoveryEvidence(item, index, book)).filter(Boolean);
   const byRef = new Map();
   evidenceList.forEach((item) => {
     [item.ref, item.ref?.replace(/[\[\]]/g, ""), item.id, item.cite?.id, item.cite?.label]
@@ -289,7 +457,7 @@ function normaliseRecoveryCard(raw, evidence, book, cursor) {
       detail: displayText(item?.detail).slice(0, 120),
       evidence: resolveEvidence(item?.evidenceRef),
     }))
-    .filter((item) => item.detail && item.evidence)
+    .filter((item) => item.detail && item.evidence && !isWeakRecoveryKeyPoint(item))
     .slice(0, 3);
   const prerequisites = (Array.isArray(raw?.prerequisites) ? raw.prerequisites : [])
     .map((item, index) => ({
@@ -299,8 +467,44 @@ function normaliseRecoveryCard(raw, evidence, book, cursor) {
     }))
     .filter((item) => item.text && item.evidence)
     .slice(0, 2);
-  const questionEvidence = resolveEvidence(raw?.question?.evidenceRef);
-  const chapterTitle = evidenceList[0]?.chapterTitle || `第 ${Number(cursor?.chapterIndex || 0) + 1} 节`;
+  let questionEvidence = resolveEvidence(raw?.question?.evidenceRef);
+  if (!questionEvidence) {
+    questionEvidence = keyPoints[0]?.evidence || evidenceList[0] || null;
+  }
+  const chapterTitle = questionEvidence?.chapterTitle
+    || evidenceList[0]?.chapterTitle
+    || `第 ${Number(cursor?.chapterIndex || 0) + 1} 节`;
+  const fallbackAnchor = preferQuestionAnchor(
+    keyPoints.map((item) => ({
+      name: item.title,
+      title: item.title,
+      summary: item.detail,
+      detail: item.detail,
+      kind: guessRecoveryKind(item),
+      priority: "primary",
+      evidence: item.evidence,
+    })),
+  ) || {
+    name: keyPoints[0]?.title,
+    title: keyPoints[0]?.title,
+    summary: keyPoints[0]?.detail || questionEvidence?.excerpt,
+    detail: keyPoints[0]?.detail || questionEvidence?.excerpt,
+    kind: "event",
+    priority: "recent",
+  };
+  const repaired = sanitizeModelRecoveryQuestion(
+    {
+      prompt: displayText(raw?.question?.prompt),
+      hint: displayText(raw?.question?.hint),
+      answer: displayText(raw?.question?.answer, questionEvidence?.excerpt || evidenceList[0]?.excerpt || ""),
+    },
+    {
+      chapterTitle,
+      fallbackAnchor,
+      evidenceExcerpt: questionEvidence?.excerpt || keyPoints[0]?.detail || "",
+    },
+  );
+  const hint = sanitizeRecoveryHint(repaired.hint);
   return {
     intensity: ["light", "medium", "deep", "fresh"].includes(raw?.intensity) ? raw.intensity : "medium",
     absenceLabel: displayText(raw?.absenceLabel, "继续阅读前"),
@@ -308,14 +512,30 @@ function normaliseRecoveryCard(raw, evidence, book, cursor) {
     keyPoints,
     prerequisites,
     question: {
-      prompt: displayText(raw?.question?.prompt, "继续前，先回想上一页的关键变化是什么？"),
-      hint: displayText(raw?.question?.hint),
-      answer: displayText(raw?.question?.answer, questionEvidence?.excerpt || evidenceList[0]?.excerpt || ""),
+      prompt: repaired.prompt || questionFromEpisodeAnchor(fallbackAnchor, chapterTitle),
+      hint: hint && !isWeakRecoveryHint(hint) ? hint : "",
+      answer: repaired.answer || questionEvidence?.excerpt || evidenceList[0]?.excerpt || "",
       evidence: questionEvidence,
     },
     evidence: evidenceList.slice(0, 6),
     sourceBook: { title: displayText(book?.title), creator: displayText(book?.creator) },
   };
+}
+
+function isWeakRecoveryKeyPoint(item) {
+  const title = displayText(item?.title);
+  const detail = displayText(item?.detail);
+  if (!title || !detail) return true;
+  if (isBroadMegaTopic(title) && !hasConcreteEpisodeCue(`${title} ${detail}`)) return true;
+  return false;
+}
+
+function guessRecoveryKind(item) {
+  const blob = `${item?.title || ""} ${item?.detail || ""}`;
+  if (/概念|定义|机制|模型|原则|framework|mechanism|definition/i.test(blob)) return "concept";
+  if (/主张|结论|判断|证明|claim|conclusion/i.test(blob)) return "claim";
+  if (/决定|命令|冲突|突破|撤退|转移|会议|部署|战役|战斗|event|battle/i.test(blob)) return "event";
+  return "event";
 }
 
 function normaliseRecoveryEvidence(item, index = 0, book = null) {
@@ -644,6 +864,37 @@ function displayText(value, fallback = "") {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   if (!text || /^(undefined|null|nan)$/i.test(text)) return fallback;
   return text;
+}
+
+/** Drop incomplete / hard-cut recovery hints rather than inventing or showing garbage. */
+function sanitizeRecoveryHint(value) {
+  const text = displayText(value);
+  if (!text) return "";
+  if (looksTruncatedRecoveryHint(text)) return "";
+  return text.slice(0, 96);
+}
+
+function looksTruncatedRecoveryHint(value) {
+  const text = String(value || "")
+    .replace(/^提示[：:]\s*/, "")
+    .replace(/^回到这条线索[—\-–]+\s*/, "")
+    .replace(/^先回想[—\-–]+\s*/, "")
+    .trim();
+  if (!text || text.length < 4) return true;
+  if (/^(undefined|null|nan)$/i.test(text)) return true;
+  // Peel a trailing stop so wrappers like 「……是清。」 still fail.
+  const core = text.replace(/[。！？…]+$/g, "").trim();
+  if (!core || core.length < 4) return true;
+  if (/[，、：:；;（(\[\{「『《【]$/.test(core)) return true;
+  if (/(?:其余的是|除了|以及|还有|就是|乃是|并非|不是)[\u4e00-\u9fff]?$/.test(core)) return true;
+  if (/[的地得了着过与和及以于]$/.test(core)) return true;
+  if (/(?:人外，|外，其余|是清|是湖|是四|是贵|是江)$/.test(core)) return true;
+  const comma = Math.max(core.lastIndexOf("，"), core.lastIndexOf(","));
+  if (comma >= 0) {
+    const tail = core.slice(comma + 1).trim();
+    if (tail.length > 0 && tail.length <= 6 && !/(什么|何处|哪|谁|如何|为何|哪一步)$/.test(tail)) return true;
+  }
+  return false;
 }
 
 function clamp(value, min, max) {
