@@ -19,7 +19,7 @@ button, input { font: inherit; } button { border: 0; background: none; color: in
 
 /* Page-reading mode: one stable page at a time, without an internal scroll area. */
 .reading-stage { grid-template-rows: 48px minmax(0, 1fr) 48px; }
-.epub-page { width: min(900px, calc(100% - 80px)); min-height: 0; padding: 26px 0 20px; overflow: hidden; font-size: 18px; line-height: 1.74; letter-spacing: .018em; }
+.epub-page { width: min(900px, calc(100% - 80px)); min-height: 0; padding: 26px 0 20px; overflow: hidden; font-size: 18px; line-height: 1.68; letter-spacing: .018em; }
 .page-title-row { display: flex; align-items: baseline; justify-content: space-between; margin: 0 0 20px; padding-bottom: 13px; border-bottom: 1px solid var(--line); }
 .page-title-row h1 { margin: 0; font-size: 24px; font-weight: 600; }.page-title-row span { color: var(--muted); font: 12px "Microsoft YaHei UI", sans-serif; }
 .page-copy { max-height: 100%; overflow: hidden; }.epub-page p { margin: 0 0 13px; }.epub-page p.is-continuation { text-indent: 0; }
@@ -85,7 +85,7 @@ html, body, #root { height: 100%; overflow: hidden; }
 .reader-tabs { overflow-x: auto; scrollbar-width: none; }.reader-tabs::-webkit-scrollbar { display: none; }.reader-tabs button { flex: 0 0 auto; padding: 0 9px; white-space: nowrap; }
 .reader-shell.sidebar-collapsed { grid-template-columns: 0 minmax(0, 1fr); }.reader-shell.sidebar-collapsed .reader-sidebar { display: none; }.reader-shell.sidebar-collapsed .reader-topbar { grid-template-columns: auto 1fr auto auto; }.reader-shell.sidebar-collapsed .context-drawer { left: 0; }
 .reader-tabs { display: flex; align-items: center; gap: 8px; padding: 0 13px; overflow: visible; }.reader-tabs .directory-tab { flex: 0 0 auto; height: 58px; padding: 0 10px; border-bottom: 2px solid transparent; color: var(--muted); font-size: 13px; }.reader-tabs .directory-tab.active { border-bottom-color: var(--accent); color: var(--accent); font-weight: 700; }.facet-picker { position: relative; display: inline-flex; align-items: center; gap: 5px; min-width: 0; padding: 6px 7px; border: 1px solid #dce3db; border-radius: 5px; color: #66806c; background: #f7faf6; }.facet-picker select { min-width: 0; max-width: 165px; padding: 0 16px 0 0; border: 0; outline: 0; color: #526258; background: transparent; font: 12px "Microsoft YaHei UI", sans-serif; appearance: none; }.facet-picker svg:last-child { position: absolute; right: 6px; pointer-events: none; }.facet-picker:focus-within { border-color: #7da688; box-shadow: 0 0 0 3px #e8f1e9; }.facet-picker:has(select:not([value=""])) { color: var(--accent); background: #edf5ee; }
-.page-copy { position: relative; }.page-copy.turn-next .page-track { animation: page-enter-next .24s cubic-bezier(.2,.72,.25,1) both; }.page-copy.turn-previous .page-track { animation: page-enter-previous .24s cubic-bezier(.2,.72,.25,1) both; }@keyframes page-enter-next { from { opacity: .28; transform: translateX(20px); } to { opacity: 1; transform: translateX(0); } }@keyframes page-enter-previous { from { opacity: .28; transform: translateX(-20px); } to { opacity: 1; transform: translateX(0); } }@media (prefers-reduced-motion: reduce) { .page-copy.turn-next .page-track, .page-copy.turn-previous .page-track { animation: none; } }
+.page-copy { position: relative; }.page-copy.turn-next .page-track { animation: page-enter-next .2s cubic-bezier(.2,.72,.25,1) both; }.page-copy.turn-previous .page-track { animation: page-enter-previous .2s cubic-bezier(.2,.72,.25,1) both; }@keyframes page-enter-next { from { transform: translateX(14px); } to { transform: translateX(0); } }@keyframes page-enter-previous { from { transform: translateX(-14px); } to { transform: translateX(0); } }@media (prefers-reduced-motion: reduce) { .page-copy.turn-next .page-track, .page-copy.turn-previous .page-track { animation: none; } }
 .open-context { bottom: 68px; }
 .facet-index { padding: 14px 10px; }.facet-index > span { color: var(--accent); font-size: 11px; }.facet-index h2 { margin: 7px 0 9px; color: var(--ink); font-size: 15px; }.facet-index p { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
 .entity-index { gap: 8px; }.entity-index > header { padding-bottom: 10px; }.entity-group { gap: 5px; }.entity-row { gap: 5px; padding: 10px 10px 9px; border: 1px solid #e0e8df; border-left: 3px solid #7da78a; border-radius: 5px; background: #fcfdfb; }.entity-row:hover { border-color: #b8d0bc; border-left-color: #2f6b4e; background: #f1f7f1; }.entity-row-heading { display: flex; align-items: center; justify-content: space-between; gap: 7px; min-width: 0; }.entity-row b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.entity-row span { display: block; overflow: hidden; color: #788278; font: 11px/1.35 "Songti SC", serif; text-overflow: ellipsis; white-space: nowrap; }.entity-attributes { flex: 0 0 auto; margin: 0; overflow: hidden; flex-wrap: nowrap; }.entity-attributes i { padding: 2px 4px; background: #e8f1e8; font-size: 9px; white-space: nowrap; }.recent-entities { padding: 9px 0 0; }.recent-entities h3 { margin-bottom: 5px; }.entity-row.compact { gap: 0; padding: 7px 8px; border: 0; border-left: 2px solid #c8d6c9; border-radius: 0; }.entity-row.compact .entity-row-heading { justify-content: flex-start; }.entity-row.compact span, .entity-row.compact .entity-attributes { display: none; }.secondary-entities summary { padding: 9px 5px; }
@@ -5393,18 +5393,8 @@ body { background: var(--desk-paper); }
   width: 100%;
   min-width: 0;
   min-height: 0;
-  padding-bottom: 16px;
+  padding: 0;
   box-sizing: border-box;
-}
-
-.page-copy > .page-track {
-  width: 100%;
-  min-width: 0;
-  height: auto !important;
-  max-height: none;
-  min-height: 0;
-  column-width: auto;
-  column-gap: 0;
 }
 
 .reading-stage > .chapter-toolbar {
@@ -7228,3 +7218,70 @@ body { background: var(--desk-paper); }
   }
 }
 
+/* Feature 016: Kindle-like native pagination.
+   A fixed-height multi-column track makes the browser's actual glyph layout the
+   only page-break authority. Horizontal clipping is intentional; vertical
+   overflow and character-budget clipping are not. */
+.reading-stage > .epub-page {
+  overflow: visible;
+}
+
+.epub-page > .page-copy {
+  position: relative;
+  flex: 1 1 auto;
+  width: 100%;
+  height: auto;
+  min-height: 0;
+  overflow: visible;
+  padding: 0;
+  contain: layout;
+  clip-path: inset(-100vh 0);
+}
+
+.epub-page > .page-copy > .page-track {
+  width: 100%;
+  height: 100% !important;
+  min-width: 0;
+  min-height: 0;
+  max-height: none;
+  column-width: var(--page-width);
+  column-gap: 0;
+  column-fill: auto;
+  will-change: transform;
+  transition: transform .2s cubic-bezier(.2, .72, .25, 1);
+}
+
+.page-copy.turn-next > .page-track,
+.page-copy.turn-previous > .page-track {
+  animation: none !important;
+}
+
+.page-copy.is-pagination-settling > .page-track {
+  visibility: hidden;
+  transition: none;
+}
+
+.page-copy.is-pagination-ready > .page-track {
+  visibility: visible;
+}
+
+.epub-page > .page-copy > .page-track > p {
+  break-inside: auto;
+  orphans: 2;
+  widows: 2;
+}
+
+.epub-page > .page-copy > .page-track > .page-figure {
+  break-inside: avoid;
+  max-height: calc(var(--page-height) - 12px);
+}
+
+.epub-page > .page-copy > .page-track > .page-figure .page-image {
+  max-height: min(42vh, calc(var(--page-height) - 24px));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .epub-page > .page-copy > .page-track {
+    transition: none;
+  }
+}

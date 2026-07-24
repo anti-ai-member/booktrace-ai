@@ -7,6 +7,8 @@ public/books/
 audit/
 reports/
 scripts/clipping-verify/
+/build-out.txt
+/verify-page-fill-out.txt
 data/
 *.local.json
 .DS_Store

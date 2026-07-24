@@ -1043,4 +1043,14 @@ function buildSummary(index, cursor) {
   };
 }
 
-app.listen(8787, "127.0.0.1", () => console.log("AI analysis service listening on http://127.0.0.1:8787"));
+const server = app.listen(8787, "127.0.0.1", () => {
+  console.log("AI analysis service listening on http://127.0.0.1:8787");
+});
+server.on("error", (error) => {
+  if (error?.code === "EADDRINUSE") {
+    console.error("Port 8787 is already in use. Stop the other node server.mjs and retry.");
+  } else {
+    console.error("AI analysis service failed to start:", error);
+  }
+  process.exit(1);
+});

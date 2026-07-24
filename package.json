@@ -7,6 +7,7 @@
     "dev": "concurrently -k -n api,web -c green,cyan \"node server.mjs\" \"vite\"",
     "build": "vite build",
     "preview": "vite preview",
+    "verify:pagination": "node scripts/verify-page-fill.mjs",
     "trace:evaluate": "node scripts/trace-eval.mjs",
     "trace:evaluate:live": "node scripts/trace-eval.mjs --live",
     "trace:evaluate:judge": "node scripts/trace-eval.mjs --live --judge"

@@ -299,6 +299,30 @@ Phase 9 quality gate:
 
 ---
 
+## Phase 10: Native Reader Pagination
+
+Status: complete (Verified).
+
+Goal:
+
+Make the browser's native glyph layout the only pagination authority so every
+page fills naturally without clipping partial lines.
+
+### Feature 016 - Native column pagination
+
+- Render the complete chapter in a fixed-height CSS multi-column track.
+- Derive page count and paragraph anchors from measured DOM fragments.
+- Preserve the nearest paragraph when the reader workspace width changes.
+- Restore chapter, page, paragraph, and within-paragraph page offset per book.
+- Verify three desktop viewport sizes with zero clipped fragments.
+
+Phase 10 quality gate:
+
+- `npm run verify:pagination` passes at 1365x768, 1440x900, and 1920x1080.
+- `npm run build` passes.
+
+---
+
 ## Deferred (explicitly out of current phases)
 
 - Large PDF conversion / OCR until Memory quality is stable.

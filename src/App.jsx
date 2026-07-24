@@ -381,7 +381,8 @@ export function App() {
   const [pageCount, setPageCount] = useState(1);
   const [pageWidth, setPageWidth] = useState(900);
   const [pageHeight, setPageHeight] = useState(720);
-  const [pagePackScale, setPagePackScale] = useState(1);
+  const [paginationReady, setPaginationReady] = useState(false);
+  const [paragraphPageMap, setParagraphPageMap] = useState({});
   const [activePanel, setActivePanel] = useState("目录");
   const [selectedParagraph, setSelectedParagraph] = useState(null);
   const [selectionBloom, setSelectionBloom] = useState(null);
@@ -418,19 +419,19 @@ export function App() {
   const pageTrackRef = useRef(null);
   const pageSizeRef = useRef({ width: 900, height: 720 });
   const readingAnchorRef = useRef({ paragraphIndex: 0, charOffset: 0 });
-  const layoutMetricsRef = useRef({ width: 900, height: 720, packScale: 1 });
+  const pendingLayoutAnchorRef = useRef(null);
   const layoutRestoreRef = useRef(false);
   const didInitialPageMeasureRef = useRef(false);
-  // Chapter pack plan: settle once, then freeze so page turns cannot rewrite pageCount.
-  const packPlanRef = useRef({ locked: false, safetyApplied: false });
+  const pendingParagraphRef = useRef(null);
+  const pendingChapterEndRef = useRef(false);
   const recoveryCardJobRef = useRef(0);
   const readingStartedAtRef = useRef(Date.now());
 
   useEffect(() => {
     didInitialPageMeasureRef.current = false;
     layoutRestoreRef.current = false;
+    pendingLayoutAnchorRef.current = null;
     pageSizeRef.current = { width: 900, height: 720 };
-    layoutMetricsRef.current = { width: 900, height: 720, packScale: 1 };
   }, [book?.id, screen]);
 
   useEffect(() => { localStorage.setItem("yuezhi-categories", JSON.stringify(categories)); }, [categories]);
@@ -444,10 +445,17 @@ export function App() {
   }, [book?.id, book?.title, book?.creator, book?.chapters.length]);
 
   useEffect(() => {
-    if (!book) return;
+    if (!book || screen !== "reader" || !paginationReady) return;
     const storageKey = readingPositionStorageKey(book);
-    localStorage.setItem(storageKey, JSON.stringify({ chapterIndex, pageIndex, updatedAt: Date.now() }));
-  }, [book, chapterIndex, pageIndex]);
+    const anchor = readingAnchorRef.current;
+    localStorage.setItem(storageKey, JSON.stringify({
+      chapterIndex,
+      pageIndex,
+      paragraphIndex: Number.isInteger(anchor?.paragraphIndex) ? anchor.paragraphIndex : null,
+      pageOffset: Math.max(0, Number(anchor?.pageOffset) || 0),
+      updatedAt: Date.now(),
+    }));
+  }, [book, chapterIndex, pageIndex, paginationReady, screen]);
   useEffect(() => { localStorage.setItem("yuezhi-ai-settings", JSON.stringify(analysisSettings)); }, [analysisSettings]);
   useEffect(() => { localStorage.setItem("yuezhi-reading-theme", JSON.stringify(readingTheme)); }, [readingTheme]);
   useEffect(() => { localStorage.setItem("yuezhi-reading-progress", JSON.stringify(readingProgress)); }, [readingProgress]);
@@ -606,25 +614,26 @@ export function App() {
   }, [recoveryCard]);
 
   const chapter = book?.chapters[chapterIndex];
-  const chapterPage = useMemo(
-    () => paginateChapterWindow(chapter, pageIndex, pageWidth, pageHeight, pagePackScale),
-    [chapter, pageIndex, pageWidth, pageHeight, pagePackScale],
-  );
-  const visiblePageIndex = Math.min(pageIndex, Math.max(0, chapterPage.pageCount - 1));
-  const currentPageParagraphs = chapterPage.items || [];
+  const chapterItems = useMemo(() => (chapter?.paragraphs || []).map((paragraph, paragraphIndex) => (
+    isImageParagraph(paragraph)
+      ? { type: "image", src: paragraph.src, alt: paragraph.alt || "", text: "", paragraphIndex, segmentIndex: 0 }
+      : { text: paragraphPlainText(paragraph).trim(), paragraphIndex, segmentIndex: 0 }
+  )).filter((item) => item.type === "image" || item.text), [chapter]);
+  const visiblePageIndex = Math.min(pageIndex, Math.max(0, pageCount - 1));
+  const currentPageParagraphs = useMemo(() => chapterItems.filter((item) => {
+    const range = paragraphPageMap[item.paragraphIndex];
+    return range ? range.start <= visiblePageIndex && range.end >= visiblePageIndex : visiblePageIndex === 0;
+  }), [chapterItems, paragraphPageMap, visiblePageIndex]);
   const hasPriorReadingContext = chapterIndex > 0 || visiblePageIndex > 0;
+
   useEffect(() => {
     function updatePageMetrics() {
       const viewport = pageCopyRef.current;
       if (!viewport) return;
       const width = Math.round(viewport.clientWidth);
-      const style = window.getComputedStyle(viewport);
-      const padY = (Number.parseFloat(style.paddingTop) || 0) + (Number.parseFloat(style.paddingBottom) || 0);
-      // Budget against the content box only — padding is reserved for glyph clearance.
-      const height = Math.round(viewport.clientHeight - padY);
+      const height = Math.round(viewport.clientHeight);
       if (width <= 0 || height <= 0) return;
       const prev = pageSizeRef.current;
-      // Ignore ±1–2px ResizeObserver jitter so charBudget / pageCount stay stable while flipping.
       const PAGE_SIZE_HYSTERESIS_PX = 2;
       if (
         didInitialPageMeasureRef.current
@@ -635,9 +644,9 @@ export function App() {
       }
       const sizeShifted = Math.abs(prev.width - width) >= 24 || Math.abs(prev.height - height) >= 24;
       if (didInitialPageMeasureRef.current && sizeShifted) {
+        pendingLayoutAnchorRef.current = { ...readingAnchorRef.current };
         layoutRestoreRef.current = true;
-        packPlanRef.current = { locked: false, safetyApplied: false };
-        setPagePackScale(1);
+        setPaginationReady(false);
       }
       didInitialPageMeasureRef.current = true;
       pageSizeRef.current = { width, height };
@@ -654,42 +663,46 @@ export function App() {
     };
   }, [chapter, screen, sidebarCollapsed, relationshipOpen]);
 
-  // Pack scale is chapter-scoped: reset only when chapter changes (or on meaningful viewport resize above).
-  // Never reset on pageIndex — that made totals oscillate as each page re-measured overflow.
   useEffect(() => {
-    packPlanRef.current = { locked: false, safetyApplied: false };
-    setPagePackScale(1);
+    setPaginationReady(false);
+    setParagraphPageMap({});
+    pendingLayoutAnchorRef.current = null;
   }, [chapter?.id]);
 
-  useEffect(() => {
-    const nextCount = Math.max(1, chapterPage.pageCount);
-    setPageCount(nextCount);
-    setPageIndex((index) => Math.min(index, nextCount - 1));
-  }, [chapterPage.pageCount]);
-
-  // Keep a paragraph/char anchor for the visible page so layout-driven repacks can restore position.
   useLayoutEffect(() => {
-    if (!currentPageParagraphs.length) return;
+    if (!paginationReady || layoutRestoreRef.current || !currentPageParagraphs.length) return;
     const preferred = [
       selectionAssist?.paragraphIndex,
       selectionBloom?.paragraphIndex,
       selectedParagraph,
     ].find((value) => Number.isInteger(value));
-    const metrics = getLogicalPageMetrics(pageWidth, pageHeight, pagePackScale);
 
     if (Number.isInteger(preferred)) {
-      const match = currentPageParagraphs.find((item) => item.paragraphIndex === preferred);
       let charOffset = 0;
       if (selectionAssist?.paragraphIndex === preferred && Number.isInteger(selectionAssist?.startOffset)) {
         charOffset = selectionAssist.startOffset;
       } else if (selectionBloom?.paragraphIndex === preferred && Number.isInteger(selectionBloom?.startOffset)) {
         charOffset = selectionBloom.startOffset;
-      } else if (match) {
-        charOffset = Math.max(0, (Number(match.segmentIndex) || 0) * metrics.longSegmentSize);
       }
       readingAnchorRef.current = {
         paragraphIndex: preferred,
         charOffset: Math.max(0, charOffset),
+        pageOffset: Math.max(0, visiblePageIndex - (paragraphPageMap[preferred]?.start || 0)),
+      };
+      return;
+    }
+
+    const existingAnchor = readingAnchorRef.current;
+    if (
+      Number.isInteger(existingAnchor?.paragraphIndex)
+      && currentPageParagraphs.some((item) => item.paragraphIndex === existingAnchor.paragraphIndex)
+    ) {
+      readingAnchorRef.current = {
+        ...existingAnchor,
+        pageOffset: Math.max(
+          0,
+          visiblePageIndex - (paragraphPageMap[existingAnchor.paragraphIndex]?.start || 0),
+        ),
       };
       return;
     }
@@ -697,140 +710,104 @@ export function App() {
     const first = currentPageParagraphs[0];
     readingAnchorRef.current = {
       paragraphIndex: first.paragraphIndex,
-      charOffset: Math.max(0, (Number(first.segmentIndex) || 0) * metrics.longSegmentSize),
+      charOffset: 0,
+      pageOffset: Math.max(0, visiblePageIndex - (paragraphPageMap[first.paragraphIndex]?.start || 0)),
     };
-  }, [currentPageParagraphs, selectionAssist, selectionBloom, selectedParagraph, pageWidth, pageHeight, pagePackScale]);
-
-  // After .page-copy resizes (sidebar / relation panel) or pack-scale settles, remap pageIndex from the reading anchor.
-  useEffect(() => {
-    const prev = layoutMetricsRef.current;
-    const widthChanged = prev.width !== pageWidth;
-    const heightChanged = prev.height !== pageHeight;
-    const scaleChanged = prev.packScale !== pagePackScale;
-    layoutMetricsRef.current = { width: pageWidth, height: pageHeight, packScale: pagePackScale };
-    if (!chapter || !layoutRestoreRef.current) return;
-    if (!widthChanged && !heightChanged && !scaleChanged) return;
-
-    const anchor = readingAnchorRef.current;
-    if (!Number.isInteger(anchor?.paragraphIndex)) return;
-    const nextIndex = findPageForParagraphInChapter(
-      chapter,
-      anchor.paragraphIndex,
-      pageWidth,
-      pageHeight,
-      pagePackScale,
-      anchor.charOffset,
-    );
-    setPageIndex((current) => (current === nextIndex ? current : nextIndex));
-  }, [pageWidth, pageHeight, pagePackScale, chapter]);
+  }, [currentPageParagraphs, selectionAssist, selectionBloom, selectedParagraph, paginationReady, paragraphPageMap, visiblePageIndex]);
 
   useEffect(() => {
     const viewport = pageCopyRef.current;
     if (!viewport || viewport.clientWidth <= 0) return;
     viewport.scrollLeft = 0;
-  }, [pageIndex, pageWidth, pageHeight]);
+  }, [pageIndex]);
 
-  useEffect(() => {
-    const viewport = pageCopyRef.current;
-    const track = pageTrackRef.current;
-    if (!viewport || !track || !currentPageParagraphs.length) return undefined;
-    // Avoid measuring mid page-turn animation (transform can skew rects).
-    if (pageTurn) return undefined;
+  // Native multi-column layout is the pagination source of truth. The browser that
+  // wraps glyphs also decides page breaks, so no character budget can clip half-lines.
+  useLayoutEffect(() => {
+    if (!chapter || !chapterItems.length || pageWidth <= 0 || pageHeight <= 0) return undefined;
     let cancelled = false;
     let frame = 0;
+    let fontCancelled = false;
 
-    function shrinkPackScale(ratio) {
-      layoutRestoreRef.current = true;
-      packPlanRef.current.locked = false;
-      setPagePackScale((scale) => {
-        const next = Math.max(0.3, Math.min(scale * ratio, scale - 0.06));
-        return Math.round(next * 100) / 100;
-      });
-    }
-
-    function measureOverflow() {
+    function measureColumns() {
       if (cancelled) return;
-      const copyBox = viewport.getBoundingClientRect();
-      const blocks = track.querySelectorAll("p, figure.page-figure");
-      if (!blocks.length || copyBox.height <= 0) return;
-      const last = blocks[blocks.length - 1];
-      const lastBottom = last.getBoundingClientRect().bottom;
-      const style = window.getComputedStyle(viewport);
-      const padBottom = Number.parseFloat(style.paddingBottom) || 0;
-      // overflow:hidden clips at the padding edge; keep a one-line band above it.
-      const clipFloor = copyBox.bottom;
-      const safetyPx = Math.max(26, padBottom + 12);
-      const softLimit = clipFloor - safetyPx;
-      const fitsSoft = lastBottom <= softLimit + 0.5;
-      const hardClipped = lastBottom > clipFloor + 0.5;
+      const viewport = pageCopyRef.current;
+      const track = pageTrackRef.current;
+      if (!viewport || !track) return;
+      const width = viewport.clientWidth;
+      const height = viewport.clientHeight;
+      if (width < 80 || height < 80) return;
 
-      // After the chapter pack plan locks, ignore soft overflow so page turns cannot rewrite totals.
-      // Still unlock + shrink on hard clipping past the padding edge.
-      if (packPlanRef.current.locked) {
-        if (!hardClipped) return;
-        const overflowPx = lastBottom - softLimit;
-        const usable = Math.max(copyBox.height, 1);
-        const ratio = Math.max(0.45, (usable - safetyPx - overflowPx) / usable);
-        shrinkPackScale(ratio);
-        return;
-      }
+      const nextCount = Math.max(1, Math.ceil((track.scrollWidth - 1) / width));
+      const viewportBox = viewport.getBoundingClientRect();
+      const translatedOffset = visiblePageIndex * width;
+      const nextMap = {};
+      track.querySelectorAll("[data-paragraph-index]").forEach((element) => {
+        const paragraphIndex = Number(element.dataset.paragraphIndex);
+        if (!Number.isInteger(paragraphIndex)) return;
+        const pages = [...element.getClientRects()].map((rect) => Math.max(0, Math.floor((rect.left - viewportBox.left + translatedOffset + 1) / width)));
+        if (!pages.length) return;
+        nextMap[paragraphIndex] = { start: Math.min(...pages), end: Math.max(...pages) };
+      });
 
-      if (fitsSoft) {
-        const gap = softLimit - lastBottom;
-        // One-time tight-fit haircut so denser later pages are less likely to hard-clip.
-        if (!packPlanRef.current.safetyApplied && gap < 56) {
-          packPlanRef.current.safetyApplied = true;
-          layoutRestoreRef.current = true;
-          setPagePackScale((scale) => Math.max(0.3, Math.round(scale * 0.97 * 100) / 100));
-          return;
+      setParagraphPageMap(nextMap);
+      setPageCount(nextCount);
+      setPageIndex((current) => {
+        if (pendingChapterEndRef.current) {
+          pendingChapterEndRef.current = false;
+          return nextCount - 1;
         }
-        packPlanRef.current.safetyApplied = true;
-        packPlanRef.current.locked = true;
-        layoutRestoreRef.current = false;
-        return;
-      }
-
-      const overflowPx = lastBottom - softLimit;
-      const usable = Math.max(copyBox.height, 1);
-      // Shrink just enough to clear the clip; avoid the old *0.8 overshoot that re-underfilled pages.
-      const ratio = Math.max(0.45, (usable - safetyPx - overflowPx) / usable);
-      packPlanRef.current.safetyApplied = true;
-      shrinkPackScale(ratio);
+        const pending = pendingParagraphRef.current;
+        if (pending?.chapterIndex === chapterIndex && nextMap[pending.paragraphIndex]) {
+          pendingParagraphRef.current = null;
+          const range = nextMap[pending.paragraphIndex];
+          return Math.min(range.end, range.start + Math.max(0, Number(pending.pageOffset) || 0));
+        }
+        if (layoutRestoreRef.current) {
+          layoutRestoreRef.current = false;
+          const anchor = pendingLayoutAnchorRef.current || readingAnchorRef.current;
+          pendingLayoutAnchorRef.current = null;
+          const range = nextMap[anchor?.paragraphIndex];
+          if (range) {
+            return Math.min(range.end, range.start + Math.max(0, Number(anchor?.pageOffset) || 0));
+          }
+        }
+        return Math.min(Math.max(current, 0), nextCount - 1);
+      });
+      setPaginationReady(true);
     }
 
     function scheduleMeasure() {
+      cancelAnimationFrame(frame);
       frame = requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          if (cancelled) return;
-          const pendingImages = [...track.querySelectorAll("img.page-image")].filter((img) => !img.complete);
-          if (!pendingImages.length) {
-            measureOverflow();
-            return;
-          }
-          let remaining = pendingImages.length;
-          const onReady = () => {
-            remaining -= 1;
-            if (remaining > 0 || cancelled) return;
-            measureOverflow();
-          };
-          pendingImages.forEach((img) => {
-            img.addEventListener("load", onReady, { once: true });
-            img.addEventListener("error", onReady, { once: true });
-          });
-        });
+        frame = requestAnimationFrame(measureColumns);
       });
     }
 
     scheduleMeasure();
+    const images = [...(pageTrackRef.current?.querySelectorAll("img.page-image") || [])];
+    images.forEach((image) => {
+      if (!image.complete) {
+        image.addEventListener("load", scheduleMeasure, { once: true });
+        image.addEventListener("error", scheduleMeasure, { once: true });
+      }
+    });
+    if (document.fonts?.ready) {
+      document.fonts.ready.then(() => {
+        if (!fontCancelled) scheduleMeasure();
+      });
+    }
+
     return () => {
       cancelled = true;
+      fontCancelled = true;
       cancelAnimationFrame(frame);
     };
-  }, [currentPageParagraphs, pageWidth, pageHeight, pagePackScale, pageTurn]);
+  }, [chapter, chapterItems, chapterIndex, pageWidth, pageHeight, explains, notes]);
 
   useEffect(() => {
     if (!pageTurn) return undefined;
-    const timeout = window.setTimeout(() => setPageTurn(""), 260);
+    const timeout = window.setTimeout(() => setPageTurn(""), 220);
     return () => window.clearTimeout(timeout);
   }, [pageTurn, pageIndex]);
   const progress = book ? Math.round(((chapterIndex + 1) / book.chapters.length) * 100) : 0;
@@ -982,6 +959,20 @@ export function App() {
     recoveryCardJobRef.current += 1;
     const jobId = recoveryCardJobRef.current;
     const sameBook = book && storageBookIdentity(book) === storageBookIdentity(nextBook);
+    pendingParagraphRef.current = Number.isInteger(saved.paragraphIndex)
+      ? {
+        chapterIndex: Math.min(Math.max(saved.chapterIndex || 0, 0), nextBook.chapters.length - 1),
+        paragraphIndex: saved.paragraphIndex,
+        pageOffset: Math.max(0, Number(saved.pageOffset) || 0),
+      }
+      : null;
+    if (pendingParagraphRef.current) {
+      readingAnchorRef.current = {
+        paragraphIndex: pendingParagraphRef.current.paragraphIndex,
+        charOffset: 0,
+        pageOffset: pendingParagraphRef.current.pageOffset,
+      };
+    }
     const commitReaderOpen = () => {
       if (!sameBook) setBook(nextBook);
       setChapterIndex(Math.min(Math.max(saved.chapterIndex || 0, 0), nextBook.chapters.length - 1));
@@ -1097,6 +1088,8 @@ export function App() {
 
   function selectChapter(index) {
     layoutRestoreRef.current = false;
+    pendingParagraphRef.current = null;
+    pendingChapterEndRef.current = false;
     markCurrentPageRead();
     setChapterIndex(index);
     setPageIndex(0);
@@ -1129,10 +1122,9 @@ export function App() {
       return;
     }
     if (chapterIndex > 0) {
-      const previousChapter = book.chapters[chapterIndex - 1];
-      const previousPageCount = Math.max(1, paginateChapterWindow(previousChapter, 0, pageWidth, pageHeight, pagePackScale).pageCount);
+      pendingChapterEndRef.current = true;
       setChapterIndex(chapterIndex - 1);
-      setPageIndex(previousPageCount - 1);
+      setPageIndex(0);
     }
   }
 
@@ -1153,8 +1145,11 @@ export function App() {
 
   function openSearchResult(result) {
     layoutRestoreRef.current = false;
+    pendingParagraphRef.current = { chapterIndex: result.chapterIndex, paragraphIndex: result.paragraphIndex };
     setChapterIndex(result.chapterIndex);
-    setPageIndex(findPageForParagraphInChapter(book.chapters[result.chapterIndex], result.paragraphIndex, pageWidth, pageHeight, pagePackScale));
+    setPageIndex(result.chapterIndex === chapterIndex
+      ? (paragraphPageMap[result.paragraphIndex]?.start ?? 0)
+      : 0);
     setSelectedParagraph(result.paragraphIndex);
     setDrawerOpen(false);
     setSearchOpen(false);
@@ -1163,24 +1158,26 @@ export function App() {
 
   function jumpToParagraph(index) {
     layoutRestoreRef.current = false;
-    setPageIndex(findPageForParagraphInChapter(chapter, index, pageWidth, pageHeight, pagePackScale));
+    pendingParagraphRef.current = paragraphPageMap[index] ? null : { chapterIndex, paragraphIndex: index };
+    setPageIndex(paragraphPageMap[index]?.start ?? 0);
     setSelectedParagraph(index);
     setDrawerOpen(false);
     showNotice(`已回到本章第 ${index + 1} 段`);
   }
 
   function goToParagraph(index) {
-    setPageIndex(findPageForParagraphInChapter(chapter, index, pageWidth, pageHeight, pagePackScale));
+    pendingParagraphRef.current = paragraphPageMap[index] ? null : { chapterIndex, paragraphIndex: index };
+    setPageIndex(paragraphPageMap[index]?.start ?? 0);
   }
 
   function openRelationshipEvidence(relationship) {
     recordProgress({ evidenceJumps: 1, xp: 1 });
     const evidence = relationship.evidence;
+    pendingParagraphRef.current = { chapterIndex: evidence.chapterIndex, paragraphIndex: evidence.paragraphIndex };
     setChapterIndex(evidence.chapterIndex);
     setPageIndex(0);
     setSelectedParagraph(evidence.paragraphIndex);
     setDrawerOpen(false);
-    window.setTimeout(() => goToParagraph(evidence.paragraphIndex), 30);
     showNotice(`已定位到“${relationship.relation}”的原文证据`);
   }
 
@@ -1690,6 +1687,7 @@ export function App() {
         setSelectionBloom(null);
         return;
       }
+      queueLayoutAnchor();
       setActivePanel("目录");
       setSidebarCollapsed(false);
       setRelationshipOpen(true);
@@ -1724,6 +1722,7 @@ export function App() {
         startOffset: selectionBloom?.startOffset ?? null,
         endOffset: selectionBloom?.endOffset ?? null,
       });
+      queueLayoutAnchor();
       setActivePanel("解惑");
       setSidebarCollapsed(false);
       setRelationshipOpen(false);
@@ -1760,6 +1759,7 @@ export function App() {
     }
     setSelectionAssist(buildAssistFromExplain(record));
     setSelectedParagraph(record.paragraphIndex);
+    queueLayoutAnchor();
     setActivePanel("解惑");
     setSidebarCollapsed(false);
     setRelationshipOpen(false);
@@ -1807,7 +1807,35 @@ export function App() {
     clearExplainPreviewSoon.timer = window.setTimeout(() => setExplainPreview(null), 120);
   }
 
+  function queueLayoutAnchor() {
+    const viewport = pageCopyRef.current;
+    const track = pageTrackRef.current;
+    const viewportBox = viewport?.getBoundingClientRect();
+    const visibleElements = viewportBox && track
+      ? [...track.querySelectorAll("[data-paragraph-index]")].filter((element) => [...element.getClientRects()].some((rect) => (
+        rect.right > viewportBox.left + 1
+        && rect.left < viewportBox.right - 1
+        && rect.bottom > viewportBox.top + 1
+        && rect.top < viewportBox.bottom - 1
+      )))
+      : [];
+    const existingParagraphIndex = readingAnchorRef.current?.paragraphIndex;
+    const visibleElement = visibleElements.find(
+      (element) => Number(element.dataset.paragraphIndex) === existingParagraphIndex,
+    ) || visibleElements[0] || null;
+    const domParagraphIndex = Number(visibleElement?.dataset?.paragraphIndex);
+    const paragraphIndex = Number.isInteger(domParagraphIndex)
+      ? domParagraphIndex
+      : (currentPageParagraphs[0]?.paragraphIndex ?? readingAnchorRef.current?.paragraphIndex);
+    if (Number.isInteger(paragraphIndex)) {
+      const pageOffset = Math.max(0, visiblePageIndex - (paragraphPageMap[paragraphIndex]?.start || 0));
+      pendingParagraphRef.current = { chapterIndex, paragraphIndex, pageOffset };
+      readingAnchorRef.current = { paragraphIndex, charOffset: 0, pageOffset };
+    }
+  }
+
   function toggleReaderPanel(panel) {
+    queueLayoutAnchor();
     if (activePanel === panel && !sidebarCollapsed) {
       setSidebarCollapsed(true);
       return;
@@ -1854,15 +1882,9 @@ export function App() {
     markCurrentPageRead();
     setChapterIndex(note.chapterIndex);
     if (Number.isInteger(note.paragraphIndex) && book?.chapters?.[note.chapterIndex]) {
-      const targetPage = findPageForParagraphInChapter(
-        book.chapters[note.chapterIndex],
-        note.paragraphIndex,
-        pageWidth,
-        pageHeight,
-        pagePackScale,
-        Number.isInteger(note.startOffset) ? note.startOffset : 0,
-      );
-      setPageIndex(Number.isInteger(targetPage) ? targetPage : note.pageIndex);
+      pendingParagraphRef.current = { chapterIndex: note.chapterIndex, paragraphIndex: note.paragraphIndex };
+      const targetPage = note.chapterIndex === chapterIndex ? paragraphPageMap[note.paragraphIndex]?.start : null;
+      setPageIndex(Number.isInteger(targetPage) ? targetPage : (note.pageIndex || 0));
       setSelectedParagraph(note.paragraphIndex);
       readingAnchorRef.current = {
         paragraphIndex: note.paragraphIndex,
@@ -1996,7 +2018,6 @@ export function App() {
     selectedParagraph,
     index: bookIndex,
   });
-  const pageMetrics = getLogicalPageMetrics(pageWidth, pageHeight, pagePackScale);
   return (
     <main className={`reader-shell theme-${readingTheme}${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}`}>
       <header className="reader-topbar">
@@ -2083,13 +2104,23 @@ export function App() {
         </div>}
         <header className="chapter-toolbar"><button className="chapter-step" disabled={chapterIndex === 0} onClick={() => selectChapter(chapterIndex - 1)} title="上一章" aria-label="上一章"><ChevronsLeft size={18} /></button><span>{chapter.title}</span><button className="chapter-step" disabled={chapterIndex === book.chapters.length - 1} onClick={() => selectChapter(chapterIndex + 1)} title="下一章" aria-label="下一章"><ChevronsRight size={18} /></button></header>
         <article className="epub-page">
-          <div className="page-title-row"><h1>{chapter.title}</h1><span>{hasPriorReadingContext && <button className="page-recall" onClick={openCurrentRecoveryCard} title="主动回忆当前页之前的内容" aria-label="主动回忆"><History size={15} /></button>}{pageIndex + 1} / {pageCount} 页 {currentPageRead && <b className="read-page-tag">已读</b>}<button className={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "page-bookmark active" : "page-bookmark"} onClick={toggleBookmark} title={bookmarks.some((item) => item.id === `${chapterIndex}:${pageIndex}`) ? "取消书签" : "添加书签"} aria-label="切换书签"><Bookmark size={16} /></button></span></div>
-          <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}><div className="page-track" ref={pageTrackRef} style={{ "--page-width": `${pageWidth}px` }}>{currentPageParagraphs.map((item) => {
-            const { text, paragraphIndex, segmentIndex, type, src, alt } = item;
+          <div className="page-title-row"><h1>{chapter.title}</h1><span>{hasPriorReadingContext && <button className="page-recall" onClick={openCurrentRecoveryCard} title="主动回忆当前页之前的内容" aria-label="主动回忆"><History size={15} /></button>}{visiblePageIndex + 1} / {pageCount} 页 {currentPageRead && <b className="read-page-tag">已读</b>}<button className={bookmarks.some((item) => item.id === `${chapterIndex}:${visiblePageIndex}`) ? "page-bookmark active" : "page-bookmark"} onClick={toggleBookmark} title={bookmarks.some((item) => item.id === `${chapterIndex}:${visiblePageIndex}`) ? "取消书签" : "添加书签"} aria-label="切换书签"><Bookmark size={16} /></button></span></div>
+          <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}${paginationReady ? " is-pagination-ready" : " is-pagination-settling"}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}>
+            <div
+              className="page-track"
+              ref={pageTrackRef}
+              style={{
+                "--page-width": `${pageWidth}px`,
+                "--page-height": `${pageHeight}px`,
+                transform: `translate3d(${-visiblePageIndex * pageWidth}px, 0, 0)`,
+              }}
+            >{chapterItems.map((item) => {
+            const { text, paragraphIndex, type, src, alt } = item;
             if (type === "image" || src) {
               return (
                 <figure
                   id={`paragraph-${paragraphIndex}`}
+                  data-paragraph-index={paragraphIndex}
                   key={`${chapter.id}-${paragraphIndex}-image`}
                   className="page-figure"
                 >
@@ -2097,18 +2128,18 @@ export function App() {
                 </figure>
               );
             }
-            const segmentStart = Math.max(0, (Number(segmentIndex) || 0) * pageMetrics.longSegmentSize);
             return (
               <p
                 id={`paragraph-${paragraphIndex}`}
-                key={`${chapter.id}-${paragraphIndex}-${segmentIndex}`}
+                data-paragraph-index={paragraphIndex}
+                key={`${chapter.id}-${paragraphIndex}`}
                 onClick={() => selectParagraph(paragraphIndex)}
               >
                 <ParagraphWithExplainMarks
                   text={text}
                   chapterIndex={chapterIndex}
                   paragraphIndex={paragraphIndex}
-                  segmentStart={segmentStart}
+                  segmentStart={0}
                   explains={explains}
                   notes={notes}
                   onPreviewEnter={scheduleExplainPreview}
@@ -2119,7 +2150,7 @@ export function App() {
             );
           })}</div></div>
         </article>
-        <footer className="reader-footer"><button className="page-step" disabled={pageIndex === 0 && chapterIndex === 0} onClick={() => turnPage(-1)} title="上一页" aria-label="上一页"><ChevronLeft size={17} /></button><span>第 {pageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button className="page-step" disabled={pageIndex === pageCount - 1 && chapterIndex === book.chapters.length - 1} onClick={() => turnPage(1)} title="下一页" aria-label="下一页"><ChevronRight size={17} /></button></footer>
+        <footer className="reader-footer"><button className="page-step" disabled={visiblePageIndex === 0 && chapterIndex === 0} onClick={() => turnPage(-1)} title="上一页" aria-label="上一页"><ChevronLeft size={17} /></button><span>第 {visiblePageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button className="page-step" disabled={visiblePageIndex === pageCount - 1 && chapterIndex === book.chapters.length - 1} onClick={() => turnPage(1)} title="下一页" aria-label="下一页"><ChevronRight size={17} /></button></footer>
       </section>
       {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} relationAvailable={contextRelationships.length > 0} canDeleteExplain={findExplainsForSelection(explains, selectionBloom).length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
       {explainPreview?.primary && (
@@ -2184,7 +2215,7 @@ export function App() {
           onSave={saveNote}
         />
       )}
-      {relationshipOpen && <RelationshipWorkspace relationships={contextRelationships} onEvidence={openRelationshipEvidence} onClose={() => { setRelationshipOpen(false); setActivePanel("目录"); }} />}
+      {relationshipOpen && <RelationshipWorkspace relationships={contextRelationships} onEvidence={openRelationshipEvidence} onClose={() => { queueLayoutAnchor(); setRelationshipOpen(false); setActivePanel("目录"); }} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </main>
   );
@@ -3704,19 +3735,12 @@ function buildTraceRecoveryCard(book, indexOrMemory = {}, savedPosition = {}, la
 function normalizeRecoveryCursor(book, savedPosition = {}) {
   const chapterIndex = Math.min(Math.max(Number(savedPosition.chapterIndex || 0), 0), book.chapters.length - 1);
   const pageIndex = Math.max(Number(savedPosition.pageIndex || 0), 0);
-  const pageWindow = paginateChapterWindow(
-    book.chapters[chapterIndex],
-    pageIndex,
-    savedPosition.pageWidth || 900,
-    savedPosition.pageHeight || 720,
-  );
-  const pageParagraphs = pageWindow.items.map((item) => item.paragraphIndex).filter(Number.isInteger);
   return {
     chapterIndex,
     pageIndex,
     paragraphIndex: Number.isInteger(savedPosition.paragraphIndex)
       ? savedPosition.paragraphIndex
-      : pageParagraphs.length ? Math.max(...pageParagraphs) : Math.max(0, (book.chapters[chapterIndex]?.paragraphs || []).length - 1),
+      : 0,
   };
 }
 
@@ -3974,134 +3998,6 @@ function getFullBookCursor(book) {
   const chapterIndex = Math.max(0, book.chapters.length - 1);
   const paragraphIndex = Math.max(0, book.chapters[chapterIndex]?.paragraphs.length - 1);
   return { chapterIndex, paragraphIndex, pageIndex: 0, pageCount: 1, scope: "full" };
-}
-
-function getLogicalPageMetrics(pageWidth = 900, pageHeight = 720, packScale = 1) {
-  const width = Math.max(320, Number(pageWidth) || 900);
-  const height = Math.max(200, Number(pageHeight) || 720);
-  const scale = Math.min(1, Math.max(0.3, Number(packScale) || 1));
-  // Match .epub-page: 18px / 1.68. Pack densely; the measure effect shrinks on overflow.
-  // Do not stack extra density haircuts here — pageHeight already excludes page-copy padding,
-  // and the overflow guard reserves a bottom safety band. A prior 0.8× factor left pages ~half empty.
-  const fontSize = 18;
-  const lineHeightPx = fontSize * 1.68;
-  // CJK glyphs are ~1em; letter-spacing (.018em) is a small adder only.
-  const charWidthPx = fontSize * 1.02;
-  const charsPerLine = Math.max(18, Math.floor(width / charWidthPx));
-  // One-line reserve in the estimate; padBottom + measure safetyPx cover the clip edge.
-  const usableHeight = Math.max(160, height - lineHeightPx);
-  const lines = Math.max(5, Math.floor(usableHeight / lineHeightPx));
-  const estimated = Math.round(charsPerLine * lines * 1.06 * scale);
-  const charBudget = Math.max(220, Math.min(2200, estimated));
-  // Images are atomic; estimate ~48% of usable height so a figure can share a page with text.
-  const imageHeightPx = Math.min(usableHeight * 0.48, lineHeightPx * 12);
-  const imageLines = Math.max(4, Math.ceil(imageHeightPx / lineHeightPx) + 1);
-  const paragraphOverhead = 14;
-  return {
-    charBudget,
-    longSegmentSize: Math.max(160, Math.min(charBudget, Math.round(charBudget * 0.9))),
-    paragraphOverhead,
-    imageCharCost: Math.round(imageLines * charsPerLine) + paragraphOverhead,
-  };
-}
-
-function paginateChapterWindow(chapter, pageIndex = 0, pageWidth = 900, pageHeight = 720, packScale = 1) {
-  const paragraphs = chapter?.paragraphs || [];
-  if (!paragraphs.length) return { pageCount: 1, items: [] };
-  const targetPage = Math.max(0, Number(pageIndex) || 0);
-  const { charBudget, longSegmentSize, paragraphOverhead, imageCharCost } = getLogicalPageMetrics(pageWidth, pageHeight, packScale);
-  const items = [];
-  let currentSize = 0;
-  let currentPage = 0;
-
-  paragraphs.forEach((paragraph, paragraphIndex) => {
-    if (isImageParagraph(paragraph)) {
-      const size = imageCharCost;
-      if (currentSize && currentSize + size > charBudget) {
-        currentPage += 1;
-        currentSize = 0;
-      }
-      if (currentPage === targetPage) {
-        items.push({
-          type: "image",
-          src: paragraph.src,
-          alt: paragraph.alt || "",
-          text: "",
-          paragraphIndex,
-          segmentIndex: 0,
-        });
-      }
-      currentSize += size;
-      if (currentSize >= charBudget * 0.92) {
-        currentPage += 1;
-        currentSize = 0;
-      }
-      return;
-    }
-
-    const text = paragraphPlainText(paragraph).trim();
-    if (!text) return;
-    for (let offset = 0; offset < text.length; offset += longSegmentSize) {
-      const segment = text.slice(offset, offset + longSegmentSize);
-      const size = segment.length + paragraphOverhead;
-      if (currentSize && currentSize + size > charBudget) {
-        currentPage += 1;
-        currentSize = 0;
-      }
-      if (currentPage === targetPage) items.push({ text: segment, paragraphIndex, segmentIndex: Math.floor(offset / longSegmentSize) });
-      currentSize += size;
-      if (size >= charBudget) {
-        currentPage += 1;
-        currentSize = 0;
-      }
-    }
-  });
-
-  return { pageCount: Math.max(1, currentPage + (currentSize > 0 ? 1 : 0)), items };
-}
-
-function findPageForParagraphInChapter(chapter, paragraphIndex = 0, pageWidth = 900, pageHeight = 720, packScale = 1, charOffset = 0) {
-  const paragraphs = chapter?.paragraphs || [];
-  const target = Number(paragraphIndex) || 0;
-  const targetOffset = Math.max(0, Number(charOffset) || 0);
-  const { charBudget, longSegmentSize, paragraphOverhead, imageCharCost } = getLogicalPageMetrics(pageWidth, pageHeight, packScale);
-  let currentSize = 0;
-  let currentPage = 0;
-  for (let index = 0; index < paragraphs.length; index += 1) {
-    const paragraph = paragraphs[index];
-    if (isImageParagraph(paragraph)) {
-      const size = imageCharCost;
-      if (currentSize && currentSize + size > charBudget) {
-        currentPage += 1;
-        currentSize = 0;
-      }
-      if (index === target) return currentPage;
-      currentSize += size;
-      if (currentSize >= charBudget * 0.92) {
-        currentPage += 1;
-        currentSize = 0;
-      }
-      continue;
-    }
-    const text = paragraphPlainText(paragraph).trim();
-    if (!text) continue;
-    for (let offset = 0; offset < text.length; offset += longSegmentSize) {
-      const segment = text.slice(offset, offset + longSegmentSize);
-      const size = segment.length + paragraphOverhead;
-      if (currentSize && currentSize + size > charBudget) {
-        currentPage += 1;
-        currentSize = 0;
-      }
-      if (index > target) return currentPage;
-      if (index === target && offset + segment.length > targetOffset) return currentPage;
-      currentSize += size;
-      if (size >= charBudget) {
-        currentPage += 1;
-        currentSize = 0;
-      }
-    }
-  }
-  return Math.max(0, currentPage);
 }
 
 function buildRecoveryCard(book, readPages = [], savedPosition = {}, lastActivity = null, memoryState = {}) {
