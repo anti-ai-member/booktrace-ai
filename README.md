@@ -11,7 +11,7 @@
 ## 核心能力
 
 - **本地书架**：管理本地图书、类型筛选、阅读进度和最近阅读位置；封面优先的书架浏览。
-- **EPUB / PDF 阅读**：本地解析、目录跳转、高度感知分页（避免裁切与半页空白）、阅读进度按书恢复；EPUB 正文插图保留在阅读流中。
+- **EPUB / PDF / MOBI 阅读**：本地解析、目录跳转、高度感知分页（避免裁切与半页空白）、阅读进度按书恢复；EPUB / MOBI 正文插图保留在阅读流中。
 - **续读恢复**：离开一段时间后回来，优先恢复「读到哪、该先想什么、当前页依赖什么」；主动回忆题基于已读证据中的具体情节，书无关、不剧透。
 - **Memory Engine**：按书类型自适应提取实体、时间线、话题、论证、情节与读者记忆；增量分析只处理已读范围。
 - **选文解惑**：选中文字后按意图解惑（书内出处 / 词条简介 / 深意阐释 / 概念释义 / 前后因果），支持快速与深思两档；结果可持久化，原文打「解」标，长悬停预览、可删除。
@@ -34,15 +34,16 @@
 
 - EPUB（含正文插图）
 - PDF（文本层）
+- MOBI / AZW / AZW3（非 DRM；基于 foliate-js）
 
-导入入口已预留、解析仍在完善的格式：TXT、HTML、RTF、DOC/DOCX、MOBI、AZW/AZW3、FB2、DjVu、CBZ/CBR 等。
+导入入口已预留、解析仍在完善的格式：TXT、HTML、RTF、DOC/DOCX、FB2、DjVu、CBZ/CBR 等。
 
 ## 技术栈
 
 - React 19 + Vite 6
 - Express（本地 AI API）
 - LangChain + DeepSeek / OpenAI
-- JSZip EPUB 解析；PDF.js
+- JSZip EPUB 解析；PDF.js；foliate-js MOBI / AZW / AZW3
 - React Flow / Dagre；PixiJS（能力树实验）
 - LocalStorage + IndexedDB（书架与阅读状态，仅本机）
 

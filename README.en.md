@@ -11,7 +11,7 @@ The UI stays quiet and reading-first. AI is a Memory Engine first (what should y
 ## Core features
 
 - Local bookshelf with cover-first browsing and per-book progress
-- EPUB / PDF reading with height-aware page packing; EPUB inline images kept in the reading flow
+- EPUB / PDF / MOBI reading with height-aware page packing; EPUB / MOBI inline images kept in the reading flow
 - Continued-reading recovery with episode-specific, book-agnostic recall questions
 - Memory Engine (entities, timeline, topics, arguments, episodic + reader memory)
 - Selection 解惑 modes, persistable markers, notes with underlines

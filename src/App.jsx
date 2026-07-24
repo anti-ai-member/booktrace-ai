@@ -113,7 +113,8 @@ function BrandMark({ size = 22 }) {
 }
 
 const SUPPORTED_IMPORT_ACCEPT = ".epub,.pdf,.txt,.html,.htm,.rtf,.doc,.docx,.mobi,.azw,.azw3,.fb2,.djvu,.cbz,.cbr,application/epub+zip,application/pdf,text/plain,text/html";
-const READABLE_IMPORT_FORMATS = new Set(["epub", "pdf"]);
+const READABLE_IMPORT_FORMATS = new Set(["epub", "pdf", "mobi", "azw", "azw3"]);
+const KINDLE_IMPORT_FORMATS = new Set(["mobi", "azw", "azw3"]);
 const TRACE_ANALYSIS_VERSION = "trace-v5";
 const PAGE_COLUMN_GAP = 64;
 const RECOVERY_CARD_MIN_ABSENCE_MS = 12 * 60 * 60 * 1000;
@@ -125,13 +126,17 @@ const PLANNED_BOOK_FORMATS = new Map([
   ["rtf", "RTF"],
   ["doc", "Word"],
   ["docx", "Word"],
-  ["mobi", "MOBI"],
-  ["azw", "Kindle AZW"],
-  ["azw3", "Kindle AZW3"],
   ["fb2", "FB2"],
   ["djvu", "DjVu"],
   ["cbz", "CBZ 漫画书"],
   ["cbr", "CBR 漫画书"],
+]);
+const IMPORT_FORMAT_LABELS = new Map([
+  ["epub", "EPUB"],
+  ["pdf", "PDF"],
+  ["mobi", "MOBI"],
+  ["azw", "AZW"],
+  ["azw3", "AZW3"],
 ]);
 const DEFAULT_CATEGORIES = ["历史纪实", "军事", "中国近现代史"];
 const DEFAULT_AI_SETTINGS = {
@@ -1204,7 +1209,7 @@ export function App() {
       const label = unsupported.length === 1
         ? PLANNED_BOOK_FORMATS.get(unsupported[0].name.split(".").pop()?.toLowerCase() || "") || unsupported[0].name.split(".").pop()?.toUpperCase() || "该格式"
         : "这些格式";
-      showNotice(`${label} 导入解析待接入；当前可直接阅读 EPUB 和 PDF`);
+      showNotice(`${label} 导入解析待接入；当前可直接阅读 EPUB、PDF、MOBI / AZW / AZW3`);
       event.target.value = "";
       return;
     }
@@ -1268,7 +1273,7 @@ export function App() {
             bookType: profile?.category || "",
             indexSchema: profile?.facets || [],
             local: false,
-            format: extension === "pdf" ? "PDF" : "EPUB",
+            format: IMPORT_FORMAT_LABELS.get(extension) || parsed.format || extension.toUpperCase(),
             ...(extension === "epub" ? { contentParseVersion: EPUB_CONTENT_PARSE_VERSION } : {}),
           });
           setImportStatus((status) => ({ ...status, classified: classifiedCount, stage: classification ? "完成分类" : "分类跳过，保留待识别" }));
@@ -1343,6 +1348,10 @@ export function App() {
     if (extension === "pdf") {
       const { parsePdf } = await import("./pdf.js");
       return parsePdf(file);
+    }
+    if (KINDLE_IMPORT_FORMATS.has(extension)) {
+      const { parseMobi } = await import("./mobi.js");
+      return parseMobi(file);
     }
     return parseEpubInWorker(file);
   }
@@ -1966,7 +1975,7 @@ export function App() {
   }
 
   if (!book && screen !== "shelf") {
-    return <main className="loading-screen"><div className="loader-mark"><BookOpen size={26} /></div><strong>书架还没有可阅读的书</strong><span>请先导入一本 EPUB 或 PDF。</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 导入书籍</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
+    return <main className="loading-screen"><div className="loader-mark"><BookOpen size={26} /></div><strong>书架还没有可阅读的书</strong><span>请先导入一本 EPUB、PDF 或 MOBI / AZW3。</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 导入书籍</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
   }
 
   if (screen === "skills") {
@@ -1997,11 +2006,11 @@ export function App() {
           <section><h3>图书类型</h3><button className={activeType === "全部类型" ? "filter-row active" : "filter-row"} onClick={() => setActiveType("全部类型")}>全部类型<span>{shelfBooks.length}</span></button>{BOOK_TYPES.map((type) => <button className={activeType === type.name ? "filter-row active" : "filter-row"} key={type.id} onClick={() => setActiveType(type.name)}><i /><span>{type.name}</span><small>{shelfBooks.filter((item) => item.bookType === type.name).length}</small></button>)}</section>
         </aside>
         <section className="library-content">
-          <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB、PDF；TXT、MOBI、AZW3 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
+          <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB、PDF、MOBI / AZW / AZW3；TXT、DOCX、FB2 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
           {searchedShelfBooks.length ? <div className="book-grid">{searchedShelfBooks.map((shelfBook) => {
             const shelfState = shelfBookStates.get(shelfBook.id) || getBookShelfState(shelfBook);
             return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || localFormatLabel(shelfBook)}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onPointerDown={(event) => { if (event.button === 0) openShelfBook(shelfBook); }} onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
-          })}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>导入一本 EPUB 或 PDF 后就可以开始阅读。</span><button className="text-action" onClick={() => inputRef.current?.click()}>导入书籍</button></div>}
+          })}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>导入一本 EPUB、PDF 或 MOBI / AZW3 后就可以开始阅读。</span><button className="text-action" onClick={() => inputRef.current?.click()}>导入书籍</button></div>}
         </section>
         {shelfSearchOpen && <div className="library-search-panel"><div className="search-panel-head"><h2>{shelfSearchText ? "搜索结果" : "书架上的热门"}</h2><button onClick={() => setShelfSearchOpen(false)} aria-label="关闭搜索"><X size={20} /></button></div><div className="search-suggestion-grid">{(shelfSearchText ? searchedShelfBooks : shelfBooks).slice(0, 6).map((item) => <button className="search-suggestion-card" key={item.id} onClick={() => { setShelfSearchOpen(false); openShelfBook(item); }}><BookCover book={item} /><span>{item.title}</span><small>{item.bookType || localFormatLabel(item)}</small></button>)}{!shelfSearchText && shelfSearchSuggestions.map((item) => <button className="search-suggestion-card type-result" key={item.label} onClick={() => { setActiveType(item.label); setShelfSearchOpen(false); }}><i /><span>{item.label}</span><small>{item.count} 本</small></button>)}</div></div>}
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
