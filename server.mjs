@@ -97,6 +97,65 @@ app.post("/api/classify-book", async (request, response) => {
   }
 });
 
+app.post("/api/situation-bridge", async (request, response) => {
+  const {
+    provider = "deepseek",
+    model,
+    thinking = true,
+    gaps = [],
+    candidates = [],
+    currentPageBrief = "",
+  } = request.body || {};
+  const config = PROVIDERS[provider];
+  if (!config) return response.status(400).json({ error: "Unsupported model provider" });
+
+  const safeGaps = sanitizeSituationGaps(gaps);
+  const safeCandidates = sanitizeSituationCandidates(candidates);
+  if (!safeGaps.length) return response.status(400).json({ error: "Missing gaps" });
+  if (safeCandidates.length < 2) return response.status(400).json({ error: "Need at least 2 candidates" });
+
+  const apiKey = process.env[config.apiKey];
+  if (!apiKey) return response.status(400).json({ error: `Please configure ${config.apiKey} in .env first` });
+
+  const useThinking = provider === "deepseek" && thinking !== false;
+  const recoveryModel = resolveRecoveryModel(provider, model);
+
+  try {
+    const { client: modelClient, model: resolvedModel } = createModelClient({
+      provider,
+      model: recoveryModel,
+      thinking: useThinking,
+    });
+    const result = await modelClient.invoke([
+      ["system", "You are a situation-bridge adjudicator for the reading app 书脉. Choose only from the supplied candidate ids. Never invent ids. Never summarize unread or unsupplied text. Return JSON only."],
+      ["human", buildSituationBridgePrompt({
+        gaps: safeGaps,
+        candidates: safeCandidates,
+        currentPageBrief: String(currentPageBrief || "").slice(0, 400),
+      })],
+    ]);
+    const parsed = parseJson(messageContent(result));
+    const judgement = normaliseSituationBridgeJudgement(parsed, safeGaps, safeCandidates);
+    if (!judgement || judgement.bridges.length < 2) {
+      return response.status(422).json({
+        error: "Situation bridge failed id contract",
+        fallback: true,
+        model: resolvedModel,
+        thinking: useThinking,
+        judgement: judgement || { bridges: [], question: null },
+      });
+    }
+    response.json({
+      provider,
+      model: resolvedModel,
+      thinking: useThinking,
+      judgement,
+    });
+  } catch (error) {
+    response.status(502).json({ error: error.message || "Situation bridge adjudication failed" });
+  }
+});
+
 app.post("/api/recovery-card", async (request, response) => {
   const {
     provider = "deepseek",
@@ -367,6 +426,101 @@ function normaliseSelectionExplanation(raw, mode, evidence) {
     highlights,
     evidence: resolved.length ? resolved : evidenceList.slice(0, 3),
   };
+}
+
+function buildSituationBridgePrompt({ gaps, candidates, currentPageBrief }) {
+  return `Adjudicate situation bridges for continued reading.
+
+Task:
+- The reader is on the current page and may have forgotten prior context.
+- For each important gap, pick AT MOST one candidate that truly unlocks understanding of that gap.
+- Return 2-3 bridges total. Prefer precision over coverage. If unsure, omit.
+- Every bridge MUST use a real gapId and candidateId from the lists below.
+- whyNeeded must mention what on the current page depends on the recalled item (one short Chinese sentence).
+- Optional question: only if one bridge is episode-worthy; must reuse a selected candidateId/gapId.
+- Do NOT invent facts outside candidate snippets.
+- Do NOT return generic slogans like 「为什么会影响后面」「关键决策如何形成」.
+
+Return JSON exactly:
+{
+  "bridges":[{"gapId":"gap-1","candidateId":"mem:…","title":"","whyNeeded":"","confidence":"high|low"}],
+  "question":null
+}
+or question as {"gapId":"","candidateId":"","prompt":"","hint":"","answer":""}
+
+Gaps:
+${JSON.stringify(gaps)}
+
+Candidates (choose only these ids):
+${JSON.stringify(candidates)}
+
+Current page brief (<=400 chars):
+${JSON.stringify(currentPageBrief || "")}`;
+}
+
+function sanitizeSituationGaps(gaps = []) {
+  return (Array.isArray(gaps) ? gaps : [])
+    .map((item, index) => ({
+      id: String(item?.id || `gap-${index + 1}`).slice(0, 32),
+      label: displayText(item?.label || "").slice(0, 40),
+      kind: String(item?.kind || "state").slice(0, 24),
+    }))
+    .filter((item) => item.id && item.label)
+    .slice(0, 6);
+}
+
+function sanitizeSituationCandidates(candidates = []) {
+  return (Array.isArray(candidates) ? candidates : [])
+    .map((item, index) => ({
+      id: String(item?.id || `candidate-${index + 1}`).slice(0, 64),
+      title: displayText(item?.title || "").slice(0, 24),
+      snippet: displayText(item?.snippet || "").slice(0, 80),
+      channel: String(item?.channel || "").slice(0, 24),
+    }))
+    .filter((item) => item.id && item.title && item.snippet)
+    .slice(0, 12);
+}
+
+function normaliseSituationBridgeJudgement(raw, gaps, candidates) {
+  const gapIds = new Set(gaps.map((item) => item.id));
+  const candidateIds = new Set(candidates.map((item) => item.id));
+  const bridges = (Array.isArray(raw?.bridges) ? raw.bridges : [])
+    .map((item) => ({
+      gapId: String(item?.gapId || "").trim(),
+      candidateId: String(item?.candidateId || "").trim(),
+      title: displayText(item?.title || "").slice(0, 16),
+      whyNeeded: displayText(item?.whyNeeded || "").slice(0, 72),
+      confidence: item?.confidence === "low" ? "low" : "high",
+    }))
+    .filter((item) => gapIds.has(item.gapId) && candidateIds.has(item.candidateId) && item.title && item.whyNeeded && item.confidence !== "low")
+    .slice(0, 3);
+
+  // Unique candidate per bridge
+  const seen = new Set();
+  const uniqueBridges = bridges.filter((item) => {
+    if (seen.has(item.candidateId)) return false;
+    seen.add(item.candidateId);
+    return true;
+  });
+
+  let question = null;
+  const q = raw?.question;
+  if (q && typeof q === "object") {
+    const gapId = String(q.gapId || "").trim();
+    const candidateId = String(q.candidateId || "").trim();
+    const prompt = displayText(q.prompt || "").slice(0, 80);
+    if (candidateIds.has(candidateId) && prompt && uniqueBridges.some((item) => item.candidateId === candidateId)) {
+      question = {
+        gapId: gapIds.has(gapId) ? gapId : uniqueBridges.find((item) => item.candidateId === candidateId)?.gapId || null,
+        candidateId,
+        prompt,
+        hint: displayText(q.hint || "").slice(0, 60),
+        answer: displayText(q.answer || "").slice(0, 120),
+      };
+    }
+  }
+
+  return { bridges: uniqueBridges, question };
 }
 
 function buildRecoveryCardPrompt({ book, cursor, traceProfile, bookMemory, traceMemory, evidence, currentText }) {

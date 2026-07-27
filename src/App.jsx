@@ -59,7 +59,14 @@ import {
   readerForgettingScore,
   updateReaderMemory,
 } from "./memoryModels.js";
-import { buildRecoveryPlan } from "./contextBuilder.js";
+import {
+  adjudicatorPayloadFromShortlist,
+  applySituationBridgeJudgement,
+  finalizeSituationBridgePlan,
+  prepareSituationBridgeShortlist,
+  situationBridgeToRecoveryCard,
+  suppressReasonMessage,
+} from "./situationBridge.js";
 import {
   hasConcreteEpisodeCue,
   hintFromEvidenceExcerpt,
@@ -117,6 +124,11 @@ const READABLE_IMPORT_FORMATS = new Set(["epub", "pdf", "mobi", "azw", "azw3"]);
 const KINDLE_IMPORT_FORMATS = new Set(["mobi", "azw", "azw3"]);
 const TRACE_ANALYSIS_VERSION = "trace-v5";
 const PAGE_COLUMN_GAP = 64;
+/** Phase B: judge-only situation bridges over local shortlist (no chapter dumps). */
+const ENABLE_SITUATION_BRIDGE_ADJUDICATOR = true;
+/** Legacy summary-card polish — keep off; recovery uses situation bridges. */
+const ENABLE_MODEL_RECOVERY_POLISH = false;
+
 const RECOVERY_CARD_MIN_ABSENCE_MS = 12 * 60 * 60 * 1000;
 const PLANNED_BOOK_FORMATS = new Map([
   ["pdf", "PDF"],
@@ -1005,66 +1017,42 @@ export function App() {
         ? normalizeBookMemory(storedRecord.bookMemory)
         : bookMemoryFromLegacy({ index: storedRecord?.index, traceMemory: storedRecord?.traceMemory }, { bookId: nextBook.id || nextBook.title || "book" });
       const cursor = { ...normalizeRecoveryCursor(nextBook, saved), pageWidth: saved.pageWidth, pageHeight: saved.pageHeight };
-      const localCard = buildTraceRecoveryCard(nextBook, persistedMemory, cursor, lastActivity, persistedMemory, memoryState)
-        || buildRecoveryCard(nextBook, [], cursor, lastActivity, memoryState);
+      const readerFuel = {
+        notes: loadStored(notesStorageKey(nextBook), []),
+        explains: loadExplains(nextBook),
+        bookmarks: loadStored(bookmarkStorageKey(nextBook), []),
+      };
+      const { shortlist, card: localCard } = prepareSituationRecovery(nextBook, persistedMemory, cursor, lastActivity, memoryState, {
+        mode: "auto",
+        ...readerFuel,
+      });
       if (recoveryCardJobRef.current !== jobId) return;
       if (localCard) setRecoveryCard(localCard);
-      else if (storedRecord?.recoveryCard) setRecoveryCard(normalizeRecoveryCard(storedRecord.recoveryCard, null));
 
-      if (!hasBookMemoryContent(persistedMemory) && !(storedRecord?.index && Object.keys(storedRecord.index).length)) {
+      if (!ENABLE_SITUATION_BRIDGE_ADJUDICATOR || !shortlist || shortlist.suppressed) {
+        setTraceJob({
+          status: "done",
+          message: localCard ? "续读接驳已就绪" : "本页不必先回想",
+        });
         return;
       }
 
-      const indexForEvidence = normalizeReadingIndex(storedRecord?.index || readingIndexFromBookMemory(persistedMemory), nextBook);
-      const evidenceStore = buildMemoryEvidenceStore(nextBook, indexForEvidence);
-      const candidateQuery = [
-        nextBook.title,
-        nextBook.creator,
-        storedRecord?.profile?.category || nextBook.bookType,
-        ...(persistedMemory.entities || []).slice(0, 12).map((item) => item.name),
-        ...(persistedMemory.episodic || []).slice(0, 6).map((item) => item.name || item.title),
-      ].filter(Boolean).join(" ");
-      const supportingEvidence = locateEvidence(evidenceStore, {
-        query: candidateQuery,
-        scopeCursor: cursor,
-        currentCursor: cursor,
-        traceIndex: indexForEvidence,
-        topK: 12,
-      }).map((item) => ({
-        cite: item.cite,
-        chapterIndex: item.chapterIndex,
-        paragraphIndex: item.paragraphIndex,
-        chapterTitle: item.chapterTitle,
-        quote: item.cite?.quote || item.excerpt,
-        score: Number(item.score.toFixed(3)),
-        matchSources: item.matchSources,
-      }));
-
-      if (recoveryCardJobRef.current !== jobId) return;
-      setTraceJob({ status: "running", message: "正在准备续读恢复…" });
-      const modelCard = await requestModelRecoveryCard({
-        targetBook: nextBook,
-        cursor,
-        traceProfile: storedRecord?.traceProfile || resolveTraceProfile(storedRecord?.profile?.category || nextBook.bookType, storedRecord?.profile?.facets || nextBook.indexSchema || []),
-        bookMemory: persistedMemory,
-        traceMemory: storedRecord?.traceMemory || compatibilityTraceMemory(persistedMemory),
-        supportingEvidence,
-        currentChapters: getRecoveryCurrentChapters(nextBook, cursor),
-        memoryState,
-        lastActivity,
-        localFallback: localCard || normalizeRecoveryCard(storedRecord?.recoveryCard, null),
+      setTraceJob({ status: "running", message: "正在裁定接上前文…" });
+      const judgedCard = await requestSituationBridgeJudgement({
+        shortlist,
+        localFallback: localCard,
       });
       if (recoveryCardJobRef.current !== jobId) return;
-      if (modelCard) {
-        setRecoveryCard(modelCard);
+      if (judgedCard) {
+        setRecoveryCard(judgedCard);
         const nextRecord = {
           ...(storedRecord || {}),
           bookMemory: persistedMemory,
-          index: indexForEvidence,
+          index: storedRecord?.index || readingIndexFromBookMemory(persistedMemory),
           profile: storedRecord?.profile || null,
           traceProfile: storedRecord?.traceProfile || null,
           traceMemory: storedRecord?.traceMemory || compatibilityTraceMemory(persistedMemory),
-          recoveryCard: modelCard,
+          recoveryCard: judgedCard,
           summary: storedRecord?.summary || null,
           cursor: storedRecord?.cursor || cursor,
           updatedAt: new Date().toISOString(),
@@ -1073,9 +1061,9 @@ export function App() {
         if (storageBookIdentity(book) === storageBookIdentity(nextBook)) {
           setAnalysisRecord(nextRecord);
         }
-        setTraceJob({ status: "done", message: "续读恢复已就绪" });
+        setTraceJob({ status: "done", message: "续读接驳已就绪" });
       } else {
-        setTraceJob({ status: "done", message: localCard ? "已使用本地恢复材料" : "暂无续读恢复材料" });
+        setTraceJob({ status: "done", message: localCard ? "续读接驳已就绪" : "本页不必先回想" });
       }
     };
 
@@ -1133,19 +1121,35 @@ export function App() {
     }
   }
 
-  function openCurrentRecoveryCard() {
+  async function openCurrentRecoveryCard() {
     if (!hasPriorReadingContext) {
       showNotice("还没有前文可回忆");
       return;
     }
     const cursor = { ...getReadCursor(), pageWidth, pageHeight };
     const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
-    const card = buildTraceRecoveryCard(book, bookMemory, cursor, null, bookMemory, memoryState) || buildRecoveryCard(book, [], cursor, null, memoryState) || buildRecoveryCard(book, readPages, cursor, null, memoryState);
-    if (!card) {
-      showNotice("当前页之前还没有足够内容可回忆");
+    const { shortlist, card: localCard } = prepareSituationRecovery(book, bookMemory, cursor, null, memoryState, {
+      mode: "manual",
+      notes,
+      explains,
+      bookmarks,
+    });
+    if (localCard) {
+      setRecoveryCard(localCard);
+    } else {
+      showNotice(suppressReasonMessage(shortlist?.reason, "manual") || "当前页不必先回想");
       return;
     }
-    setRecoveryCard(card);
+
+    if (!ENABLE_SITUATION_BRIDGE_ADJUDICATOR || !shortlist || shortlist.suppressed) return;
+
+    setTraceJob({ status: "running", message: "正在裁定接上前文…" });
+    const judgedCard = await requestSituationBridgeJudgement({
+      shortlist,
+      localFallback: localCard,
+    });
+    if (judgedCard) setRecoveryCard(judgedCard);
+    setTraceJob({ status: "done", message: judgedCard ? "续读接驳已就绪" : "已使用本地接驳" });
   }
 
   function openSearchResult(result) {
@@ -1484,15 +1488,32 @@ export function App() {
       setBook((current) => current ? { ...current, bookType: result.profile.category, indexSchema: result.profile.facets } : current);
       setLibraryBooks((items) => items.map((item) => item.id === book.id ? { ...item, bookType: result.profile.category, indexSchema: result.profile.facets } : item));
       let nextRecoveryCard = null;
-      setTraceJob({ status: "running", message: "正在生成续读恢复卡" });
-      nextRecoveryCard = await requestModelRecoveryCard({
-        targetBook: book,
-        cursor,
-        traceProfile: result.traceProfile || traceProfile,
-        bookMemory: nextBookMemory,
-        supportingEvidence,
-        currentChapters: newChapters,
+      setTraceJob({ status: "running", message: "正在生成续读接驳卡" });
+      const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
+      const prepared = prepareSituationRecovery(book, nextBookMemory, cursor, null, memoryState, {
+        mode: "manual",
+        notes,
+        explains,
+        bookmarks,
       });
+      nextRecoveryCard = prepared.card;
+      if (ENABLE_SITUATION_BRIDGE_ADJUDICATOR && prepared.shortlist && !prepared.shortlist.suppressed) {
+        nextRecoveryCard = await requestSituationBridgeJudgement({
+          shortlist: prepared.shortlist,
+          localFallback: nextRecoveryCard,
+        }) || nextRecoveryCard;
+      } else if (ENABLE_MODEL_RECOVERY_POLISH) {
+        nextRecoveryCard = await requestModelRecoveryCard({
+          targetBook: book,
+          cursor,
+          traceProfile: result.traceProfile || traceProfile,
+          bookMemory: nextBookMemory,
+          supportingEvidence,
+          currentChapters: newChapters,
+          memoryState,
+          localFallback: nextRecoveryCard,
+        }) || nextRecoveryCard;
+      }
       const record = {
         bookMemory: nextBookMemory,
         index: nextIndex,
@@ -1507,12 +1528,46 @@ export function App() {
       setAnalysisRecord(record);
       localStorage.setItem(analysisStorageKey(book), JSON.stringify(record));
       if (nextRecoveryCard && !isAutomatic) setRecoveryCard(nextRecoveryCard);
-      setAnalysisState({ status: "done", message: `已由 ${result.model} 更新续读恢复材料` });
-      setTraceJob({ status: "done", message: `恢复材料已更新到第 ${cursor.pageIndex + 1} 页` });
-      showNotice(isAutomatic ? "已根据新增已读内容自动准备恢复材料" : "续读恢复材料已更新");
+      setAnalysisState({ status: "done", message: `已由 ${result.model} 更新续读接驳材料` });
+      setTraceJob({ status: "done", message: nextRecoveryCard ? `接驳材料已更新到第 ${cursor.pageIndex + 1} 页` : "本页不必先回想" });
+      showNotice(isAutomatic
+        ? (nextRecoveryCard ? "已根据新增已读内容准备接驳材料" : "新增已读已分析；本页不必先回想")
+        : (nextRecoveryCard ? "续读接驳材料已更新" : "分析完成；当前页不必先回想"));
     } catch (error) {
       setAnalysisState({ status: "error", message: error.message || "大模型分析失败" });
       setTraceJob({ status: "error", message: error.message || "AI Trace 失败" });
+    }
+  }
+
+  async function requestSituationBridgeJudgement({ shortlist, localFallback = null }) {
+    const payload = adjudicatorPayloadFromShortlist(shortlist);
+    if (!payload?.gaps?.length || !(payload.candidates?.length >= 2)) {
+      return localFallback;
+    }
+    try {
+      const response = await fetch("/api/situation-bridge", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          provider: analysisSettings.provider,
+          model: RECOVERY_MODEL_BY_PROVIDER[analysisSettings.provider] || RECOVERY_MODEL_BY_PROVIDER.deepseek,
+          thinking: analysisSettings.provider === "deepseek",
+          gaps: payload.gaps,
+          candidates: payload.candidates,
+          currentPageBrief: payload.currentPageBrief,
+        }),
+      });
+      const result = await response.json();
+      if (response.status === 422 && result?.fallback) {
+        const fallbackPlan = applySituationBridgeJudgement(shortlist, result.judgement || { bridges: [] });
+        return situationBridgeToRecoveryCard(fallbackPlan) || localFallback;
+      }
+      if (!response.ok) throw new Error(result.error || "Situation bridge failed");
+      const plan = applySituationBridgeJudgement(shortlist, result.judgement);
+      return situationBridgeToRecoveryCard(plan) || localFallback;
+    } catch (error) {
+      console.warn("Situation bridge fallback:", error);
+      return localFallback;
     }
   }
 
@@ -1742,6 +1797,12 @@ export function App() {
     setSelectionBloom(null);
   }
 
+  function closeSelectionAssist() {
+    queueLayoutAnchor();
+    setSelectionAssist(null);
+    setSidebarCollapsed(true);
+  }
+
   function persistSelectionExplain(payload) {
     if (!book || !payload?.selection) return;
     setExplains((current) => upsertExplain(current, {
@@ -1789,8 +1850,7 @@ export function App() {
       return { ...preview, records: remaining, primary };
     });
     if (closingOpenAssist) {
-      setSelectionAssist(null);
-      setActivePanel("目录");
+      closeSelectionAssist();
     }
     showNotice("已删除解惑标注");
   }
@@ -2090,7 +2150,7 @@ export function App() {
             onPersistExplain={persistSelectionExplain}
             onDeleteExplain={deletePersistedExplain}
             onEvidence={openSearchResult}
-            onClose={() => { setSelectionAssist(null); setActivePanel("目录"); }}
+            onClose={closeSelectionAssist}
           />}
         </div>
         <div className="side-book-meta"><span>共 {book.chapters.length} 节</span><span>{localFormatLabel(book)}</span></div>
@@ -2895,18 +2955,26 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
   const [hintOpen, setHintOpen] = useState(false);
   const [answerOpen, setAnswerOpen] = useState(false);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
-  const keyPoints = Array.isArray(card.keyPoints) ? card.keyPoints.slice(0, 3) : [];
-  const prerequisites = Array.isArray(card.prerequisites) ? card.prerequisites.slice(0, 2) : [];
+  const [questionOpen, setQuestionOpen] = useState(false);
+  const bridges = Array.isArray(card.bridges) && card.bridges.length
+    ? card.bridges.slice(0, 3)
+    : (Array.isArray(card.keyPoints) ? card.keyPoints : []).slice(0, 3).map((item) => ({
+      id: item.id,
+      title: item.title,
+      whyNeeded: item.detail,
+      evidence: item.evidence,
+    }));
   const evidence = Array.isArray(card.evidence) ? card.evidence : [];
+  const hasQuestion = Boolean(card.question?.prompt);
   useEffect(() => {
     onTrack?.("shown", card);
   }, [onTrack]);
   const hint = sanitizeRecoveryHint(card.question?.hint) || buildRecoveryQuestionHint(card.question?.evidence || evidence[0]);
-  return <aside className={`recall-sheet ${card.intensity === "deep" ? "deep" : ""}`} role="dialog" aria-modal="true" aria-label="续读恢复卡">
+  return <aside className={`recall-sheet ${card.intensity === "deep" ? "deep" : ""}`} role="dialog" aria-modal="true" aria-label="续读接驳卡">
     <header className="recall-sheet-head">
       <div className="recall-sheet-title">
         <span>{card.absenceLabel || "继续阅读前"}</span>
-        <strong>记忆浮现</strong>
+        <strong>接上前文</strong>
       </div>
       <button type="button" className="recall-icon" onClick={() => onClose("skipped")} title="跳过续读恢复" aria-label="跳过续读恢复"><X size={18} /></button>
     </header>
@@ -2914,32 +2982,16 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
     <div className="recall-sheet-position"><History size={14} /><span>{card.positionLabel || "上次阅读位置"}</span></div>
 
     <div className="recall-sheet-body">
-      <section className="recall-sheet-question" aria-label="主动回忆">
-        <p className="recall-sheet-kicker">先想一件事</p>
-        <p className="recall-sheet-prompt">{card.question?.prompt}</p>
-        {hintOpen && !answerOpen && <div className="recall-sheet-hint">{hint}</div>}
-        {answerOpen ? (
-          <button type="button" className="recall-sheet-answer" onClick={() => card.question?.evidence && onEvidence(card.question.evidence)} title="跳转到答案出处" aria-label="跳转到答案出处">
-            {card.question?.answer}
-          </button>
-        ) : (
-          <div className="recall-sheet-actions">
-            <button type="button" className={hintOpen ? "recall-icon active" : "recall-icon"} onClick={() => { onTrack?.("hint", card); setHintOpen(true); }} title="查看提示" aria-label="查看提示"><Lightbulb size={16} /></button>
-            <button type="button" className="recall-icon" onClick={() => { onTrack?.("answer", card); setAnswerOpen(true); }} title="查看答案" aria-label="查看答案"><Eye size={16} /></button>
-          </div>
-        )}
-      </section>
-
-      {keyPoints.length > 0 && <section className="recall-sheet-anchors" aria-label="前文关键点">
-        <h2>前文关键点</h2>
+      {bridges.length > 0 && <section className="recall-sheet-anchors" aria-label="接上这几件事">
+        <h2>接上这几件事</h2>
         <ol className="recall-sheet-steps">
-          {keyPoints.map((item, index) => (
-            <li key={item.id}>
+          {bridges.map((item, index) => (
+            <li key={item.id || `bridge-${index}`}>
               <button type="button" onClick={() => item.evidence && onEvidence(item.evidence)} title={item.title} aria-label={item.title}>
                 <span className="recall-sheet-step-num" aria-hidden="true">{index + 1}</span>
                 <span className="recall-sheet-step-copy">
                   <b>{item.title}</b>
-                  <span>{item.detail}</span>
+                  <span>{item.whyNeeded || item.detail}</span>
                 </span>
               </button>
             </li>
@@ -2947,18 +2999,25 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
         </ol>
       </section>}
 
-      {prerequisites.length > 0 && <section className="recall-sheet-prereqs" aria-label="当前页前置">
-        <h2>理解当前页前</h2>
-        <ul>
-          {prerequisites.map((item) => (
-            <li key={item.id}>
-              <button type="button" onClick={() => item.evidence && onEvidence(item.evidence)} title={item.text} aria-label={item.text}>
-                <Lightbulb size={14} />
-                <span>{item.text}</span>
-              </button>
-            </li>
-          ))}
-        </ul>
+      {hasQuestion && <section className="recall-sheet-question recall-sheet-question-secondary" aria-label="主动回忆">
+        <button type="button" className="recall-sheet-question-toggle" onClick={() => setQuestionOpen((value) => !value)} aria-expanded={questionOpen}>
+          <p className="recall-sheet-kicker">先想一件事</p>
+          <ChevronDown size={16} className={questionOpen ? "is-open" : ""} aria-hidden="true" />
+        </button>
+        {questionOpen && <>
+          <p className="recall-sheet-prompt">{card.question?.prompt}</p>
+          {hintOpen && !answerOpen && <div className="recall-sheet-hint">{hint}</div>}
+          {answerOpen ? (
+            <button type="button" className="recall-sheet-answer" onClick={() => card.question?.evidence && onEvidence(card.question.evidence)} title="跳转到答案出处" aria-label="跳转到答案出处">
+              {card.question?.answer}
+            </button>
+          ) : (
+            <div className="recall-sheet-actions">
+              <button type="button" className={hintOpen ? "recall-icon active" : "recall-icon"} onClick={() => { onTrack?.("hint", card); setHintOpen(true); }} title="查看提示" aria-label="查看提示"><Lightbulb size={16} /></button>
+              <button type="button" className="recall-icon" onClick={() => { onTrack?.("answer", card); setAnswerOpen(true); }} title="查看答案" aria-label="查看答案"><Eye size={16} /></button>
+            </div>
+          )}
+        </>}
       </section>}
 
       {evidenceOpen && <section className="recall-sheet-evidence" aria-label="原文证据">
@@ -3661,6 +3720,15 @@ function normalizeRecoveryCard(card, fallback = null) {
     intensity: ["light", "medium", "deep", "fresh"].includes(card.intensity) ? card.intensity : fallback?.intensity || "medium",
     absenceLabel: summaryText(card.absenceLabel) || fallback?.absenceLabel || "继续阅读前",
     positionLabel: summaryText(card.positionLabel) || fallback?.positionLabel || "上次阅读位置",
+    bridges: Array.isArray(card.bridges) && card.bridges.length
+      ? card.bridges
+      : keyPoints.map((item) => ({
+        id: item.id,
+        title: item.title,
+        whyNeeded: item.detail,
+        evidence: item.evidence,
+        candidateId: item.memoryKey,
+      })),
     keyPoints,
     prerequisites: prerequisites.length ? prerequisites : fallback?.prerequisites || [],
     question: {
@@ -3704,41 +3772,46 @@ function normalizeRecoveryEvidence(item) {
   };
 }
 
-function buildTraceRecoveryCard(book, indexOrMemory = {}, savedPosition = {}, lastActivity = null, bookMemoryOrTrace = null, memoryState = {}) {
+function prepareSituationRecovery(book, bookMemoryInput = {}, savedPosition = {}, lastActivity = null, memoryState = {}, options = {}) {
   const bookMemory = normalizeBookMemory(
-    hasBookMemoryContent(indexOrMemory) || indexOrMemory?.version
-      ? indexOrMemory
-      : bookMemoryOrTrace?.version || hasBookMemoryContent(bookMemoryOrTrace)
-        ? bookMemoryOrTrace
-        : bookMemoryFromLegacy({ index: indexOrMemory, traceMemory: bookMemoryOrTrace }),
+    hasBookMemoryContent(bookMemoryInput) || bookMemoryInput?.version
+      ? bookMemoryInput
+      : bookMemoryFromLegacy({ index: bookMemoryInput, traceMemory: options.traceMemory }, { bookId: book?.id || book?.title || "book" }),
     { bookId: book?.id || book?.title || "book" },
   );
-  if (!book?.chapters?.length || !hasBookMemoryContent(bookMemory)) return null;
+  if (!book?.chapters?.length) return { shortlist: null, card: null };
   const cursor = normalizeRecoveryCursor(book, savedPosition);
   const currentPageText = (book.chapters[cursor.chapterIndex]?.paragraphs || [])
     .slice(Math.max(0, (cursor.paragraphIndex || 0) - 2), (cursor.paragraphIndex || 0) + 1)
     .map((item) => (typeof item === "object" ? item.text : item))
     .filter(Boolean)
     .join("\n");
-  const plan = buildRecoveryPlan({
+  const shortlist = prepareSituationBridgeShortlist({
     book,
     bookMemory,
     cursor,
     currentPageText,
     lastActivity,
     reader: memoryState?.reader || memoryState,
-    minAbsenceMs: RECOVERY_CARD_MIN_ABSENCE_MS,
+    notes: options.notes || [],
+    explains: options.explains || [],
+    bookmarks: options.bookmarks || [],
+    mode: options.mode || "auto",
+    minAbsenceMs: options.mode === "manual" ? 0 : RECOVERY_CARD_MIN_ABSENCE_MS,
   });
-  if (!plan || plan.suppressed) return null;
-  return {
-    intensity: plan.intensity,
-    absenceLabel: plan.absenceLabel,
-    positionLabel: plan.positionLabel,
-    keyPoints: plan.keyPoints,
-    prerequisites: plan.prerequisites,
-    question: plan.question,
-    evidence: plan.evidence,
-  };
+  const plan = finalizeSituationBridgePlan(shortlist, null);
+  return { shortlist, card: situationBridgeToRecoveryCard(plan) };
+}
+
+function buildSituationRecoveryCard(book, bookMemoryInput = {}, savedPosition = {}, lastActivity = null, memoryState = {}, options = {}) {
+  return prepareSituationRecovery(book, bookMemoryInput, savedPosition, lastActivity, memoryState, options).card;
+}
+
+function buildTraceRecoveryCard(book, indexOrMemory = {}, savedPosition = {}, lastActivity = null, bookMemoryOrTrace = null, memoryState = {}) {
+  return buildSituationRecoveryCard(book, indexOrMemory, savedPosition, lastActivity, memoryState, {
+    mode: lastActivity == null ? "manual" : "auto",
+    traceMemory: bookMemoryOrTrace,
+  });
 }
 
 function normalizeRecoveryCursor(book, savedPosition = {}) {

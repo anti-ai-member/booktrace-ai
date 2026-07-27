@@ -1,0 +1,549 @@
+[
+  {
+    "id": "hist-person-causal-show",
+    "bookType": "history",
+    "factor": "person+causal",
+    "expect": {
+      "suppressed": false,
+      "minBridges": 2,
+      "titleHints": ["夏英杰", "渡口", "封锁"],
+      "gapKinds": ["person", "causal", "intent", "state"]
+    },
+    "book": {
+      "id": "hist-a",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "转移",
+          "paragraphs": [
+            "夏英杰决定率部先行转移，并命令卫队封锁渡口。",
+            "此后数日，部队在山谷中休整，等待会合信号。",
+            "雨停之后，斥候回报对岸已无追兵。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "北上",
+          "paragraphs": [
+            "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+            "山谷里只剩风声，并无新的命令。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "e1",
+          "kind": "person",
+          "name": "夏英杰",
+          "summary": "率部转移并封锁渡口的主事者",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "夏英杰决定率部先行转移" }
+        }
+      ],
+      "episodic": [
+        {
+          "id": "ep1",
+          "kind": "event",
+          "name": "封锁渡口",
+          "summary": "夏英杰命令卫队封锁渡口以便转移",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "命令卫队封锁渡口" }
+        }
+      ],
+      "timeline": [],
+      "topics": [],
+      "arguments": [],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 0, "paragraphIndex": 0 },
+    "currentPageText": "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+    "mode": "manual"
+  },
+  {
+    "id": "hist-scenic-suppress",
+    "bookType": "history",
+    "factor": "state",
+    "expect": {
+      "suppressed": true,
+      "reasons": ["page-not-dependent", "low-importance-gaps", "no-bridges", "low-confidence"]
+    },
+    "book": {
+      "id": "hist-a",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "转移",
+          "paragraphs": [
+            "夏英杰决定率部先行转移，并命令卫队封锁渡口。",
+            "此后数日，部队在山谷中休整，等待会合信号。",
+            "雨停之后，斥候回报对岸已无追兵。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "北上",
+          "paragraphs": [
+            "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+            "山谷里只剩风声，并无新的命令。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "e1",
+          "kind": "person",
+          "name": "夏英杰",
+          "summary": "率部转移并封锁渡口的主事者",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "夏英杰决定率部先行转移" }
+        }
+      ],
+      "episodic": [
+        {
+          "id": "ep1",
+          "kind": "event",
+          "name": "封锁渡口",
+          "summary": "夏英杰命令卫队封锁渡口以便转移",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "命令卫队封锁渡口" }
+        }
+      ],
+      "timeline": [],
+      "topics": [],
+      "arguments": [],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 1, "paragraphIndex": 1 },
+    "currentPageText": "山谷里只剩风声，并无新的命令。",
+    "mode": "manual"
+  },
+  {
+    "id": "hist-temporal-spatial-show",
+    "bookType": "history",
+    "factor": "temporal+spatial",
+    "expect": {
+      "suppressed": false,
+      "minBridges": 2,
+      "titleHints": ["赤水", "遵义", "转移"],
+      "gapKinds": ["temporal", "spatial", "causal", "person", "state", "intent"]
+    },
+    "book": {
+      "id": "hist-b",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "遵义之后",
+          "paragraphs": [
+            "部队于遵义休整三日，随后决定向赤水河方向转移。",
+            "前卫连先行抵达河岸，等待主力会合。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "渡河前夜",
+          "paragraphs": [
+            "此前在遵义定下的转移路线，此刻在赤水河岸重新压上众人肩头。",
+            "河面只有雾气，没有船只。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "place-zunyi",
+          "kind": "place",
+          "name": "遵义",
+          "summary": "休整三日并决定转移路线之处",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "部队于遵义休整三日" }
+        },
+        {
+          "id": "place-chishui",
+          "kind": "place",
+          "name": "赤水河",
+          "summary": "转移目标方向",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "向赤水河方向转移" }
+        }
+      ],
+      "episodic": [
+        {
+          "id": "ep-move",
+          "kind": "event",
+          "name": "决定向赤水转移",
+          "summary": "遵义休整后决定向赤水河方向转移",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "随后决定向赤水河方向转移" }
+        }
+      ],
+      "timeline": [
+        {
+          "id": "tl1",
+          "kind": "event",
+          "name": "遵义休整三日",
+          "summary": "休整后转入转移",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "于遵义休整三日" }
+        }
+      ],
+      "topics": [],
+      "arguments": [],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 0, "paragraphIndex": 0 },
+    "currentPageText": "此前在遵义定下的转移路线，此刻在赤水河岸重新压上众人肩头。",
+    "mode": "manual"
+  },
+  {
+    "id": "concept-intent-show",
+    "bookType": "argument",
+    "factor": "concept+intent",
+    "expect": {
+      "suppressed": false,
+      "minBridges": 2,
+      "titleHints": ["可错性", "证伪", "批评"],
+      "gapKinds": ["concept", "intent", "causal", "state"]
+    },
+    "book": {
+      "id": "arg-a",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "可错性",
+          "paragraphs": [
+            "波普提出可错性：科学理论必须能被证伪，否则不是科学。",
+            "他主张用大胆猜测与严格批评推进知识。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "批评的用途",
+          "paragraphs": [
+            "因此，任何无法接受证伪检验的主张，都与可错性原则相冲突。",
+            "窗外雨声很大，与论证无关。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "e-popper",
+          "kind": "person",
+          "name": "波普",
+          "summary": "提出可错性与证伪标准的哲学家",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "波普提出可错性" }
+        }
+      ],
+      "episodic": [],
+      "timeline": [],
+      "topics": [
+        {
+          "id": "t-fallibilism",
+          "kind": "concept",
+          "name": "可错性",
+          "summary": "科学理论必须能被证伪",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "科学理论必须能被证伪" }
+        }
+      ],
+      "arguments": [
+        {
+          "id": "a1",
+          "kind": "claim",
+          "name": "大胆猜测与严格批评",
+          "summary": "用猜测与批评推进知识",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 1, "quote": "大胆猜测与严格批评推进知识" }
+        }
+      ],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 0, "paragraphIndex": 0 },
+    "currentPageText": "因此，任何无法接受证伪检验的主张，都与可错性原则相冲突。",
+    "mode": "manual",
+    "notes": [
+      {
+        "id": "n1",
+        "chapterIndex": 0,
+        "paragraphIndex": 0,
+        "selection": "可错性",
+        "content": "记住：能被证伪才算科学",
+        "createdAt": 1
+      }
+    ]
+  },
+  {
+    "id": "concept-scenic-suppress",
+    "bookType": "argument",
+    "factor": "concept",
+    "expect": {
+      "suppressed": true,
+      "reasons": ["page-not-dependent", "low-importance-gaps", "no-bridges", "low-confidence"]
+    },
+    "book": {
+      "id": "arg-a",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "可错性",
+          "paragraphs": [
+            "波普提出可错性：科学理论必须能被证伪，否则不是科学。",
+            "他主张用大胆猜测与严格批评推进知识。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "批评的用途",
+          "paragraphs": [
+            "因此，任何无法接受证伪检验的主张，都与可错性原则相冲突。",
+            "窗外雨声很大，与论证无关。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "e-popper",
+          "kind": "person",
+          "name": "波普",
+          "summary": "提出可错性与证伪标准的哲学家",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "波普提出可错性" }
+        }
+      ],
+      "episodic": [],
+      "timeline": [],
+      "topics": [
+        {
+          "id": "t-fallibilism",
+          "kind": "concept",
+          "name": "可错性",
+          "summary": "科学理论必须能被证伪",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "科学理论必须能被证伪" }
+        }
+      ],
+      "arguments": [
+        {
+          "id": "a1",
+          "kind": "claim",
+          "name": "大胆猜测与严格批评",
+          "summary": "用猜测与批评推进知识",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 1, "quote": "大胆猜测与严格批评推进知识" }
+        }
+      ],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 1, "paragraphIndex": 1 },
+    "currentPageText": "窗外雨声很大，与论证无关。",
+    "mode": "manual"
+  },
+  {
+    "id": "reader-trace-intent-show",
+    "bookType": "fiction",
+    "factor": "intent+reader",
+    "expect": {
+      "suppressed": false,
+      "minBridges": 2,
+      "titleHints": ["背叛", "离开", "契约"],
+      "gapKinds": ["intent", "person", "causal", "state", "relation"]
+    },
+    "book": {
+      "id": "fic-a",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "契约",
+          "paragraphs": [
+            "林晚决定撕毁与顾城的契约，并准备次日离开这座城。",
+            "她把钥匙放回抽屉，不再回头。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "车站",
+          "paragraphs": [
+            "因为那纸契约已被撕毁，顾城在车站仍等不到她的解释。",
+            "站台空无一人。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "e-lin",
+          "kind": "person",
+          "name": "林晚",
+          "summary": "决定撕毁契约并离开的人",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "林晚决定撕毁与顾城的契约" }
+        },
+        {
+          "id": "e-gu",
+          "kind": "person",
+          "name": "顾城",
+          "summary": "契约另一方",
+          "priority": "recent",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "与顾城的契约" }
+        }
+      ],
+      "episodic": [
+        {
+          "id": "ep-break",
+          "kind": "event",
+          "name": "撕毁契约",
+          "summary": "林晚决定撕毁契约并离开",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "决定撕毁与顾城的契约" }
+        }
+      ],
+      "timeline": [],
+      "topics": [],
+      "arguments": [],
+      "relationships": [
+        {
+          "id": "r1",
+          "kind": "relation",
+          "name": "林晚与顾城",
+          "summary": "契约关系破裂",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "撕毁与顾城的契约" }
+        }
+      ]
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 0, "paragraphIndex": 0 },
+    "currentPageText": "因为那纸契约已被撕毁，顾城在车站仍等不到她的解释。",
+    "mode": "manual",
+    "explains": [
+      {
+        "id": "ex1",
+        "chapterIndex": 0,
+        "paragraphIndex": 0,
+        "selection": "撕毁与顾城的契约",
+        "mode": "causal",
+        "conclusion": "她已决定离开，契约不再约束她",
+        "createdAt": 1
+      }
+    ],
+    "bookmarks": [
+      {
+        "id": "0:0",
+        "chapterIndex": 0,
+        "pageIndex": 0,
+        "chapterTitle": "契约"
+      }
+    ]
+  },
+  {
+    "id": "low-context-suppress",
+    "bookType": "history",
+    "factor": "state",
+    "expect": {
+      "suppressed": true,
+      "reasons": ["low-context", "page-not-dependent", "no-bridges"]
+    },
+    "book": {
+      "id": "hist-empty",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "开篇",
+          "paragraphs": ["天亮了。"]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [],
+      "episodic": [],
+      "timeline": [],
+      "topics": [],
+      "arguments": [],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 0, "pageIndex": 0, "paragraphIndex": 0 },
+    "currentPageText": "天亮了。",
+    "mode": "manual"
+  },
+  {
+    "id": "adjudicator-id-contract",
+    "bookType": "history",
+    "factor": "person+causal",
+    "expect": {
+      "suppressed": false,
+      "minBridges": 2,
+      "source": "adjudicator",
+      "titleHints": ["夏英杰", "渡口", "封锁"],
+      "rejectInventedIds": true
+    },
+    "useJudgement": true,
+    "book": {
+      "id": "hist-a",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "转移",
+          "paragraphs": [
+            "夏英杰决定率部先行转移，并命令卫队封锁渡口。",
+            "此后数日，部队在山谷中休整，等待会合信号。",
+            "雨停之后，斥候回报对岸已无追兵。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "北上",
+          "paragraphs": [
+            "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+            "山谷里只剩风声，并无新的命令。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "e1",
+          "kind": "person",
+          "name": "夏英杰",
+          "summary": "率部转移并封锁渡口的主事者",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "夏英杰决定率部先行转移" }
+        }
+      ],
+      "episodic": [
+        {
+          "id": "ep1",
+          "kind": "event",
+          "name": "封锁渡口",
+          "summary": "夏英杰命令卫队封锁渡口以便转移",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "命令卫队封锁渡口" }
+        }
+      ],
+      "timeline": [],
+      "topics": [],
+      "arguments": [],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 0, "paragraphIndex": 0 },
+    "currentPageText": "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+    "mode": "manual"
+  }
+]

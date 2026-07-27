@@ -6957,6 +6957,36 @@ body { background: var(--desk-paper); }
   background: #f4f1e8;
 }
 
+.recall-sheet-question-secondary {
+  background: transparent;
+  padding: 4px 0 0;
+  border-top: 1px solid rgba(70, 90, 78, 0.1);
+}
+
+.recall-sheet-question-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  padding: 8px 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+
+.recall-sheet-question-toggle svg {
+  transition: transform .16s ease;
+  color: #7a857c;
+}
+
+.recall-sheet-question-toggle svg.is-open {
+  transform: rotate(180deg);
+}
+
 .recall-sheet-anchors,
 .recall-sheet-prereqs,
 .recall-sheet-evidence {

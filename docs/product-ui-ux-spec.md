@@ -119,41 +119,47 @@ Chrome, transient reading tools, and recovery/memory cards share one control lan
 
 ### Continue Reading Recovery
 
-Purpose: restore the reader's situation model before continuing.
+Purpose: restore the reader's situation model before continuing — **only when this page truly depends on forgotten prior context**.
 
 The recovery card should answer:
 
-> 为了理解当前页，你只需要回忆哪几件事？
+> 为了理解当前页，你只需要接上哪几件事？
 
-Required content:
+Required content when shown:
 
 - Last position.
-- One active-recall question.
-- 2-3 memory anchors.
-- 1-2 current-page prerequisites.
+- 2-3 situation bridges (primary visual focus): what to recall + why this page needs it; each jumps to evidence.
+- Optional active-recall question (collapsed by default; omit when no episode-worthy bridge).
 - Evidence collapsed by default.
 - Continue reading button.
+
+Do not show a separate “prerequisites” block; fold that into each bridge’s why-needed line.
+
+Trigger rules:
+
+- Auto: long absence **and** page-dependent gaps **and** enough bridges. Not on ordinary page turns. Not on low-importance / transitional pages.
+- Manual History control: user-initiated; may still suppress with a short notice when the page needs no bridge.
 
 Layout rules:
 
 - One screen, no scrolling.
-- Single-column reading path: title → position → question → memory path → prerequisites → footer.
-- No overlapping absolute-positioned content. Recovery content sections use normal document flow only (`position: static` / flex column); never absolute-position anchors, prerequisites, or evidence inside the card.
-- Use an explicit grid/flex structure.
-- Center question is the first visual focus.
-- Memory anchors are a quiet numbered path of at most three nodes. Prefer a readable layout: if a three-column horizontal path would crush titles or details, use a vertical step list (number + title + one-to-two-line detail) that still reads as a path, not a dense report.
-- Leave clear vertical rhythm between question, anchors, prerequisites, and footer; avoid dashboard density.
+- Single-column reading path: title → position → **bridges** → optional question → footer.
+- No overlapping absolute-positioned content. Recovery content sections use normal document flow only.
+- Bridges are a quiet numbered vertical step list (number + title + one-line why-needed).
+- Leave clear vertical rhythm; avoid dashboard density.
 - Evidence is secondary and collapsed.
 - Avoid two-column report layouts and decorative aura layers.
-- Secondary recovery actions (查看提示、查看答案、展开证据、想起来了、还没想起) are icon-only with hover/focus labels.
-- Continue reading is an accent icon control with hover/focus label「继续阅读」(rail-consistent); close remains a quiet icon.
+- Secondary recovery actions are icon-only with hover/focus labels.
+- Continue reading is an accent icon control with hover/focus label「继续阅读」.
 
 Do not:
 
-- Show recovery on the first page.
+- Show recovery on the first page / pages with no prior context.
+- Force a card on every reopen or every page.
 - Include publication metadata, cover/copyright text, table of contents, incidental dates, or minor names.
 - Show full summaries.
-- Show more than three primary recall items.
+- Show more than three primary bridge items.
+- Stuff prior chapters into model prompts (local shortlist + optional Phase B adjudicator only).
 
 ### Memory Engine
 
