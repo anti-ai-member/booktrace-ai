@@ -250,7 +250,7 @@ Phase 7 quality gate:
 
 ## Phase 8: Reader Memory And Type-Specific Aids
 
-Status: planned.
+Status: in progress.
 
 Goal:
 
@@ -261,6 +261,8 @@ Make Reader Memory participate in recall decisions, and surface type-specific ai
 - Persist active reading time, remembered/missed, notes, bookmarks into `bookMemory.reader`.
 - Feed forgetting and reader events into Context Builder with secondary weight only.
 - Keep mainline / current-page fit as primary score.
+
+Implementation vehicle this season: Feature 019 (`constitution/features/019-reader-memory-bridge-fuel.md`).
 
 ### Feature 011 — Type-specific memory aids on demand
 
