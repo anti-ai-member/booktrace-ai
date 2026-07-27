@@ -255,6 +255,14 @@ export function updateReaderMemory(reader = null, patch = {}) {
   });
 }
 
+/** Feedback keys only from bridges and keyPoints (Feature 019 / Task 2). */
+export function recoveryBridgeFeedbackKeys(card) {
+  return [...new Set([
+    ...(card?.bridges || []).map((item) => item.candidateId || item.memoryKey),
+    ...(card?.keyPoints || []).map((item) => item.memoryKey || item.evidence?.memoryKey),
+  ].filter(Boolean))];
+}
+
 /** Map recovery-card track actions onto Reader Memory remembered/missed keys. */
 export function markReaderBridgeFeedback(reader = null, { action, keys = [] } = {}) {
   const list = (keys || []).map(String).filter(Boolean);

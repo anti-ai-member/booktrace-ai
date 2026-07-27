@@ -1,5 +1,6 @@
 import {
   markReaderBridgeFeedback,
+  recoveryBridgeFeedbackKeys,
 } from "../src/memoryModels.js";
 import {
   adjudicatorPayloadFromShortlist,
@@ -175,6 +176,17 @@ const ignored = markReaderBridgeFeedback(missed, { action: "shown", keys: ["cand
 assert(!ignored.rememberedKeys.includes("cand:d") && !ignored.missedKeys.includes("cand:d"), "non-feedback actions skip key updates");
 const knew = markReaderBridgeFeedback(null, { action: "knew", keys: ["cand:e"] });
 assert(knew.rememberedKeys.includes("cand:e"), "knew maps to remembered");
+
+const feedbackKeys = recoveryBridgeFeedbackKeys({
+  bridges: [{ candidateId: "cand:bridge" }],
+  keyPoints: [{ memoryKey: "kp:1" }],
+  question: { memoryKey: "q:should-not-feedback" },
+  prerequisites: [{ memoryKey: "prereq:skip" }],
+  evidence: [{ memoryKey: "ev:skip" }],
+});
+assert(feedbackKeys.includes("cand:bridge") && feedbackKeys.includes("kp:1"), "feedback keys from bridges/keyPoints");
+assert(!feedbackKeys.includes("q:should-not-feedback"), "question memoryKey excluded from feedback keys");
+assert(!feedbackKeys.includes("prereq:skip") && !feedbackKeys.includes("ev:skip"), "prereq/evidence excluded from feedback keys");
 
 console.log("situation-bridge smoke ok", {
   bridges: dependent.bridges.map((item) => item.title),

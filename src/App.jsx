@@ -55,6 +55,7 @@ import {
   compatibilityTraceMemory,
   hasBookMemoryContent,
   markReaderBridgeFeedback,
+  recoveryBridgeFeedbackKeys,
   normalizeBookMemory,
   readingIndexFromBookMemory,
   readerForgettingScore,
@@ -4231,6 +4232,7 @@ function updateRecoveryMemoryState(book, card, action) {
   const current = loadStored(storageKey, {});
   const now = new Date().toISOString();
   const keys = recoveryCardMemoryKeys(card);
+  const feedbackKeys = recoveryBridgeFeedbackKeys(card);
   if (!keys.length) return;
   const next = { ...current };
   keys.forEach((key) => {
@@ -4264,7 +4266,7 @@ function updateRecoveryMemoryState(book, card, action) {
   });
   const feedbackReader = markReaderBridgeFeedback(current.reader || null, {
     action: action === "remembered" || action === "missed" ? action : null,
-    keys: action === "remembered" || action === "missed" ? keys : [],
+    keys: action === "remembered" || action === "missed" ? feedbackKeys : [],
   });
   next.reader = updateReaderMemory(feedbackReader, {
     lastActivityAt: Date.now(),
@@ -4281,7 +4283,7 @@ function updateRecoveryMemoryState(book, card, action) {
   });
   localStorage.setItem(storageKey, JSON.stringify(next));
   if (action === "remembered" || action === "missed") {
-    mergeReaderFeedbackIntoAnalysis(book, action, keys);
+    mergeReaderFeedbackIntoAnalysis(book, action, feedbackKeys);
   }
 }
 
