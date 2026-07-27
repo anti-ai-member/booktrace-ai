@@ -255,6 +255,19 @@ export function updateReaderMemory(reader = null, patch = {}) {
   });
 }
 
+/** Map recovery-card track actions onto Reader Memory remembered/missed keys. */
+export function markReaderBridgeFeedback(reader = null, { action, keys = [] } = {}) {
+  const list = (keys || []).map(String).filter(Boolean);
+  if (!list.length) return normalizeReaderMemory(reader);
+  if (action === "remembered" || action === "knew") {
+    return updateReaderMemory(reader, { rememberedKeys: list });
+  }
+  if (action === "missed" || action === "forgot") {
+    return updateReaderMemory(reader, { missedKeys: list });
+  }
+  return normalizeReaderMemory(reader);
+}
+
 export function collectMemoryAnchors(memory = null, cursor = null, reader = null) {
   const scoped = filterBookMemoryByCursor(memory, cursor);
   const readerState = normalizeReaderMemory(reader || scoped.reader);

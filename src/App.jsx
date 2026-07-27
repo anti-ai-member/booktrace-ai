@@ -54,6 +54,7 @@ import {
   collectMemoryAnchors,
   compatibilityTraceMemory,
   hasBookMemoryContent,
+  markReaderBridgeFeedback,
   normalizeBookMemory,
   readingIndexFromBookMemory,
   readerForgettingScore,
@@ -4261,10 +4262,12 @@ function updateRecoveryMemoryState(book, card, action) {
     }
     next[key] = updated;
   });
-  next.reader = updateReaderMemory(current.reader || null, {
+  const feedbackReader = markReaderBridgeFeedback(current.reader || null, {
+    action: action === "remembered" || action === "missed" ? action : null,
+    keys: action === "remembered" || action === "missed" ? keys : [],
+  });
+  next.reader = updateReaderMemory(feedbackReader, {
     lastActivityAt: Date.now(),
-    rememberedKeys: action === "remembered" ? keys : [],
-    missedKeys: action === "missed" ? keys : [],
     forgettingScores: Object.fromEntries(keys.map((key) => [
       key,
       readerForgettingScore({
@@ -4277,10 +4280,15 @@ function updateRecoveryMemoryState(book, card, action) {
     ])),
   });
   localStorage.setItem(storageKey, JSON.stringify(next));
+  if (action === "remembered" || action === "missed") {
+    mergeReaderFeedbackIntoAnalysis(book, action, keys);
+  }
 }
 
+/** Prefer bridge candidateId, then keyPoint memoryKey (Feature 019 feedback keys). */
 function recoveryCardMemoryKeys(card) {
   const keys = [
+    ...(card.bridges || []).map((item) => item.candidateId || item.memoryKey),
     ...(card.keyPoints || []).map((item) => item.memoryKey || item.evidence?.memoryKey),
     ...(card.prerequisites || []).map((item) => item.memoryKey || item.evidence?.memoryKey),
     card.question?.memoryKey,
@@ -4288,6 +4296,29 @@ function recoveryCardMemoryKeys(card) {
     ...(card.evidence || []).map((item) => item.memoryKey),
   ];
   return [...new Set(keys.filter(Boolean))].slice(0, 8);
+}
+
+function mergeReaderFeedbackIntoAnalysis(book, action, keys) {
+  if (!book || !keys?.length) return;
+  if (action !== "remembered" && action !== "missed") return;
+  try {
+    const storageKey = analysisStorageKey(book);
+    const stored = loadStored(storageKey, null);
+    if (!stored) return;
+    const record = hydrateAnalysisRecord(stored, book);
+    if (!record?.bookMemory) return;
+    const nextReader = markReaderBridgeFeedback(record.bookMemory.reader, { action, keys });
+    localStorage.setItem(storageKey, JSON.stringify({
+      ...record,
+      bookMemory: {
+        ...record.bookMemory,
+        reader: nextReader,
+        updatedAt: new Date().toISOString(),
+      },
+    }));
+  } catch {
+    // Ignore storage failures; recovery-memory path still holds the feedback.
+  }
 }
 
 function recoveryMemoryKey(kind = "memory", title = "", occurrence = {}) {

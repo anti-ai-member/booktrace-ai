@@ -1,4 +1,7 @@
 import {
+  markReaderBridgeFeedback,
+} from "../src/memoryModels.js";
+import {
   adjudicatorPayloadFromShortlist,
   applySituationBridgeJudgement,
   buildSituationBridgePlan,
@@ -163,8 +166,19 @@ assert(
   "invented ids rejected",
 );
 
+// Reader Memory bridge feedback (Task 2)
+const remembered = markReaderBridgeFeedback(null, { action: "remembered", keys: ["cand:a", "cand:b"] });
+assert(remembered.rememberedKeys.includes("cand:a") && remembered.rememberedKeys.includes("cand:b"), "remembered keys persist");
+const missed = markReaderBridgeFeedback(remembered, { action: "missed", keys: ["cand:c"] });
+assert(missed.missedKeys.includes("cand:c") && missed.rememberedKeys.includes("cand:a"), "missed merges without clearing remembered");
+const ignored = markReaderBridgeFeedback(missed, { action: "shown", keys: ["cand:d"] });
+assert(!ignored.rememberedKeys.includes("cand:d") && !ignored.missedKeys.includes("cand:d"), "non-feedback actions skip key updates");
+const knew = markReaderBridgeFeedback(null, { action: "knew", keys: ["cand:e"] });
+assert(knew.rememberedKeys.includes("cand:e"), "knew maps to remembered");
+
 console.log("situation-bridge smoke ok", {
   bridges: dependent.bridges.map((item) => item.title),
   scenicReason: scenic.reason,
   judgedSource: judged.source,
+  readerFeedback: { remembered: remembered.rememberedKeys.length, missed: missed.missedKeys.length },
 });
