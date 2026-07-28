@@ -445,6 +445,7 @@ export function App() {
   const pendingChapterEndRef = useRef(false);
   const recoveryCardJobRef = useRef(0);
   const readingStartedAtRef = useRef(Date.now());
+  const loadBuiltInBookRef = useRef(null);
 
   useEffect(() => {
     didInitialPageMeasureRef.current = false;
@@ -534,56 +535,7 @@ export function App() {
   }, [readPages, analysisSettings.analysisMode, analysisSettings.autoPageThreshold, analysisRecord, analysisState.status, traceJob.status, book]);
 
   useEffect(() => {
-    async function loadBuiltInBook() {
-      try {
-        const storedBooks = await loadStoredLibraryBooks();
-        const importedBooks = storedBooks.filter((item) => !item.local);
-        const cachedBuiltIn = storedBooks.find((item) => item.id === BUILT_IN_BOOK_ID && item.builtInCacheVersion === BUILT_IN_CACHE_VERSION) || null;
-        const activeBookId = loadStored("shumai-active-book-id", "");
-        const cachedBooks = cachedBuiltIn ? [cachedBuiltIn, ...importedBooks] : importedBooks;
-        const activeCachedBook = cachedBooks.find((item) => item.id === activeBookId) || cachedBuiltIn || importedBooks[0] || null;
-        setLibraryBooks(cachedBooks);
-        if (activeCachedBook) {
-          setBook(activeCachedBook);
-          setChapterIndex((current) => Math.min(Math.max(current, 0), activeCachedBook.chapters.length - 1));
-        }
-        const staleEpubCount = importedBooks.filter((item) => needsEpubContentReparse(item)).length;
-        if (staleEpubCount > 0 && !loadStored("shumai-epub-image-reparse-hint", false)) {
-          localStorage.setItem("shumai-epub-image-reparse-hint", JSON.stringify(true));
-          showNotice(`${staleEpubCount} 本已导入 EPUB 仍是旧解析；重新导入同一文件即可显示插图`);
-        }
-        if (cachedBuiltIn) {
-          return;
-        }
-        await yieldToBrowser();
-
-        const response = await fetch(BOOK_PATH);
-        if (!response.ok) throw new Error("无法打开本地 EPUB 文件");
-        const parsed = await parseEpubInWorker(await response.blob());
-        const builtIn = {
-          ...parsed,
-          id: BUILT_IN_BOOK_ID,
-          fingerprint: "builtin:long-march",
-          cover: COVER_PATH,
-          bookType: "历史纪实 / 传记",
-          indexSchema: findBookType("历史纪实 / 传记").facets,
-          local: true,
-          builtIn: true,
-          format: "EPUB",
-          builtInCacheVersion: BUILT_IN_CACHE_VERSION,
-          contentParseVersion: EPUB_CONTENT_PARSE_VERSION,
-        };
-        await saveStoredLibraryBook(builtIn);
-        const books = [builtIn, ...importedBooks];
-        const activeBook = books.find((item) => item.id === activeBookId) || builtIn;
-        setLibraryBooks(books);
-        setBook((current) => current || activeBook);
-        setChapterIndex((current) => Math.min(Math.max(current, 0), activeBook.chapters.length - 1));
-      } catch (error) {
-        setLoadError(error.message || "解析 EPUB 时出现问题");
-      }
-    }
-    loadBuiltInBook();
+    void loadBuiltInBookRef.current?.();
   }, []);
 
   useEffect(() => {
@@ -918,6 +870,66 @@ export function App() {
     setNotice(message);
     window.setTimeout(() => setNotice(""), 2600);
   }
+
+  function isMissingApiKeyError(message) {
+    return /API_KEY|configure.*\.env/i.test(String(message || ""));
+  }
+
+  function noticeMissingApiKey(fallbackHint = "阅读与本地接驳仍可继续") {
+    showNotice(`未配置 API Key，大模型暂不可用；${fallbackHint}`);
+  }
+
+  async function loadBuiltInBook() {
+    setLoadError("");
+    try {
+      const storedBooks = await loadStoredLibraryBooks();
+      const importedBooks = storedBooks.filter((item) => !item.local);
+      const cachedBuiltIn = storedBooks.find((item) => item.id === BUILT_IN_BOOK_ID && item.builtInCacheVersion === BUILT_IN_CACHE_VERSION) || null;
+      const activeBookId = loadStored("shumai-active-book-id", "");
+      const cachedBooks = cachedBuiltIn ? [cachedBuiltIn, ...importedBooks] : importedBooks;
+      const activeCachedBook = cachedBooks.find((item) => item.id === activeBookId) || cachedBuiltIn || importedBooks[0] || null;
+      setLibraryBooks(cachedBooks);
+      if (activeCachedBook) {
+        setBook(activeCachedBook);
+        setChapterIndex((current) => Math.min(Math.max(current, 0), activeCachedBook.chapters.length - 1));
+      }
+      const staleEpubCount = importedBooks.filter((item) => needsEpubContentReparse(item)).length;
+      if (staleEpubCount > 0 && !loadStored("shumai-epub-image-reparse-hint", false)) {
+        localStorage.setItem("shumai-epub-image-reparse-hint", JSON.stringify(true));
+        showNotice(`${staleEpubCount} 本已导入 EPUB 仍是旧解析；重新导入同一文件即可显示插图`);
+      }
+      if (cachedBuiltIn) {
+        return;
+      }
+      await yieldToBrowser();
+
+      const response = await fetch(BOOK_PATH);
+      if (!response.ok) throw new Error("无法打开本地 EPUB 文件");
+      const parsed = await parseEpubInWorker(await response.blob());
+      const builtIn = {
+        ...parsed,
+        id: BUILT_IN_BOOK_ID,
+        fingerprint: "builtin:long-march",
+        cover: COVER_PATH,
+        bookType: "历史纪实 / 传记",
+        indexSchema: findBookType("历史纪实 / 传记").facets,
+        local: true,
+        builtIn: true,
+        format: "EPUB",
+        builtInCacheVersion: BUILT_IN_CACHE_VERSION,
+        contentParseVersion: EPUB_CONTENT_PARSE_VERSION,
+      };
+      await saveStoredLibraryBook(builtIn);
+      const books = [builtIn, ...importedBooks];
+      const activeBook = books.find((item) => item.id === activeBookId) || builtIn;
+      setLibraryBooks(books);
+      setBook((current) => current || activeBook);
+      setChapterIndex((current) => Math.min(Math.max(current, 0), activeBook.chapters.length - 1));
+    } catch (error) {
+      setLoadError(error.message || "解析 EPUB 时出现问题");
+    }
+  }
+  loadBuiltInBookRef.current = loadBuiltInBook;
 
   function recordProgress(delta) {
     setReadingProgress((current) => {
@@ -1308,17 +1320,17 @@ export function App() {
         setScreen("shelf");
       } else if (duplicateBooks.length) {
         const existing = duplicateBooks[duplicateBooks.length - 1];
-        setBook(existing);
         setActiveCategory("全部");
         setActiveType("全部类型");
-        setScreen("shelf");
+        openShelfBook(existing);
       }
 
       const messages = [];
       if (importedBooks.length) messages.push(`已导入 ${importedBooks.length} 本书`);
       if (upgradedCount) messages.push(`已升级 ${upgradedCount} 本插图解析`);
       if (classifiedCount) messages.push(`已识别 ${classifiedCount} 本类型`);
-      if (duplicateCount) messages.push(`${duplicateCount} 本已在书架中`);
+      if (duplicateCount && !shelfUpdates.length) messages.push("书架已有这本书，已为你打开");
+      else if (duplicateCount) messages.push(`${duplicateCount} 本已在书架中`);
       if (unsupported.length) messages.push(`${unsupported.length} 个暂不支持的文件已跳过`);
       if (failedCount) messages.push(`${failedCount} 本导入失败`);
       if (!shelfUpdates.length && failedCount && firstFailureMessage) messages.push(firstFailureMessage);
@@ -1470,7 +1482,11 @@ export function App() {
       });
       await yieldToBrowser();
       const result = await response.json();
-      if (!response.ok) throw new Error(result.error || "分析服务暂不可用");
+      if (!response.ok) {
+        const message = result.error || "分析服务暂不可用";
+        if (isMissingApiKeyError(message)) noticeMissingApiKey();
+        throw new Error(message);
+      }
       const nextBookMemory = normalizeBookMemory(result.bookMemory || {
         index: result.index,
         traceMemory: result.traceMemory,
@@ -1564,10 +1580,13 @@ export function App() {
         const fallbackPlan = applySituationBridgeJudgement(shortlist, result.judgement || { bridges: [] });
         return situationBridgeToRecoveryCard(fallbackPlan) || localFallback;
       }
-      if (!response.ok) throw new Error(result.error || "Situation bridge failed");
+      if (!response.ok) {
+        throw new Error(result.error || "Situation bridge failed");
+      }
       const plan = applySituationBridgeJudgement(shortlist, result.judgement);
       return situationBridgeToRecoveryCard(plan) || localFallback;
     } catch (error) {
+      if (isMissingApiKeyError(error?.message)) noticeMissingApiKey("已改用本地接驳");
       console.warn("Situation bridge fallback:", error);
       return localFallback;
     }
@@ -2033,7 +2052,16 @@ export function App() {
   }
 
   if (loadError && !book && !libraryBooks.length && screen !== "shelf") {
-    return <main className="loading-screen"><div className="loader-mark"><FileText size={26} /></div><strong>无法打开这本书</strong><span>{loadError}</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 选择书籍文件</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
+    return (
+      <main className="loading-screen">
+        <div className="loader-mark"><FileText size={26} /></div>
+        <strong>无法加载内置书《长征》</strong>
+        <span>{loadError}</span>
+        <button className="primary-button" type="button" onClick={() => void loadBuiltInBook()} title="重试加载《长征》" aria-label="重试加载《长征》">重试加载《长征》</button>
+        <button className="text-action" type="button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 选择书籍文件</button>
+        <input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} />
+      </main>
+    );
   }
 
   if (!book && screen !== "shelf") {
@@ -2072,7 +2100,25 @@ export function App() {
           {searchedShelfBooks.length ? <div className="book-grid">{searchedShelfBooks.map((shelfBook) => {
             const shelfState = shelfBookStates.get(shelfBook.id) || getBookShelfState(shelfBook);
             return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || localFormatLabel(shelfBook)}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onPointerDown={(event) => { if (event.button === 0) openShelfBook(shelfBook); }} onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
-          })}</div> : <div className="empty-library"><ListFilter size={28} /><strong>这个分类还没有图书</strong><span>导入一本 EPUB、PDF 或 MOBI / AZW3 后就可以开始阅读。</span><button className="text-action" onClick={() => inputRef.current?.click()}>导入书籍</button></div>}
+          })}</div> : (
+            <div className="empty-library">
+              <ListFilter size={28} />
+              {loadError && !libraryBooks.length ? (
+                <>
+                  <strong>无法加载内置书《长征》</strong>
+                  <span>{loadError}</span>
+                  <button className="primary-button" type="button" onClick={() => void loadBuiltInBook()} title="重试加载《长征》" aria-label="重试加载《长征》">重试加载《长征》</button>
+                  <button className="text-action" type="button" onClick={() => inputRef.current?.click()}>导入书籍</button>
+                </>
+              ) : (
+                <>
+                  <strong>这个分类还没有图书</strong>
+                  <span>导入一本 EPUB、PDF 或 MOBI / AZW3 后就可以开始阅读。</span>
+                  <button className="text-action" type="button" onClick={() => inputRef.current?.click()}>导入书籍</button>
+                </>
+              )}
+            </div>
+          )}
         </section>
         {shelfSearchOpen && <div className="library-search-panel"><div className="search-panel-head"><h2>{shelfSearchText ? "搜索结果" : "书架上的热门"}</h2><button onClick={() => setShelfSearchOpen(false)} aria-label="关闭搜索"><X size={20} /></button></div><div className="search-suggestion-grid">{(shelfSearchText ? searchedShelfBooks : shelfBooks).slice(0, 6).map((item) => <button className="search-suggestion-card" key={item.id} onClick={() => { setShelfSearchOpen(false); openShelfBook(item); }}><BookCover book={item} /><span>{item.title}</span><small>{item.bookType || localFormatLabel(item)}</small></button>)}{!shelfSearchText && shelfSearchSuggestions.map((item) => <button className="search-suggestion-card type-result" key={item.label} onClick={() => { setActiveType(item.label); setShelfSearchOpen(false); }}><i /><span>{item.label}</span><small>{item.count} 本</small></button>)}</div></div>}
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
