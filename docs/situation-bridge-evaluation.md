@@ -41,7 +41,18 @@ Fixtures live in `scripts/fixtures/situation-bridge-cases.json`, labeled by crit
 - `budgetCompliance` = 100
 - `inventIdReject` = 100
 
+## Hand protocol
+
+Automated fixtures catch regressions; they do not prove usefulness on real mid-book pages. Before season close, run the **20-case desktop checklist** in [`hand-eval-bridge-protocol.md`](./hand-eval-bridge-protocol.md):
+
+- Built-in 《长征》 plus one imported argument or fiction EPUB
+- 10 show · 5 suppress · 3 evidence-jump · 2「没想起」reopen-ranking cases
+- Fill pass/fail locally — do not commit private results
+
+**Season gate (hand):** show-helpful ≥ **70%** on show rows; suppress correct ≥ **80%** on suppress rows.
+
 ## What this does not do
 
 - Does not dump prior chapters into a model for offline mode
 - Live mode only sends the adjudicator shortlist budgets already enforced by `/api/situation-bridge`
+- Does not replace human helpfulness judgment — use the hand protocol for that
