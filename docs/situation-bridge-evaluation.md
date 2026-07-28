@@ -51,6 +51,8 @@ Automated fixtures catch regressions; they do not prove usefulness on real mid-b
 
 **Season gate (hand):** show-helpful ≥ **70%** on show rows; suppress correct ≥ **80%** on suppress rows.
 
+**Season engineering gate (2026-07-28):** `verify:situation-bridge`, `situation-bridge:evaluate` (98/100, 10/10), and `build` are green on `season/bridge-retention`. Hand protocol remains for human UX sign-off.
+
 ## What this does not do
 
 - Does not dump prior chapters into a model for offline mode

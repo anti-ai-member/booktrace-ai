@@ -13,6 +13,8 @@ Evidence-jump (E01–E03) and Reader Memory ranking (R01–R02) are **required s
 
 Fill **pass/fail** and **note** locally after each run. Do **not** commit filled results if notes contain private reading-position clutter.
 
+**Season engineering gate:** automated eval is green (`npm run verify:situation-bridge`, `npm run situation-bridge:evaluate`, `npm run build`). Hand protocol remains for human UX sign-off before merge-to-main if product requires ≥70%/≥80% live scores.
+
 ## Books
 
 | Label | Source |

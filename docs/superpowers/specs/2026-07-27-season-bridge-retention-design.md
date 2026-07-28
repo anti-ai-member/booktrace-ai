@@ -1,7 +1,7 @@
 # Design: Season — Bridge Retention (not catalog)
 
 **Date:** 2026-07-27  
-**Status:** implementing  
+**Status:** gated (engineering); hand UX pending  
 **Product:** 书脉  
 **Constraint:** Cannot and will not compete with 腾讯读书 / Kindle on book count or discovery.
 

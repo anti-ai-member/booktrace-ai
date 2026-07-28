@@ -250,7 +250,7 @@ Phase 7 quality gate:
 
 ## Phase 8: Reader Memory And Type-Specific Aids
 
-Status: in progress.
+Status: in progress (Bridge Retention season engineering gate green; hand UX pending).
 
 Goal:
 
@@ -262,17 +262,22 @@ Make Reader Memory participate in recall decisions, and surface type-specific ai
 - Feed forgetting and reader events into Context Builder with secondary weight only.
 - Keep mainline / current-page fit as primary score.
 
-Implementation vehicle this season: Feature 019 (`constitution/features/019-reader-memory-bridge-fuel.md`).
+Implementation vehicle this season: Feature 019 (`constitution/features/019-reader-memory-bridge-fuel.md`) — **delivered** (persist remembered/missed; secondary boost in situation-bridge fuel). Hand protocol UX sign-off still pending.
 
 ### Feature 011 — Type-specific memory aids on demand
 
 - Concept / argument / timeline aids appear only when Memory has reliable edges for the current type and page.
 - Reuse left-push workspace patterns; no permanent index rail.
 
+Season companion (type-honest bridges): Feature 021 (`constitution/features/021-type-honest-bridges.md`) — **delivered** (gap/fuel `typeBias`). Full on-demand aid workspaces remain later Phase 8 work.
+
+Also delivered this season: Feature 020 open-book reliability (`constitution/features/020-open-book-reliability.md`).
+
 Phase 8 quality gate:
 
 - Reader feedback changes ranking without flooding the card with noise.
 - Non-history books can recover via topics/arguments without forcing people/places.
+- Automated: `npm run situation-bridge:evaluate` green; human hand protocol (`docs/hand-eval-bridge-protocol.md`) for live ≥70% / ≥80% before treating the season as product-complete.
 
 ---
 
