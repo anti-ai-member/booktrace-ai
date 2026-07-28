@@ -68,13 +68,13 @@ export function prepareSituationBridgeShortlist({
   });
   if (!fuel.length) return suppressedPlan("no-bridges", absence);
 
-  const offer = shouldOfferSituationBridge({ gaps, fuel, mode });
+  const offer = shouldOfferSituationBridge({ gaps, fuel, mode, reader });
   if (!offer.ok) return suppressedPlan(offer.reason, absence);
 
-  const candidates = fuseCandidates(gaps, fuel).slice(0, MAX_CANDIDATES);
+  const candidates = fuseCandidates(gaps, fuel, reader).slice(0, MAX_CANDIDATES);
   if (candidates.length < 2) return suppressedPlan("no-bridges", absence);
 
-  const localBridges = matchBridgesLocal(gaps, candidates, mode);
+  const localBridges = matchBridgesLocal(gaps, candidates, mode, reader);
   const chapterTitle = book.chapters[normalizedCursor.chapterIndex]?.title || `第 ${normalizedCursor.chapterIndex + 1} 节`;
 
   return {
@@ -232,13 +232,13 @@ export function applySituationBridgeJudgement(shortlist, judgement) {
   return finalizeSituationBridgePlan(shortlist, { bridges, question });
 }
 
-export function shouldOfferSituationBridge({ gaps = [], fuel = [], mode = "auto" } = {}) {
+export function shouldOfferSituationBridge({ gaps = [], fuel = [], mode = "auto", reader = null } = {}) {
   if (!gaps.length) return { ok: false, reason: "page-not-dependent" };
   const importantGaps = gaps.filter((gap) => gap.importance >= (mode === "manual" ? 0.35 : 0.45));
   if (!importantGaps.length) return { ok: false, reason: "low-importance-gaps" };
 
   const strongFuel = fuel.filter((item) => item.strength >= (mode === "manual" ? 0.35 : 0.42));
-  const canCover = importantGaps.some((gap) => strongFuel.some((item) => scoreGapFuel(gap, item) >= 0.28));
+  const canCover = importantGaps.some((gap) => strongFuel.some((item) => scoreGapFuel(gap, item, reader) >= 0.28));
   if (!canCover) return { ok: false, reason: "low-importance-gaps" };
   return { ok: true, reason: null };
 }
@@ -459,11 +459,11 @@ function collectRecallFuel({
   return dedupeFuel(fuel).sort((a, b) => b.strength - a.strength);
 }
 
-function fuseCandidates(gaps, fuel) {
+function fuseCandidates(gaps, fuel, reader = null) {
   const scored = [];
   gaps.forEach((gap) => {
     const ranked = fuel
-      .map((item) => ({ item, score: scoreGapFuel(gap, item) }))
+      .map((item) => ({ item, score: scoreGapFuel(gap, item, reader) }))
       .filter((entry) => entry.score >= 0.22)
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
@@ -493,7 +493,7 @@ function fuseCandidates(gaps, fuel) {
     .slice(0, MAX_CANDIDATES);
 }
 
-function matchBridgesLocal(gaps, candidates, mode) {
+function matchBridgesLocal(gaps, candidates, mode, reader = null) {
   const bridges = [];
   const usedCandidates = new Set();
   const threshold = mode === "manual" ? 0.3 : 0.34;
@@ -519,7 +519,7 @@ function matchBridgesLocal(gaps, candidates, mode) {
   sortedGaps.forEach((gap) => {
     const best = candidates
       .filter((item) => !usedCandidates.has(item.candidateId || item.id))
-      .map((item) => ({ item, score: scoreGapFuel(gap, item) }))
+      .map((item) => ({ item, score: scoreGapFuel(gap, item, reader) }))
       .filter((entry) => entry.score >= threshold)
       .sort((a, b) => b.score - a.score)[0];
     if (best) pushBridge(gap, best.item, best.score);
@@ -530,7 +530,7 @@ function matchBridgesLocal(gaps, candidates, mode) {
     const fillGap = sortedGaps[0];
     candidates
       .filter((item) => !usedCandidates.has(item.candidateId || item.id))
-      .map((item) => ({ item, score: scoreGapFuel(fillGap, item) }))
+      .map((item) => ({ item, score: scoreGapFuel(fillGap, item, reader) }))
       .filter((entry) => entry.score >= threshold)
       .sort((a, b) => b.score - a.score)
       .forEach((entry) => {
@@ -565,7 +565,7 @@ function whyNeededText(gap, candidate) {
   return `读懂本页前，先接上：${clip(candidate.title, 16)}。`;
 }
 
-function scoreGapFuel(gap, item) {
+function scoreGapFuel(gap, item, reader = null) {
   if (!gap || !item) return 0;
   const kindBonus = (item.gapKinds || []).includes(gap.kind) ? 0.22 : 0;
   const label = normaliseText(gap.label);
@@ -577,7 +577,25 @@ function scoreGapFuel(gap, item) {
   });
   const strength = Number(item.strength) || 0.3;
   const traceBonus = item.channel === "readerTrace" ? 0.12 : 0;
-  return Math.min(1.4, overlap + kindBonus + strength * 0.45 + traceBonus);
+  const readerDelta = readerSignalDelta(item.id || item.candidateId, reader);
+  return Math.min(1.4, overlap + kindBonus + strength * 0.45 + traceBonus + readerDelta);
+}
+
+/** Secondary Reader Memory signal only; never replaces gap fit. */
+function readerSignalDelta(key, reader) {
+  return readerSignalDeltaForKeys([key], reader);
+}
+
+function readerSignalDeltaForKeys(keys, reader) {
+  if (!reader || !keys?.length) return 0;
+  let missed = 0;
+  let remembered = 0;
+  for (const key of keys) {
+    if (!key) continue;
+    if (reader?.missedKeys?.includes(key)) missed = 0.12;
+    if (reader?.rememberedKeys?.includes(key)) remembered = -0.06;
+  }
+  return Math.max(-0.08, Math.min(0.15, missed + remembered));
 }
 
 function channelForMemoryItem(item) {
@@ -605,7 +623,9 @@ function memoryStrength(item, reader) {
   const priority = item.priority === "primary" ? 0.7 : item.priority === "recent" ? 0.55 : 0.4;
   const mainline = ACTION_HINT.test(item.summary || "") ? 0.15 : 0;
   const forgetting = readerForgettingScore({ memoryKey: item.id, reader }) * 0.12;
-  return Math.min(1, priority + mainline + forgetting);
+  // Fuel ids are `mem:${id}`; feedback keys from cards use the same form.
+  const readerDelta = readerSignalDeltaForKeys([`mem:${item.id}`, item.id], reader);
+  return Math.min(1, Math.max(0, priority + mainline + forgetting + readerDelta));
 }
 
 function recentParagraphFuel(book, cursor) {

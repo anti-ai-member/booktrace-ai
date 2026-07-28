@@ -545,5 +545,142 @@
     "cursor": { "chapterIndex": 1, "pageIndex": 0, "paragraphIndex": 0 },
     "currentPageText": "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
     "mode": "manual"
+  },
+  {
+    "id": "reader-missed-boost-show",
+    "bookType": "history",
+    "factor": "reader-missed",
+    "reader": { "missedKeys": ["mem:ep1"] },
+    "expect": {
+      "suppressed": false,
+      "minBridges": 2,
+      "titleHints": ["封锁渡口", "夏英杰", "渡口"],
+      "mustIncludeTitleHints": ["封锁渡口"],
+      "gapKinds": ["person", "causal", "intent", "state"]
+    },
+    "book": {
+      "id": "hist-a",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "转移",
+          "paragraphs": [
+            "夏英杰决定率部先行转移，并命令卫队封锁渡口。",
+            "此后数日，部队在山谷中休整，等待会合信号。",
+            "雨停之后，斥候回报对岸已无追兵。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "北上",
+          "paragraphs": [
+            "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+            "山谷里只剩风声，并无新的命令。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "e1",
+          "kind": "person",
+          "name": "夏英杰",
+          "summary": "率部转移并封锁渡口的主事者",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "夏英杰决定率部先行转移" }
+        }
+      ],
+      "episodic": [
+        {
+          "id": "ep1",
+          "kind": "event",
+          "name": "封锁渡口",
+          "summary": "夏英杰命令卫队封锁渡口以便转移",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "命令卫队封锁渡口" }
+        }
+      ],
+      "timeline": [],
+      "topics": [],
+      "arguments": [],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 0, "paragraphIndex": 0 },
+    "currentPageText": "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+    "mode": "manual"
+  },
+  {
+    "id": "reader-remembered-not-only",
+    "bookType": "history",
+    "factor": "reader-remembered",
+    "reader": { "rememberedKeys": ["mem:person:山谷斥候"] },
+    "expect": {
+      "suppressed": false,
+      "minBridges": 2,
+      "titleHints": ["夏英杰", "渡口", "封锁"],
+      "gapKinds": ["person", "causal", "intent", "state"]
+    },
+    "book": {
+      "id": "hist-a",
+      "chapters": [
+        {
+          "id": "c0",
+          "title": "转移",
+          "paragraphs": [
+            "夏英杰决定率部先行转移，并命令卫队封锁渡口。",
+            "此后数日，部队在山谷中休整，等待会合信号。",
+            "雨停之后，山谷斥候回报对岸已无追兵。"
+          ]
+        },
+        {
+          "id": "c1",
+          "title": "北上",
+          "paragraphs": [
+            "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+            "山谷里只剩风声，并无新的命令。"
+          ]
+        }
+      ]
+    },
+    "bookMemory": {
+      "version": 2,
+      "entities": [
+        {
+          "id": "e1",
+          "kind": "person",
+          "name": "夏英杰",
+          "summary": "率部转移并封锁渡口的主事者",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "夏英杰决定率部先行转移" }
+        },
+        {
+          "id": "e-weak",
+          "kind": "person",
+          "name": "山谷斥候",
+          "summary": "雨停后回报对岸情况的次要人物",
+          "priority": "secondary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 2, "quote": "山谷斥候回报对岸已无追兵" }
+        }
+      ],
+      "episodic": [
+        {
+          "id": "ep1",
+          "kind": "event",
+          "name": "封锁渡口",
+          "summary": "夏英杰命令卫队封锁渡口以便转移",
+          "priority": "primary",
+          "evidence": { "chapterIndex": 0, "paragraphIndex": 0, "quote": "命令卫队封锁渡口" }
+        }
+      ],
+      "timeline": [],
+      "topics": [],
+      "arguments": [],
+      "relationships": []
+    },
+    "cursor": { "chapterIndex": 1, "pageIndex": 0, "paragraphIndex": 0 },
+    "currentPageText": "因此夏英杰下令继续北上，渡口一事仍压在众人心头。",
+    "mode": "manual"
   }
 ]

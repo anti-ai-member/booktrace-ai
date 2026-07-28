@@ -38,7 +38,7 @@ if (!report.pass.passed) {
 }
 
 async function evaluateCase(fixture, options) {
-  const shortlist = prepareSituationBridgeShortlist({
+  const planOptions = {
     book: fixture.book,
     bookMemory: fixture.bookMemory,
     cursor: fixture.cursor,
@@ -46,9 +46,11 @@ async function evaluateCase(fixture, options) {
     notes: fixture.notes || [],
     explains: fixture.explains || [],
     bookmarks: fixture.bookmarks || [],
+    reader: fixture.reader || null,
     mode: fixture.mode || "manual",
     minAbsenceMs: 0,
-  });
+  };
+  const shortlist = prepareSituationBridgeShortlist(planOptions);
 
   let plan;
   let liveMeta = null;
@@ -78,17 +80,7 @@ async function evaluateCase(fixture, options) {
     });
   }
 
-  plan = buildSituationBridgePlan({
-    book: fixture.book,
-    bookMemory: fixture.bookMemory,
-    cursor: fixture.cursor,
-    currentPageText: fixture.currentPageText,
-    notes: fixture.notes || [],
-    explains: fixture.explains || [],
-    bookmarks: fixture.bookmarks || [],
-    mode: fixture.mode || "manual",
-    minAbsenceMs: 0,
-  });
+  plan = buildSituationBridgePlan(planOptions);
   return scoreRow(fixture, plan, shortlist, { liveMeta });
 }
 
@@ -176,6 +168,13 @@ function scoreRow(fixture, plan, shortlist, extras = {}) {
 
     const precision = scorePrecision(bridges, expect.titleHints || []);
     checks.push({ id: "precision", pass: precision >= 0.5, value: precision });
+
+    if (expect.mustIncludeTitleHints?.length) {
+      const missing = expect.mustIncludeTitleHints.filter(
+        (hint) => !bridges.some((bridge) => overlaps(bridge.title, hint) || overlaps(bridge.whyNeeded, hint)),
+      );
+      checks.push({ id: "mustInclude", pass: missing.length === 0, missing });
+    }
 
     if (expect.gapKinds?.length && plan?.gaps?.length) {
       const kinds = new Set(plan.gaps.map((item) => item.kind));
