@@ -1038,6 +1038,7 @@ export function App() {
       };
       const { shortlist, card: localCard } = prepareSituationRecovery(nextBook, persistedMemory, cursor, lastActivity, memoryState, {
         mode: "auto",
+        bookType: nextBook.bookType || storedRecord?.profile?.category || "",
         ...readerFuel,
       });
       if (recoveryCardJobRef.current !== jobId) return;
@@ -1144,6 +1145,7 @@ export function App() {
     const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
     const { shortlist, card: localCard } = prepareSituationRecovery(book, bookMemory, cursor, null, memoryState, {
       mode: "manual",
+      bookType: book.bookType || bookProfile?.category || "",
       notes,
       explains,
       bookmarks,
@@ -1510,6 +1512,7 @@ export function App() {
       const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
       const prepared = prepareSituationRecovery(book, nextBookMemory, cursor, null, memoryState, {
         mode: "manual",
+        bookType: result.profile?.category || book.bookType || bookProfile?.category || "",
         notes,
         explains,
         bookmarks,
@@ -3846,6 +3849,7 @@ function prepareSituationRecovery(book, bookMemoryInput = {}, savedPosition = {}
     bookmarks: options.bookmarks || [],
     mode: options.mode || "auto",
     minAbsenceMs: options.mode === "manual" ? 0 : RECOVERY_CARD_MIN_ABSENCE_MS,
+    bookType: options.bookType || book?.bookType || "",
   });
   const plan = finalizeSituationBridgePlan(shortlist, null);
   return { shortlist, card: situationBridgeToRecoveryCard(plan) };

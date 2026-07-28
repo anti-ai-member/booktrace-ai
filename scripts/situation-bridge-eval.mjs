@@ -49,6 +49,7 @@ async function evaluateCase(fixture, options) {
     reader: fixture.reader || null,
     mode: fixture.mode || "manual",
     minAbsenceMs: 0,
+    bookType: fixture.bookType || fixture.book?.bookType || "",
   };
   const shortlist = prepareSituationBridgeShortlist(planOptions);
 

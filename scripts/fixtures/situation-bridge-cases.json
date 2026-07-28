@@ -210,7 +210,7 @@
       "suppressed": false,
       "minBridges": 2,
       "titleHints": ["可错性", "证伪", "批评"],
-      "gapKinds": ["concept", "intent", "causal", "state"]
+      "gapKinds": ["concept", "causal"]
     },
     "book": {
       "id": "arg-a",
@@ -360,7 +360,7 @@
       "suppressed": false,
       "minBridges": 2,
       "titleHints": ["背叛", "离开", "契约"],
-      "gapKinds": ["intent", "person", "causal", "state", "relation"]
+      "gapKinds": ["person", "causal", "intent"]
     },
     "book": {
       "id": "fic-a",
@@ -615,7 +615,7 @@
     "id": "reader-remembered-not-only",
     "bookType": "history",
     "factor": "reader-remembered",
-    "reader": { "rememberedKeys": ["mem:person:山谷斥候"] },
+    "reader": { "rememberedKeys": ["mem:e-weak"] },
     "expect": {
       "suppressed": false,
       "minBridges": 2,

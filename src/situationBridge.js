@@ -40,10 +40,12 @@ export function prepareSituationBridgeShortlist({
   bookmarks = [],
   mode = "auto",
   minAbsenceMs = 0,
+  bookType = "",
 } = {}) {
   const absence = describeAbsence(lastActivity);
   const normalizedCursor = normalizeCursor(cursor);
   const memory = normalizeBookMemory(bookMemory || {});
+  const bias = typeBias(bookType || book?.bookType || "");
 
   if (mode === "auto" && minAbsenceMs > 0 && Number(lastActivity || 0) && Date.now() - Number(lastActivity) < minAbsenceMs) {
     return suppressedPlan("recent-activity", absence);
@@ -53,7 +55,7 @@ export function prepareSituationBridgeShortlist({
   }
 
   const pageText = normaliseText(currentPageText || extractCurrentPageText(book, normalizedCursor));
-  const gaps = extractPageGaps(pageText, memory, normalizedCursor);
+  const gaps = extractPageGaps(pageText, memory, normalizedCursor, bias);
   if (!gaps.length) return suppressedPlan("page-not-dependent", absence);
 
   const fuel = collectRecallFuel({
@@ -68,13 +70,13 @@ export function prepareSituationBridgeShortlist({
   });
   if (!fuel.length) return suppressedPlan("no-bridges", absence);
 
-  const offer = shouldOfferSituationBridge({ gaps, fuel, mode, reader });
+  const offer = shouldOfferSituationBridge({ gaps, fuel, mode, reader, bias });
   if (!offer.ok) return suppressedPlan(offer.reason, absence);
 
-  const candidates = fuseCandidates(gaps, fuel, reader).slice(0, MAX_CANDIDATES);
+  const candidates = fuseCandidates(gaps, fuel, reader, bias).slice(0, MAX_CANDIDATES);
   if (candidates.length < 2) return suppressedPlan("no-bridges", absence);
 
-  const localBridges = matchBridgesLocal(gaps, candidates, mode, reader);
+  const localBridges = matchBridgesLocal(gaps, candidates, mode, reader, bias);
   const chapterTitle = book.chapters[normalizedCursor.chapterIndex]?.title || `第 ${normalizedCursor.chapterIndex + 1} 节`;
 
   return {
@@ -232,15 +234,35 @@ export function applySituationBridgeJudgement(shortlist, judgement) {
   return finalizeSituationBridgePlan(shortlist, { bridges, question });
 }
 
-export function shouldOfferSituationBridge({ gaps = [], fuel = [], mode = "auto", reader = null } = {}) {
+export function shouldOfferSituationBridge({ gaps = [], fuel = [], mode = "auto", reader = null, bias = null } = {}) {
   if (!gaps.length) return { ok: false, reason: "page-not-dependent" };
+  const typeWeights = bias || typeBias();
   const importantGaps = gaps.filter((gap) => gap.importance >= (mode === "manual" ? 0.35 : 0.45));
   if (!importantGaps.length) return { ok: false, reason: "low-importance-gaps" };
 
   const strongFuel = fuel.filter((item) => item.strength >= (mode === "manual" ? 0.35 : 0.42));
-  const canCover = importantGaps.some((gap) => strongFuel.some((item) => scoreGapFuel(gap, item, reader) >= 0.28));
+  const canCover = importantGaps.some((gap) => strongFuel.some((item) => scoreGapFuel(gap, item, reader, typeWeights) >= 0.28));
   if (!canCover) return { ok: false, reason: "low-importance-gaps" };
   return { ok: true, reason: null };
+}
+
+/** Type-honest multipliers for gap importance and fuel kind bonus. */
+export function typeBias(category = "") {
+  const text = String(category || "");
+  if (/科普|技术|哲学|商业|教材|论证|社科|argument|science|tech|philosophy|business|textbook|social/i.test(text)) {
+    return { concept: 1.2, intent: 1.1, causal: 1.05, person: 0.85, spatial: 0.8 };
+  }
+  if (/小说|文学|fiction|romance/i.test(text)) {
+    return { person: 1.15, intent: 1.15, relation: 1.1, concept: 0.85 };
+  }
+  return { person: 1.05, causal: 1.1, temporal: 1.05, spatial: 1.05 };
+}
+
+function biasImportance(kind, importance, bias, { primary = false } = {}) {
+  let factor = Number(bias?.[kind]) || 1;
+  // Argument/science: demote incidental people, keep primary closer to unscaled.
+  if (primary && factor < 1) factor = Math.min(1, factor + 0.12);
+  return Math.min(1, importance * factor);
 }
 
 export function situationBridgeToRecoveryCard(plan) {
@@ -280,16 +302,19 @@ export function suppressReasonMessage(reason, mode = "manual") {
   return "此刻没有需要接上的前文";
 }
 
-function extractPageGaps(pageText, memory, cursor) {
+function extractPageGaps(pageText, memory, cursor, bias = null) {
   const text = normaliseText(pageText);
   if (text.length < 24) return [];
+  const typeWeights = bias || typeBias();
 
   const gaps = [];
-  const pushGap = (label, kind, importance) => {
+  const pushGap = (label, kind, importance, meta = {}) => {
     const clean = clip(normaliseText(label), 40);
     if (!clean || clean.length < 2) return;
+    // Fiction: demote abstract mega-topics harder via concept bias.
     if (isBroadMegaTopic(clean) && importance < 0.7) return;
     if (NOISE_PATTERNS.test(clean)) return;
+    const scaled = biasImportance(kind, importance, typeWeights, meta);
     const dupIndex = gaps.findIndex((item) => {
       if (item.label === clean) return true;
       const short = Math.min(item.label.length, clean.length);
@@ -302,12 +327,12 @@ function extractPageGaps(pageText, memory, cursor) {
     });
     if (dupIndex >= 0) {
       const existing = gaps[dupIndex];
-      if (clean.length + 4 < existing.label.length && existing.label.includes(clean) && importance >= existing.importance - 0.05) {
+      if (clean.length + 4 < existing.label.length && existing.label.includes(clean) && scaled >= existing.importance - 0.05) {
         gaps[dupIndex] = {
           id: existing.id,
           label: clean,
           kind,
-          importance: Math.min(1, Math.max(existing.importance, importance)),
+          importance: Math.min(1, Math.max(existing.importance, scaled)),
         };
       }
       return;
@@ -316,7 +341,7 @@ function extractPageGaps(pageText, memory, cursor) {
       id: `gap-${gaps.length + 1}`,
       label: clean,
       kind,
-      importance: Math.min(1, importance),
+      importance: Math.min(1, scaled),
     });
   };
 
@@ -331,7 +356,7 @@ function extractPageGaps(pageText, memory, cursor) {
     const entity = (scoped.entities || []).find((item) => normaliseText(item.name) === name);
     const kind = entity?.kind === "place" ? "spatial" : entity?.kind === "organization" ? "relation" : "person";
     const importance = entity?.priority === "primary" ? 0.72 : entity?.priority === "recent" ? 0.58 : 0.4;
-    pushGap(name, kind, importance);
+    pushGap(name, kind, importance, { primary: entity?.priority === "primary" });
   });
 
   extractLooseNames(text).forEach((name) => {
@@ -459,11 +484,12 @@ function collectRecallFuel({
   return dedupeFuel(fuel).sort((a, b) => b.strength - a.strength);
 }
 
-function fuseCandidates(gaps, fuel, reader = null) {
+function fuseCandidates(gaps, fuel, reader = null, bias = null) {
+  const typeWeights = bias || typeBias();
   const scored = [];
   gaps.forEach((gap) => {
     const ranked = fuel
-      .map((item) => ({ item, score: scoreGapFuel(gap, item, reader) }))
+      .map((item) => ({ item, score: scoreGapFuel(gap, item, reader, typeWeights) }))
       .filter((entry) => entry.score >= 0.22)
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
@@ -493,7 +519,8 @@ function fuseCandidates(gaps, fuel, reader = null) {
     .slice(0, MAX_CANDIDATES);
 }
 
-function matchBridgesLocal(gaps, candidates, mode, reader = null) {
+function matchBridgesLocal(gaps, candidates, mode, reader = null, bias = null) {
+  const typeWeights = bias || typeBias();
   const bridges = [];
   const usedCandidates = new Set();
   const threshold = mode === "manual" ? 0.3 : 0.34;
@@ -519,7 +546,7 @@ function matchBridgesLocal(gaps, candidates, mode, reader = null) {
   sortedGaps.forEach((gap) => {
     const best = candidates
       .filter((item) => !usedCandidates.has(item.candidateId || item.id))
-      .map((item) => ({ item, score: scoreGapFuel(gap, item, reader) }))
+      .map((item) => ({ item, score: scoreGapFuel(gap, item, reader, typeWeights) }))
       .filter((entry) => entry.score >= threshold)
       .sort((a, b) => b.score - a.score)[0];
     if (best) pushBridge(gap, best.item, best.score);
@@ -530,7 +557,7 @@ function matchBridgesLocal(gaps, candidates, mode, reader = null) {
     const fillGap = sortedGaps[0];
     candidates
       .filter((item) => !usedCandidates.has(item.candidateId || item.id))
-      .map((item) => ({ item, score: scoreGapFuel(fillGap, item, reader) }))
+      .map((item) => ({ item, score: scoreGapFuel(fillGap, item, reader, typeWeights) }))
       .filter((entry) => entry.score >= threshold)
       .sort((a, b) => b.score - a.score)
       .forEach((entry) => {
@@ -565,9 +592,11 @@ function whyNeededText(gap, candidate) {
   return `读懂本页前，先接上：${clip(candidate.title, 16)}。`;
 }
 
-function scoreGapFuel(gap, item, reader = null) {
+function scoreGapFuel(gap, item, reader = null, bias = null) {
   if (!gap || !item) return 0;
-  const kindBonus = (item.gapKinds || []).includes(gap.kind) ? 0.22 : 0;
+  const typeWeights = bias || typeBias();
+  const kindFactor = Number(typeWeights[gap.kind]) || 1;
+  const kindBonus = (item.gapKinds || []).includes(gap.kind) ? 0.22 * kindFactor : 0;
   const label = normaliseText(gap.label);
   const hay = normaliseText(`${item.title} ${item.snippet}`);
   let overlap = 0;
