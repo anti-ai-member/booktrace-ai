@@ -4,7 +4,7 @@ This document is the interface contract for Shumai. Any new UI or interaction ch
 
 ## Product Promise
 
-书脉 is a quiet reading companion. Its value is not "AI summary everywhere"; its value is:
+书脉 is a quiet reading companion and a **second-layer serious reader**: books are discovered or bought elsewhere; 书脉 helps readers resume and understand them. Its value is not "AI summary everywhere" and not a bookstore catalog; its value is:
 
 > AI 知道此刻你最应该回忆什么。
 
@@ -80,12 +80,13 @@ Chrome, transient reading tools, and recovery/memory cards share one control lan
 ### Home
 
 - Left icon rail.
-- Top wide search.
+- Top wide text search. Do not add an image-search control unless a real image-search workflow is available.
 - Cover-first bookshelf grid.
 - Default book cards show little/no text.
 - Title, author, progress, and actions appear on hover/focus.
 - Type/category filters open as click-triggered side flyout.
 - Avoid large header zones and dense text chips.
+- Continue-reading band: cover | progress copy | **this-book resume context** (leave-off chapter, quiet absence, up to two local memory anchors). Do not fill the right with catalog recommendations or discovery covers.
 
 ### Reader
 
@@ -101,19 +102,19 @@ Chrome, transient reading tools, and recovery/memory cards share one control lan
 
 - Topbar:
   - Icon-only search trigger opens a quiet paper panel anchored under the icon (`Ctrl K`); not a centered marketing modal.
-  - Secondary progress/status controls on the right.
+  - Merge the compact reader chrome and chapter metadata into one 48px row. The larger bold chapter title anchors the left; page/bookmark metadata follows it, while search, contextual recall, and a visual progress line form a quiet right-side tool group. Align this row to the page content column so the body begins immediately beneath it; percentage and privacy/Trace status text stay out of the permanent chrome.
 
 - Reading stage:
   - Page-turn reading, no internal scrolling in the page body.
   - In-book EPUB figures render inline in the page track (quiet centered images); packing reserves their height so glyphs and figures are not clipped.
-  - Stable top chapter navigation and bottom page navigation.
-  - Chapter controls and page controls must use distinct icons.
-  - Chapter/page step controls, page recall, Trace status, and top-right status cluster are **icon-only**; labels appear only via `title` / `aria-label` on hover/focus.
-  - Top-right status cluster (Trace + progress + shield) shares one baseline/height.
+  - Chapter identity appears once in the page title; do not repeat a chapter label in a separate top toolbar.
+  - Page turning uses left/right reading-edge targets that reveal a quiet directional affordance on hover or focus; do not use a persistent bottom pager.
+  - Page-turn controls and page recall are **icon-only**; labels appear only via `title` / `aria-label` on hover/focus.
 
 - Side panels:
-  - Directory, bookmarks, notes, themes, AI settings, and reading indexes use the same left-panel toggle behavior.
+  - Directory, bookmarks, notes, AI settings, and reading indexes use the same left-panel toggle behavior.
   - No floating popovers for primary reader tools.
+  - The AI panel is outcome-led: call it reading memory and state that it prepares the main thread, current-page prerequisites, and evidence from already-read content. Its read-bounded update should reveal an existing local recovery card immediately when available; model refinement remains a visible background task. Full-book rebuild is explicit, secondary, and marked as slow correction work. All visible panel copy uses the locale catalog.
 
 ## Core Flows
 
@@ -231,7 +232,7 @@ Actions:
 
 笔记 rules:
 
-- Saving a note on selected text persists the selection plus paragraph/offset anchors when available, and underlines the annotated span in the page with a quiet solid bottom underline (rose/ink, theme-aware) — distinct from 「解」badges (no badge, no wash).
+- Saving a note on selected text persists the selection plus paragraph/offset anchors when available, and underlines the annotated span in the page with a quiet solid bottom underline (rose/ink) — distinct from 「解」badges (no badge, no wash).
 - Deleting a note from the sidebar clears storage and the underline immediately.
 - Notes sidebar list order: selection excerpt first, chapter/page source second, note content third. Click still jumps to the annotated location.
 
@@ -245,6 +246,7 @@ Actions:
 - Non-source modes may call a read-bounded model; source mode is local cites only.
 - Switching speed refetches non-source answers (cache keyed by mode + speed).
 - Persist every successful 解惑 result per book. Closing the panel must not discard stored explains.
+- Book-wide exact-text reuse: when the reader selects the same trimmed selection again elsewhere and opens 解惑, restore the newest matching cached answer (prefer the default mode when present) without a forced refetch. Stay on the current page; do not jump to the original span. Do not render「解」markers on later occurrences. Persist updates from a reuse session write back to the original chapter/paragraph/offsets. Bloom「删除」remains position-only.
 - Mark the original selection in the page with a quiet badge (default「解」). Multiple explains on the same span collapse to one badge + count.
 - Long hover (~500ms) on a marker shows a compact preview only: mode (+ speed), one-line conclusion (title or first sentence, max ~2 lines), and「依据 ×N · 点击展开」— never the full answer.
 - Preview, reopened 解惑 panel, and the selection bloom (when the selection matches stored explains) all allow deleting; delete removes localStorage and clears the in-text marker immediately. Grouped badges (`解·N`) delete the currently shown item from preview; bloom delete removes all matching explains for that selection group.
@@ -307,8 +309,22 @@ Empty states should be quiet and specific:
 - "当前页附近还没有可靠关系证据。"
 - "尚未从已读内容中提取到可追溯时间线。"
 - "继续阅读几页后，书脉会形成更稳定的记忆。"
+- Empty shelf / onboarding must state the second-layer story (books come from elsewhere; import to read through interruptions) — never only「请导入」or a fake catalog tease.
 
 Avoid blame or technical wording.
+
+## Mobile (Phase 11 / Feature 022)
+
+Phone delivery uses Capacitor wrapping the same React reader. Before shipping mobile chrome changes, update this section deliberately.
+
+Locked for mobile UE:
+
+- Reading canvas stays primary; keep the icon rail; on phone widths (`max-width: 760px`) side panels open as overlays/sheets over the page (not a permanent dual-column that halves the canvas).
+- Touch-friendly page turns; keep bridges-first recovery and 选文解惑 without desktop-only popover traps.
+- Prefer icon-only chrome with tooltip/`aria-label` labels; continue control remains the quiet accent next step.
+- Do not introduce a second visual language for the app shell; adapt density and hit targets for phone widths (≥40px primary rail hits).
+- No online bookstore UI, recommendation shelves, or catalog browsing as home chrome.
+- Validate first in Chrome device mode (~390px); Capacitor/real devices after that smoke is green.
 
 ## Forbidden Patterns
 
@@ -333,6 +349,6 @@ Before changing UI:
 - Confirm the primary action.
 - Confirm evidence behavior.
 - Confirm empty state.
-- Confirm no overlap at 1365x768 and 1920x1080.
+- Confirm no overlap at 1365x768 and 1920x1080 (desktop); for phone work also smoke a phone-width viewport and follow Feature 022.
 - Run `npm run build`.
 - Preview in the in-app browser when layout changes are visible.

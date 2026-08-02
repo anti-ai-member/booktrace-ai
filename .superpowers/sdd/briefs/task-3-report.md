@@ -3,7 +3,7 @@
 **Status:** DONE  
 **Branch:** `season/bridge-retention`  
 **Base:** `1567a0f5addb75f3d2bdd07ea35bff4e496c665d`  
-**Commit:** (see git log) — feat: secondary Reader Memory boosts for situation-bridge fuel
+**Commit:** `5996c95` — feat: secondary Reader Memory boosts for situation-bridge fuel
 
 ## Deliverables
 

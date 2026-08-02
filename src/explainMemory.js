@@ -161,6 +161,30 @@ export function findExplainsForSelection(explains, selectionMeta) {
   return (Array.isArray(explains) ? explains : []).filter((record) => selectionOverlapsExplain(selectionMeta, record));
 }
 
+/** Exact selection text match (trim only) — for book-wide reuse, not fuzzy/contains. */
+export function normalizeExplainSelection(text) {
+  return String(text || "").trim();
+}
+
+export function findExplainsByExactSelection(explains, text) {
+  const needle = normalizeExplainSelection(text);
+  if (!needle) return [];
+  return (Array.isArray(explains) ? explains : [])
+    .filter((record) => normalizeExplainSelection(record?.selection) === needle)
+    .sort((left, right) => (right.createdAt || 0) - (left.createdAt || 0));
+}
+
+/** Newest exact-text explain for reuse; optional preferred mode wins when tied by recency group. */
+export function pickExplainForTextReuse(explains, text, preferredMode = null) {
+  const matches = findExplainsByExactSelection(explains, text);
+  if (!matches.length) return null;
+  if (preferredMode) {
+    const preferred = matches.find((item) => item.mode === preferredMode);
+    if (preferred) return preferred;
+  }
+  return matches[0];
+}
+
 export function spanGroupKey(record) {
   return [
     Number(record.chapterIndex) || 0,

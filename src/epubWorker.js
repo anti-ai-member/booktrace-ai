@@ -28,6 +28,7 @@ async function parseEpubBuffer(buffer) {
   const creator = tagText(opfSource, "dc:creator") || "未知作者";
   const publisher = tagText(opfSource, "dc:publisher") || "";
   const spineIds = [...opfSource.matchAll(/<itemref\b[^>]*>/gi)].map((match) => attr(match[0], "idref")).filter(Boolean);
+  const navigationLabels = await chapterLabelsFromNavigation(zip, manifest, basePath);
 
   const chapters = [];
   for (let index = 0; index < spineIds.length; index += 1) {
@@ -41,7 +42,7 @@ async function parseEpubBuffer(buffer) {
       chapters.push({
         id: `chapter-${index}`,
         href: item.href,
-        title: heading || `第 ${chapters.length + 1} 节`,
+        title: navigationLabels.get(entryPath) || heading || `第 ${chapters.length + 1} 节`,
         paragraphs,
       });
     }
@@ -90,6 +91,42 @@ async function blocksFromHtml(source, zip, chapterPath) {
   }
 
   return { heading, paragraphs };
+}
+
+function addNavigationLabel(labels, basePath, href, label) {
+  const cleanLabel = stripTags(label).replace(/\s+/g, " ").trim();
+  if (!href || !cleanLabel) return;
+  const path = normalisePath(basePath, href);
+  if (!labels.has(path)) labels.set(path, cleanLabel);
+}
+
+async function chapterLabelsFromNavigation(zip, manifest, basePath) {
+  const labels = new Map();
+  const navItems = [...manifest.values()].filter((item) => String(item.properties || "").split(/\s+/).includes("nav"));
+  const ncxItems = [...manifest.values()].filter((item) => item.type === "application/x-dtbncx+xml");
+
+  for (const item of [...navItems, ...ncxItems]) {
+    if (!item.href) continue;
+    const navigationPath = normalisePath(basePath, item.href);
+    const entry = zip.file(navigationPath);
+    if (!entry) continue;
+    const source = await entry.async("text");
+    const navigationBase = navigationPath.split("/").slice(0, -1).join("/");
+
+    if (item.type === "application/x-dtbncx+xml") {
+      for (const point of source.matchAll(/<navPoint\b[^>]*>([\s\S]*?)<\/navPoint>/gi)) {
+        const content = point[1] || "";
+        addNavigationLabel(labels, navigationBase, attr(content.match(/<content\b[^>]*>/i)?.[0] || "", "src"), tagText(content, "text"));
+      }
+      continue;
+    }
+
+    for (const anchor of source.matchAll(/<a\b[^>]*href=["'][^"']+["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+      addNavigationLabel(labels, navigationBase, attr(anchor[0], "href"), anchor[1] || "");
+    }
+  }
+
+  return labels;
 }
 
 function imageHrefFromTag(tag) {
@@ -152,7 +189,13 @@ function stripTags(value) {
 }
 
 function normalisePath(base, href) {
-  const cleanHref = href.split("#")[0];
+  const fragmentFreeHref = href.split("#")[0];
+  let cleanHref = fragmentFreeHref;
+  try {
+    cleanHref = decodeURIComponent(fragmentFreeHref);
+  } catch {
+    // Keep malformed escape sequences readable enough for ZIP lookup.
+  }
   const parts = `${base}/${cleanHref}`.split("/");
   const resolved = [];
   parts.forEach((part) => {

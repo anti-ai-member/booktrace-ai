@@ -42,12 +42,15 @@ const PROVIDERS = {
 /** Default model for continued-reading recovery cards (DeepSeek Pro + thinking). */
 const DEFAULT_RECOVERY_MODEL = "deepseek-v4-pro";
 
-function createModelClient({ provider, model, thinking = false }) {
+function createModelClient({ provider, model, thinking = false, maxTokens } = {}) {
   const config = PROVIDERS[provider];
   const resolvedModel = model || config.defaultModel;
   const modelKwargs = thinking && provider === "deepseek"
     ? { thinking: { type: "enabled" }, reasoning_effort: "high" }
     : undefined;
+  const resolvedMaxTokens = Number.isFinite(maxTokens)
+    ? maxTokens
+    : (thinking ? 8192 : 4096);
   return {
     model: resolvedModel,
     client: new ChatOpenAI({
@@ -55,8 +58,8 @@ function createModelClient({ provider, model, thinking = false }) {
       model: resolvedModel,
       // Thinking mode ignores sampling params; omit temperature when enabled.
       ...(thinking ? {} : { temperature: 0 }),
-      maxTokens: thinking ? 8192 : undefined,
-      timeout: thinking ? 180_000 : 60_000,
+      maxTokens: resolvedMaxTokens,
+      timeout: thinking ? 180_000 : 90_000,
       configuration: config.baseURL ? { baseURL: config.baseURL } : undefined,
       modelKwargs,
     }),
@@ -290,7 +293,11 @@ app.post("/api/analyze", async (request, response) => {
   if (!apiKey) return response.status(400).json({ error: `Please configure ${config.apiKey} in .env first` });
 
   try {
-    const { client: modelClient, model: resolvedModel } = createModelClient({ provider, model });
+    const { client: modelClient, model: resolvedModel } = createModelClient({
+      provider,
+      model,
+      maxTokens: 4096,
+    });
     const activeTraceProfile = traceProfile || traceProfileForPrompt(resolveTraceProfile(book.bookType, book.indexSchema || []));
     const priorMemory = resolvePreviousBookMemory({
       previousBookMemory,
@@ -876,19 +883,53 @@ ${JSON.stringify(book)}`;
 }
 
 function parseJson(content) {
-  const text = typeof content === "string" ? content : JSON.stringify(content);
+  const text = String(typeof content === "string" ? content : (content == null ? "" : JSON.stringify(content))).trim();
+  if (!text) {
+    throw new Error("模型返回为空，请重试更新恢复卡");
+  }
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  return JSON.parse(fenced ? fenced[1] : text);
+  const candidate = String(fenced ? fenced[1] : text).trim();
+  try {
+    return JSON.parse(candidate);
+  } catch (error) {
+    const objectMatch = candidate.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      try {
+        return JSON.parse(objectMatch[0]);
+      } catch {
+        // fall through
+      }
+    }
+    const hint = /Unexpected end of JSON input/i.test(String(error?.message || ""))
+      ? "模型输出被截断或不是完整 JSON，请重试"
+      : (error?.message || "模型输出不是有效 JSON");
+    throw new Error(hint);
+  }
 }
 
 /** Extract final answer text from a LangChain AIMessage (thinking models keep CoT separate). */
 function messageContent(result) {
   const content = result?.content;
-  if (typeof content === "string") return content;
+  if (typeof content === "string" && content.trim()) return content;
   if (Array.isArray(content)) {
-    return content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("");
+    const joined = content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("");
+    if (joined.trim()) return joined;
   }
-  return String(content ?? "");
+  // Some providers park the visible answer beside thinking / tool payloads.
+  const extras = [
+    result?.additional_kwargs?.content,
+    result?.additional_kwargs?.text,
+    result?.response_metadata?.content,
+    result?.kwargs?.content,
+  ];
+  for (const extra of extras) {
+    if (typeof extra === "string" && extra.trim()) return extra;
+    if (Array.isArray(extra)) {
+      const joined = extra.map((part) => (typeof part === "string" ? part : part?.text || "")).join("");
+      if (joined.trim()) return joined;
+    }
+  }
+  return "";
 }
 
 function normaliseIndex(raw, chapters) {

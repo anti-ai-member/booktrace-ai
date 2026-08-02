@@ -6,6 +6,7 @@ import {
   adjudicatorPayloadFromShortlist,
   applySituationBridgeJudgement,
   buildSituationBridgePlan,
+  dedupeSituationBridges,
   prepareSituationBridgeShortlist,
   situationBridgeToRecoveryCard,
   shouldOfferSituationBridge,
@@ -79,6 +80,14 @@ assert(dependent.bridges.length >= 2, "expected >=2 bridges");
 assert(dependent.bridges.every((item) => item.whyNeeded && item.evidence), "bridges need whyNeeded+evidence");
 const card = situationBridgeToRecoveryCard(dependent);
 assert(card?.bridges?.length >= 2, "card mapping failed");
+
+const duplicateTitleBridges = dedupeSituationBridges([
+  { id: "legacy-person", candidateId: "entity:1", title: "肖亚文", score: 0.4 },
+  { id: "current-person", candidateId: "entity:99", title: " 肖 亚 文 ", score: 0.8 },
+  { id: "company", candidateId: "organization:1", title: "索林特博彩公司", score: 0.5 },
+]);
+assert(duplicateTitleBridges.length === 2, "same displayed anchor must use one recall slot");
+assert(duplicateTitleBridges[0].id === "current-person", "stronger duplicate anchor should win");
 
 const scenic = buildSituationBridgePlan({
   book,

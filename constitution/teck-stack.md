@@ -13,6 +13,15 @@
 - React for UI state and reader interaction.
 - React Flow only for necessary relationship visualization.
 - PixiJS only for future ability-tree visual scenes; the ability tree is currently hidden as a later feature.
+- **Mobile delivery (next quarter):** Capacitor wraps the existing Vite/React web app for iOS and Android. Prefer responsive CSS and shared reader logic over a second native UI codebase. Do not default to React Native or Flutter rewrites.
+- Capacitor native plugins are additive only where the Web platform is insufficient (e.g. share-target / filesystem / status bar). Keep Memory Engine and situation-bridge logic in the shared JS layer.
+
+## Cross-device sync direction
+
+- Local-first remains the source of truth on each device (IndexedDB / localStorage).
+- Sync is an enhancement: library metadata, reading progress, notes, bookmarks, explains, and `bookMemory` / reader feedback across devices.
+- Book file blobs may sync or transfer separately; Wi‑Fi desktop→phone transfer is an acceptable interim before full cloud sync.
+- Sync must not imply an online bookstore or server-side catalog.
 
 ## Architecture
 
@@ -83,6 +92,7 @@ Architecture rules:
 - Search gate: runtime code must not import or reference removed RAG modules.
 - Evaluation gate: `npm run trace:evaluate` where available.
 - UI gate for visual changes: run local server and inspect with browser/screenshot.
+- Mobile gate (Phase 11): phone-width layout smoke + Capacitor debug build checklist (see Feature 022).
 - Feature verification: every feature implementation must be reviewed by a sub-agent against its spec.
 
 ## Benchmark

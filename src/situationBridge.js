@@ -25,6 +25,37 @@ const MAX_BRIDGES_AUTO = 2;
 const MAX_BRIDGES_SHOW = 3;
 
 /**
+ * A recovery card is a tiny recall budget, so it must not spend two slots on
+ * the same displayed memory anchor even when upstream candidate IDs differ.
+ */
+export function dedupeSituationBridges(items = []) {
+  const unique = new Map();
+  items.filter(Boolean).forEach((item, index) => {
+    const key = situationBridgeAnchorKey(item);
+    if (!key) return;
+    const existing = unique.get(key);
+    if (!existing || situationBridgeQuality(item) > situationBridgeQuality(existing.item)) {
+      unique.set(key, { item, index: existing?.index ?? index });
+    }
+  });
+  return [...unique.values()]
+    .sort((left, right) => left.index - right.index)
+    .map((entry) => entry.item);
+}
+
+function situationBridgeAnchorKey(item = {}) {
+  const title = normaliseText(item.title || item.name || item.label)
+    .toLocaleLowerCase()
+    .replace(/[\s·・，,。.!！?？:：;；'"“”‘’（）()【】\[\]_-]/g, "");
+  return title ? `title:${title}` : (item.candidateId || item.memoryKey || item.id ? `id:${item.candidateId || item.memoryKey || item.id}` : "");
+}
+
+function situationBridgeQuality(item = {}) {
+  const confidence = item.confidence === "high" ? 1 : item.confidence === "low" ? -1 : 0;
+  return confidence * 10 + Number(item.score || 0) + Number(item.fuseScore || 0);
+}
+
+/**
  * Phase A+B: local shortlist + optional LLM adjudicator input.
  * Never dumps prior chapters — only gaps and ≤12 short candidates.
  */
@@ -114,8 +145,13 @@ export function finalizeSituationBridgePlan(shortlist, judgement = null) {
   const minBridges = shortlist.mode === "manual" ? 2 : MAX_BRIDGES_AUTO;
   const judgedBridges = Array.isArray(judgement?.bridges) ? judgement.bridges : null;
   const usedJudged = Boolean(judgedBridges && judgedBridges.length >= minBridges);
-  const bridges = (usedJudged ? judgedBridges : shortlist.localBridges || [])
-    .slice(0, MAX_BRIDGES_SHOW);
+  const preferredBridges = usedJudged ? judgedBridges : shortlist.localBridges || [];
+  // Model and local extractors may use different candidate IDs for the same person
+  // or concept. Preserve the adjudicated order, then use distinct local anchors to fill.
+  const bridges = dedupeSituationBridges([
+    ...preferredBridges,
+    ...(usedJudged ? shortlist.localBridges || [] : []),
+  ]).slice(0, MAX_BRIDGES_SHOW);
   if (bridges.length < minBridges) {
     return suppressedPlan(judgedBridges ? "low-confidence" : "no-bridges", {
       intensity: shortlist.intensity,
@@ -125,6 +161,7 @@ export function finalizeSituationBridgePlan(shortlist, judgement = null) {
 
   const chapterTitle = shortlist.chapterTitle || "";
   const questionFromJudge = usedJudged && judgement?.question?.candidateId
+    && bridges.some((item) => item.candidateId === judgement.question.candidateId)
     ? judgement.question
     : null;
   const questionBridge = bridges.find((item) => isEpisodeWorthyAnchor({
@@ -199,7 +236,9 @@ export function applySituationBridgeJudgement(shortlist, judgement) {
       const gap = gapById.get(item.gapId);
       if (!candidate || !gap) return null;
       const whyNeeded = clip(item.whyNeeded || whyNeededText(gap, candidate), 72);
-      const title = clip(item.title || candidate.title, 16);
+      // The candidate title is source-bounded. Do not let a model rename it into
+      // another already-visible anchor.
+      const title = clip(candidate.title, 16);
       if (!title || !whyNeeded) return null;
       return {
         id: `bridge-judge-${index + 1}`,
@@ -267,13 +306,15 @@ function biasImportance(kind, importance, bias, { primary = false } = {}) {
 
 export function situationBridgeToRecoveryCard(plan) {
   if (!plan || plan.suppressed || !plan.bridges?.length) return null;
+  const bridges = dedupeSituationBridges(plan.bridges).slice(0, MAX_BRIDGES_SHOW);
+  if (!bridges.length) return null;
   return {
     intensity: plan.intensity,
     absenceLabel: plan.absenceLabel,
     positionLabel: plan.positionLabel,
-    bridges: plan.bridges,
+    bridges,
     gaps: plan.gaps,
-    keyPoints: plan.bridges.map((item, index) => ({
+    keyPoints: bridges.map((item, index) => ({
       id: item.id || `bridge-point-${index}`,
       memoryKey: item.candidateId,
       title: item.title,

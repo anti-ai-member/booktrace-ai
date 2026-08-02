@@ -3,6 +3,7 @@ import { flushSync } from "react-dom";
 import { Background, Controls, ReactFlow } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import dagre from "dagre";
+import shumaiMark from "./assets/shumai-mark-cropped.png";
 import {
   ArrowLeft,
   ArrowRight,
@@ -10,19 +11,14 @@ import {
   Bookmark,
   Bot,
   Brain,
-  Camera,
   Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
-  ChevronsLeft,
-  ChevronsRight,
   Clock3,
   CircleHelp,
-  Coffee,
   Eye,
   FileText,
-  Flower2,
   FolderPlus,
   GitBranch,
   History,
@@ -32,21 +28,23 @@ import {
   Minus,
   Network,
   Plus,
-  Palette,
   Search,
   Settings2,
-  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
-  Sprout,
   Tag,
-  Trees,
   Trash2,
   Upload,
   X,
   Zap,
 } from "lucide-react";
-import { parseEpub } from "./epub.js";
+import {
+  isPageNumberTitle,
+  isSyntheticChapterTitle,
+  normalizeChapterList,
+  parseEpub,
+  shouldOmitFromToc,
+} from "./epub.js";
 import { BOOK_TYPES, findBookType } from "./bookTaxonomy.js";
 import { buildMemoryCandidates, buildMemoryEvidenceStore, locateEvidence } from "./memoryEngine.js";
 import {
@@ -64,6 +62,7 @@ import {
 import {
   adjudicatorPayloadFromShortlist,
   applySituationBridgeJudgement,
+  dedupeSituationBridges,
   finalizeSituationBridgePlan,
   prepareSituationBridgeShortlist,
   situationBridgeToRecoveryCard,
@@ -83,6 +82,8 @@ import {
 import { resolveTraceProfile, traceProfileForPrompt } from "./traceProfiles.js";
 import { UNIVERSAL_SKILLS, createReadingProgress, domainProgress, earnedBadges, getDomainConfig, resolveSkillDomain, unlockedSpecialSkills } from "./skillSystem.js";
 import { TalentConstellation } from "./TalentConstellation.jsx";
+import { useLocale } from "./i18n/LocaleContext.jsx";
+import { LocaleToggle } from "./i18n/LocaleToggle.jsx";
 import {
   buildAssistFromExplain,
   explainModeLabel,
@@ -91,16 +92,19 @@ import {
   groupNoteMarksForSegment,
   loadExplains,
   markerShortLabel,
+  pickExplainForTextReuse,
   previewConclusion,
   previewMetaLabel,
   removeExplains,
+  saveExplains,
   upsertExplain,
 } from "./explainMemory.js";
 
 const BUILT_IN_BOOK_ID = "long-march";
-const BUILT_IN_CACHE_VERSION = "long-march-v2-images";
+/** Bump to force re-parse of the built-in EPUB (cover/TOC/backmatter cleanup). */
+const BUILT_IN_CACHE_VERSION = "long-march-v5-nav-titles";
 /** Bump when EPUB paragraph shape changes (e.g. keep inline images). Re-import upgrades stale IndexedDB books. */
-const EPUB_CONTENT_PARSE_VERSION = "epub-v2-images";
+const EPUB_CONTENT_PARSE_VERSION = "epub-v8-repair-nav-titles";
 const BOOK_PATH = "/books/long-march.epub";
 const COVER_PATH = "/books/long-march-cover.jpeg";
 const APP_NAME = "书脉";
@@ -109,14 +113,7 @@ const APP_SLOGAN = "读得清脉络，记得住来处";
 function BrandMark({ size = 22 }) {
   return (
     <span className="brand-mark" aria-hidden="true">
-      <svg width={size} height={size} viewBox="0 0 32 32" fill="none">
-        <path d="M5.5 9.2c3.4-1.8 6.6-1.7 10.5.6v13.4c-3.8-2.1-7-2.2-10.5-.3V9.2Z" stroke="currentColor" strokeWidth="1.75" strokeLinejoin="round" />
-        <path d="M26.5 9.2c-3.4-1.8-6.6-1.7-10.5.6v13.4c3.8-2.1 7-2.2 10.5-.3V9.2Z" stroke="currentColor" strokeWidth="1.75" strokeLinejoin="round" />
-        <path d="M8.8 15.2c2.4 2.1 4.1-.6 7.2 1.1 2.6 1.4 4.2 3 7.2 1.5" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-        <circle cx="10.4" cy="15.8" r="1.35" fill="currentColor" />
-        <circle cx="16" cy="16.3" r="2.05" fill="currentColor" />
-        <circle cx="22.4" cy="17.5" r="1.35" fill="currentColor" />
-      </svg>
+      <img src={shumaiMark} width={size} height={size} alt="" />
     </span>
   );
 }
@@ -200,14 +197,6 @@ const LIBRARY_DB_NAME = "shumai-library";
 const LIBRARY_DB_VERSION = 1;
 const LIBRARY_STORE = "books";
 const EMPTY_READING_INDEX = { people: [], organizations: [], places: [], timeline: [], relationships: [] };
-const READING_THEMES = [
-  { id: "plain", name: "素笺", detail: "清透留白", icon: BookOpen },
-  { id: "lotus", name: "荷花", detail: "淡青水色", icon: Flower2 },
-  { id: "tea", name: "香茗", detail: "轻烟暖白", icon: Coffee },
-  { id: "orchid", name: "兰花", detail: "幽绿清雅", icon: Sprout },
-  { id: "flower", name: "花枝", detail: "微粉春意", icon: Flower2 },
-  { id: "bamboo", name: "竹林", detail: "疏竹晨雾", icon: Trees },
-];
 const EXPLAIN_MODES = [
   { id: "source", label: "书内出处", detail: "在已读范围定位相关原文", icon: Quote },
   { id: "entity", label: "词条简介", detail: "人物、地点、组织或术语的身份与作用", icon: Tag },
@@ -235,6 +224,20 @@ function loadStored(name, fallback) {
     return value ? JSON.parse(value) : fallback;
   } catch {
     return fallback;
+  }
+}
+
+async function readApiJson(response) {
+  const text = await response.text();
+  if (!String(text || "").trim()) {
+    throw new Error(response.ok
+      ? "服务返回为空，请重试"
+      : `分析服务暂不可用（${response.status}）`);
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error("服务返回了无效 JSON，请重试更新恢复卡");
   }
 }
 
@@ -381,6 +384,7 @@ async function deleteStoredLibraryBook(bookId) {
 }
 
 export function App() {
+  const { t, locale } = useLocale();
   const [screen, setScreen] = useState("shelf");
   const [book, setBook] = useState(null);
   const [libraryBooks, setLibraryBooks] = useState([]);
@@ -411,7 +415,6 @@ export function App() {
   const [shelfSearchOpen, setShelfSearchOpen] = useState(false);
   const [shelfSearchQuery, setShelfSearchQuery] = useState("");
   const [analysisSettings, setAnalysisSettings] = useState(() => ({ ...DEFAULT_AI_SETTINGS, ...loadStored("yuezhi-ai-settings", DEFAULT_AI_SETTINGS) }));
-  const [readingTheme, setReadingTheme] = useState(() => loadStored("yuezhi-reading-theme", "plain"));
   const [analysisSummaryOpen, setAnalysisSummaryOpen] = useState(false);
   const [selectionAssist, setSelectionAssist] = useState(null);
   const [relationshipOpen, setRelationshipOpen] = useState(false);
@@ -430,8 +433,8 @@ export function App() {
   const [noteComposerOpen, setNoteComposerOpen] = useState(false);
   const [noteDraft, setNoteDraft] = useState("");
   const [noteContext, setNoteContext] = useState(null);
-  const [analysisState, setAnalysisState] = useState({ status: "idle", message: "尚未使用大模型分析" });
-  const [traceJob, setTraceJob] = useState({ status: "idle", message: "AI Trace 空闲" });
+  const [analysisState, setAnalysisState] = useState(() => ({ status: "idle", message: t("reader.memory.notPrepared") }));
+  const [traceJob, setTraceJob] = useState(() => ({ status: "idle", message: t("reader.memory.notPrepared") }));
   const [notice, setNotice] = useState("");
   const inputRef = useRef(null);
   const pageCopyRef = useRef(null);
@@ -477,7 +480,7 @@ export function App() {
     }));
   }, [book, chapterIndex, pageIndex, paginationReady, screen]);
   useEffect(() => { localStorage.setItem("yuezhi-ai-settings", JSON.stringify(analysisSettings)); }, [analysisSettings]);
-  useEffect(() => { localStorage.setItem("yuezhi-reading-theme", JSON.stringify(readingTheme)); }, [readingTheme]);
+  useEffect(() => { localStorage.removeItem("yuezhi-reading-theme"); }, []);
   useEffect(() => { localStorage.setItem("yuezhi-reading-progress", JSON.stringify(readingProgress)); }, [readingProgress]);
 
   useEffect(() => () => {
@@ -498,10 +501,10 @@ export function App() {
     setRecoveryCard(null);
     setAiIndex(record?.index || null);
     setBookProfile(record?.profile || (book.bookType ? { category: book.bookType, facets: book.indexSchema || findBookType(book.bookType).facets } : null));
-    setAnalysisState(record ? { status: "done", message: "已加载上次增量分析结果" } : { status: "idle", message: "尚未使用大模型分析" });
-    setTraceJob(record ? { status: "done", message: "已加载上次 Trace" } : { status: "idle", message: "AI Trace 空闲" });
+    setAnalysisState(record ? { status: "done", message: t("reader.memory.previousLoaded") } : { status: "idle", message: t("reader.memory.notPrepared") });
+    setTraceJob(record ? { status: "done", message: t("reader.memory.previousLoaded") } : { status: "idle", message: t("reader.memory.notPrepared") });
     if (record) localStorage.setItem(storageKey, JSON.stringify(record));
-  }, [book?.title, book?.creator, book?.chapters.length]);
+  }, [book?.title, book?.creator, book?.chapters.length, t]);
 
   useEffect(() => {
     if (!book) return;
@@ -528,7 +531,7 @@ export function App() {
     const latestRead = getLatestReadCursor();
     const unreadSinceAnalysis = countReadPagesAfter(readPages, analysisRecord?.cursor);
     if (latestRead && unreadSinceAnalysis >= analysisSettings.autoPageThreshold) {
-      setTraceJob({ status: "queued", message: "AI Trace 已排队" });
+      setTraceJob({ status: "queued", message: t("reader.memory.queued") });
       const timer = window.setTimeout(() => analyzeBook("read", true), 120);
       return () => window.clearTimeout(timer);
     }
@@ -796,7 +799,7 @@ export function App() {
   });
   const shelfSearchText = shelfSearchQuery.trim().toLowerCase();
   const searchedShelfBooks = shelfSearchText
-    ? visibleShelfBooks.filter((item) => [item.title, item.creator, item.publisher, item.bookType, localFormatLabel(item)].filter(Boolean).join(" ").toLowerCase().includes(shelfSearchText))
+    ? visibleShelfBooks.filter((item) => [item.title, item.creator, item.publisher, item.bookType, localFormatLabel(item, t)].filter(Boolean).join(" ").toLowerCase().includes(shelfSearchText))
     : visibleShelfBooks;
   const shelfSearchSuggestions = useMemo(() => {
     const typeItems = BOOK_TYPES.map((type) => ({ label: type.name, count: shelfBooks.filter((item) => item.bookType === type.name).length }))
@@ -808,6 +811,19 @@ export function App() {
     return [...typeItems, ...categoryItems].slice(0, 6);
   }, [shelfBooks, categories, bookCategories]);
   const shelfLabel = activeType !== "全部类型" ? activeType : activeCategory === "全部" ? "本地书架" : activeCategory;
+  const continueShelfBook = useMemo(() => {
+    const currentShelfBook = shelfBooks.find((item) => item.id === book?.id);
+    if (currentShelfBook && shelfBookStates.get(currentShelfBook.id)?.hasRead) return currentShelfBook;
+    return shelfBooks.find((item) => shelfBookStates.get(item.id)?.hasRead) || shelfBooks[0] || null;
+  }, [book?.id, shelfBookStates, shelfBooks]);
+  const continueShelfState = continueShelfBook ? shelfBookStates.get(continueShelfBook.id) || getBookShelfState(continueShelfBook) : null;
+  const continueShelfContext = useMemo(
+    () => (continueShelfBook ? buildContinueShelfContext(continueShelfBook) : null),
+    [continueShelfBook, shelfBookStates],
+  );
+  const shelfDisplayBooks = continueShelfBook && !shelfSearchText
+    ? searchedShelfBooks.filter((item) => item.id !== continueShelfBook.id)
+    : searchedShelfBooks;
   const bookMemory = useMemo(
     () => (analysisRecord?.bookMemory
       ? normalizeBookMemory(analysisRecord.bookMemory)
@@ -883,8 +899,24 @@ export function App() {
     setLoadError("");
     try {
       const storedBooks = await loadStoredLibraryBooks();
-      const importedBooks = storedBooks.filter((item) => !item.local);
-      const cachedBuiltIn = storedBooks.find((item) => item.id === BUILT_IN_BOOK_ID && item.builtInCacheVersion === BUILT_IN_CACHE_VERSION) || null;
+      const upgradedBooks = [];
+      const normalizedBooks = [];
+      for (const item of storedBooks) {
+        const repaired = await repairLibraryBookFromSource(item);
+        if (repaired) {
+          upgradedBooks.push(repaired);
+          normalizedBooks.push(repaired);
+          continue;
+        }
+        const upgraded = upgradeLibraryBookChapters(item);
+        if (upgraded !== item) upgradedBooks.push(upgraded);
+        normalizedBooks.push(upgraded);
+      }
+      if (upgradedBooks.length) {
+        await Promise.all(upgradedBooks.map((item) => saveStoredLibraryBook(item)));
+      }
+      const importedBooks = normalizedBooks.filter((item) => !item.local);
+      const cachedBuiltIn = normalizedBooks.find((item) => item.id === BUILT_IN_BOOK_ID && item.builtInCacheVersion === BUILT_IN_CACHE_VERSION) || null;
       const activeBookId = loadStored("shumai-active-book-id", "");
       const cachedBooks = cachedBuiltIn ? [cachedBuiltIn, ...importedBooks] : importedBooks;
       const activeCachedBook = cachedBooks.find((item) => item.id === activeBookId) || cachedBuiltIn || importedBooks[0] || null;
@@ -896,7 +928,7 @@ export function App() {
       const staleEpubCount = importedBooks.filter((item) => needsEpubContentReparse(item)).length;
       if (staleEpubCount > 0 && !loadStored("shumai-epub-image-reparse-hint", false)) {
         localStorage.setItem("shumai-epub-image-reparse-hint", JSON.stringify(true));
-        showNotice(`${staleEpubCount} 本已导入 EPUB 仍是旧解析；重新导入同一文件即可显示插图`);
+        showNotice(`${staleEpubCount} 本已导入 EPUB 仍是旧解析；重新导入同一文件可升级正文结构`);
       }
       if (cachedBuiltIn) {
         return;
@@ -1094,12 +1126,25 @@ export function App() {
     setSelectedParagraph(index);
   }
 
+  function nearestReadableChapterIndex(fromIndex, direction = 1) {
+    const chapters = book?.chapters || [];
+    if (!chapters.length) return 0;
+    const step = direction >= 0 ? 1 : -1;
+    for (let index = fromIndex; index >= 0 && index < chapters.length; index += step) {
+      if (!shouldOmitFromToc(chapters[index])) return index;
+    }
+    for (let index = fromIndex; index >= 0 && index < chapters.length; index -= step) {
+      if (!shouldOmitFromToc(chapters[index])) return index;
+    }
+    return Math.max(0, Math.min(fromIndex, chapters.length - 1));
+  }
+
   function selectChapter(index) {
     layoutRestoreRef.current = false;
     pendingParagraphRef.current = null;
     pendingChapterEndRef.current = false;
     markCurrentPageRead();
-    setChapterIndex(index);
+    setChapterIndex(nearestReadableChapterIndex(index, 1));
     setPageIndex(0);
     setSelectedParagraph(null);
     setDrawerOpen(false);
@@ -1119,8 +1164,11 @@ export function App() {
         return;
       }
       if (chapterIndex < book.chapters.length - 1) {
-        setChapterIndex(chapterIndex + 1);
-        setPageIndex(0);
+        const nextChapter = nearestReadableChapterIndex(chapterIndex + 1, 1);
+        if (nextChapter !== chapterIndex) {
+          setChapterIndex(nextChapter);
+          setPageIndex(0);
+        }
       }
       return;
     }
@@ -1130,9 +1178,12 @@ export function App() {
       return;
     }
     if (chapterIndex > 0) {
-      pendingChapterEndRef.current = true;
-      setChapterIndex(chapterIndex - 1);
-      setPageIndex(0);
+      const previousChapter = nearestReadableChapterIndex(chapterIndex - 1, -1);
+      if (previousChapter !== chapterIndex) {
+        pendingChapterEndRef.current = true;
+        setChapterIndex(previousChapter);
+        setPageIndex(0);
+      }
     }
   }
 
@@ -1407,31 +1458,207 @@ export function App() {
     showNotice(`已删除《${deleteCandidate.title}》`);
   }
 
+  function recoveryOutcomeCopy(card) {
+    if (!card) {
+      return {
+        message: t("reader.memory.notNeeded"),
+        notice: t("reader.memory.notNeeded"),
+      };
+    }
+    const bridgeCount = Array.isArray(card.bridges) && card.bridges.length
+      ? card.bridges.length
+      : (Array.isArray(card.keyPoints) ? card.keyPoints.length : 0);
+    const message = bridgeCount > 0 ? t("reader.memory.updated", { count: bridgeCount }) : t("reader.memory.updatedEmpty");
+    return { message, notice: message };
+  }
+
+  function analysisErrorMessage(error) {
+    const message = String(error?.message || "").trim();
+    if (message && (locale !== "en" || !/[\u4e00-\u9fff]/.test(message))) return message;
+    return t("reader.memory.updateFailed");
+  }
+
+  function persistAnalysisRecord(record) {
+    setAnalysisRecord(record);
+    localStorage.setItem(analysisStorageKey(book), JSON.stringify(record));
+  }
+
+  async function finalizeRecoveryCardUpdate({
+    prepared,
+    openCard,
+    isAutomatic,
+    baseRecord,
+    supportingEvidence = [],
+    currentChapters = [],
+    bookMemory = null,
+    traceProfile = null,
+  }) {
+    let nextRecoveryCard = prepared?.card || null;
+    if (nextRecoveryCard && openCard) setRecoveryCard(nextRecoveryCard);
+
+    const applyOutcome = (card, { refining = false } = {}) => {
+      const outcome = recoveryOutcomeCopy(card);
+      const message = refining && card
+        ? t("reader.memory.selecting")
+        : outcome.message;
+      setAnalysisState({ status: refining && card ? "loading" : "done", message });
+      setTraceJob({ status: refining && card ? "running" : "done", message });
+      if (!refining) showNotice(isAutomatic ? outcome.notice : outcome.notice);
+      return outcome;
+    };
+
+    let record = {
+      ...baseRecord,
+      recoveryCard: nextRecoveryCard,
+      updatedAt: new Date().toISOString(),
+    };
+    persistAnalysisRecord(record);
+
+    const canAdjudicate = ENABLE_SITUATION_BRIDGE_ADJUDICATOR
+      && prepared?.shortlist
+      && !prepared.shortlist.suppressed;
+    const canPolish = ENABLE_MODEL_RECOVERY_POLISH && !canAdjudicate;
+
+    if (!canAdjudicate && !canPolish) {
+      applyOutcome(nextRecoveryCard);
+      return nextRecoveryCard;
+    }
+
+    // Manual clicks: show the local card immediately; refine in the background.
+    if (openCard && nextRecoveryCard) {
+      applyOutcome(nextRecoveryCard, { refining: true });
+    } else if (!isAutomatic) {
+      setAnalysisState({ status: "loading", message: t("reader.memory.selecting") });
+      setTraceJob({ status: "running", message: t("reader.memory.selecting") });
+    }
+
+    if (canAdjudicate) {
+      nextRecoveryCard = await requestSituationBridgeJudgement({
+        shortlist: prepared.shortlist,
+        localFallback: nextRecoveryCard,
+      }) || nextRecoveryCard;
+    } else if (canPolish) {
+      nextRecoveryCard = await requestModelRecoveryCard({
+        targetBook: book,
+        cursor: baseRecord.cursor,
+        traceProfile,
+        bookMemory,
+        supportingEvidence,
+        currentChapters,
+        memoryState: loadStored(recoveryMemoryStorageKey(book), {}),
+        localFallback: nextRecoveryCard,
+      }) || nextRecoveryCard;
+    }
+
+    if (nextRecoveryCard && openCard) setRecoveryCard(nextRecoveryCard);
+    record = {
+      ...record,
+      recoveryCard: nextRecoveryCard,
+      updatedAt: new Date().toISOString(),
+    };
+    persistAnalysisRecord(record);
+    applyOutcome(nextRecoveryCard);
+    return nextRecoveryCard;
+  }
+
+  async function refreshRecoveryFromMemory({ cursor, openCard, isAutomatic = false }) {
+    const storedMemory = analysisRecord?.bookMemory
+      ? normalizeBookMemory(analysisRecord.bookMemory)
+      : bookMemoryFromLegacy({
+        index: analysisRecord?.index,
+        traceMemory: analysisRecord?.traceMemory,
+      }, { bookId: book.id || book.title || "book" });
+    if (!storedMemory || !hasUsableRecoveryMemory(storedMemory)) {
+      setAnalysisState({ status: "idle", message: t("reader.memory.needRead") });
+      setTraceJob({ status: "idle", message: t("reader.memory.needRead") });
+      if (!isAutomatic) showNotice(t("reader.memory.needRead"));
+      return null;
+    }
+    setAnalysisState({ status: "loading", message: t("reader.memory.preparing") });
+    setTraceJob({ status: "running", message: t("reader.memory.preparing") });
+    const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
+    const prepared = prepareSituationRecovery(book, storedMemory, cursor, null, memoryState, {
+      mode: "manual",
+      bookType: analysisRecord?.profile?.category || book.bookType || bookProfile?.category || "",
+      notes,
+      explains,
+      bookmarks,
+    });
+    return finalizeRecoveryCardUpdate({
+      prepared,
+      openCard,
+      isAutomatic,
+      baseRecord: {
+        ...(analysisRecord || {}),
+        bookMemory: storedMemory,
+        index: analysisRecord?.index || readingIndexFromBookMemory(storedMemory),
+        profile: analysisRecord?.profile || null,
+        traceProfile: analysisRecord?.traceProfile || null,
+        traceMemory: analysisRecord?.traceMemory || compatibilityTraceMemory(storedMemory),
+        summary: analysisRecord?.summary || null,
+        cursor: analysisRecord?.cursor || cursor,
+      },
+      bookMemory: storedMemory,
+      traceProfile: analysisRecord?.traceProfile || null,
+    });
+  }
+
   async function analyzeBook(scope = "read", isAutomatic = false) {
     const cursor = scope === "full" ? getFullBookCursor(book) : getLatestReadCursor();
     if (!cursor && scope === "read") {
-      setAnalysisState({ status: "idle", message: "请先完整读完至少一页，再进行分析" });
-      setTraceJob({ status: "idle", message: "等待已读页" });
+      setAnalysisState({ status: "idle", message: t("reader.memory.needRead") });
+      setTraceJob({ status: "idle", message: t("reader.memory.needRead") });
+      if (!isAutomatic) showNotice(t("reader.memory.needRead"));
       return;
+    }
+    // A manual refresh should feel immediate. Reuse the last trustworthy memory card
+    // first, then let extraction and model refinement update it in the background.
+    if (scope === "read" && !isAutomatic && analysisRecord) {
+      const previousMemory = analysisRecord.bookMemory
+        ? normalizeBookMemory(analysisRecord.bookMemory)
+        : bookMemoryFromLegacy({
+          index: analysisRecord.index,
+          traceMemory: analysisRecord.traceMemory,
+        }, { bookId: book.id || book.title || "book" });
+      if (hasUsableRecoveryMemory(previousMemory)) {
+        const previousState = loadStored(recoveryMemoryStorageKey(book), {});
+        const { card: immediateCard } = prepareSituationRecovery(book, previousMemory, cursor, null, previousState, {
+          mode: "manual",
+          bookType: analysisRecord?.profile?.category || book.bookType || bookProfile?.category || "",
+          notes,
+          explains,
+          bookmarks,
+        });
+        if (immediateCard) {
+          setRecoveryCard(immediateCard);
+          setTraceJob({ status: "running", message: t("reader.memory.backgroundUpdate") });
+          setAnalysisState({ status: "loading", message: t("reader.memory.backgroundUpdate") });
+        }
+      }
     }
     const newChapters = scope === "full" ? getFullBookContent(book.chapters) : getNewReadingContent(book.chapters, analysisRecord?.cursor, cursor);
     if (!newChapters.length) {
-      setAnalysisState({ status: "done", message: "当前阅读位置没有新增内容可分析" });
-      setTraceJob({ status: "done", message: "没有新增已读内容" });
-      if (!isAutomatic && analysisRecord?.summary) {
-        showNotice("阅读记忆已更新");
+      if (scope === "full") {
+        setAnalysisState({ status: "done", message: t("reader.memory.noFullContent") });
+        setTraceJob({ status: "done", message: t("reader.memory.noFullContent") });
+        return;
       }
+      // 「更新恢复卡」means refresh the card — not only run when pages are new.
+      await refreshRecoveryFromMemory({ cursor, openCard: !isAutomatic, isAutomatic });
       return;
     }
     const traceProfile = traceProfileForPrompt(activeTraceProfile);
-    setTraceJob({ status: "running", message: "正在抽取候选锚点" });
-    setAnalysisState({ status: "loading", message: "AI Trace 正在整理已读内容…" });
+    setTraceJob({ status: "running", message: t("reader.memory.gathering") });
+    setAnalysisState({ status: "loading", message: t("reader.memory.gathering") });
     try {
       await yieldToBrowser();
       const candidates = await buildMemoryCandidatesAsync(newChapters, traceProfile, (count) => {
-        setTraceJob({ status: "running", message: `已整理候选锚点 ${count} 个` });
+        const message = t("reader.memory.gatheringProgress", { count });
+        setTraceJob({ status: "running", message });
+        setAnalysisState({ status: "loading", message });
       });
-      setTraceJob({ status: "running", message: `候选锚点 ${candidates.length} 个，正在检索证据` });
+      setTraceJob({ status: "running", message: t("reader.memory.checkingEvidence") });
+      setAnalysisState({ status: "loading", message: t("reader.memory.checkingEvidence") });
       const candidateQuery = [
         book.title,
         book.creator,
@@ -1457,7 +1684,8 @@ export function App() {
         score: Number(item.score.toFixed(3)),
         matchSources: item.matchSources,
       }));
-      setTraceJob({ status: "running", message: "正在让模型判断主线相关性" });
+      setTraceJob({ status: "running", message: t("reader.memory.gathering") });
+      setAnalysisState({ status: "loading", message: t("reader.memory.gathering") });
       const response = await fetch("/api/analyze", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1483,7 +1711,7 @@ export function App() {
         }),
       });
       await yieldToBrowser();
-      const result = await response.json();
+      const result = await readApiJson(response);
       if (!response.ok) {
         const message = result.error || "分析服务暂不可用";
         if (isMissingApiKeyError(message)) noticeMissingApiKey();
@@ -1507,8 +1735,8 @@ export function App() {
       setBookProfile(result.profile);
       setBook((current) => current ? { ...current, bookType: result.profile.category, indexSchema: result.profile.facets } : current);
       setLibraryBooks((items) => items.map((item) => item.id === book.id ? { ...item, bookType: result.profile.category, indexSchema: result.profile.facets } : item));
-      let nextRecoveryCard = null;
-      setTraceJob({ status: "running", message: "正在生成续读接驳卡" });
+      setAnalysisState({ status: "loading", message: t("reader.memory.preparing") });
+      setTraceJob({ status: "running", message: t("reader.memory.preparing") });
       const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
       const prepared = prepareSituationRecovery(book, nextBookMemory, cursor, null, memoryState, {
         mode: "manual",
@@ -1517,46 +1745,28 @@ export function App() {
         explains,
         bookmarks,
       });
-      nextRecoveryCard = prepared.card;
-      if (ENABLE_SITUATION_BRIDGE_ADJUDICATOR && prepared.shortlist && !prepared.shortlist.suppressed) {
-        nextRecoveryCard = await requestSituationBridgeJudgement({
-          shortlist: prepared.shortlist,
-          localFallback: nextRecoveryCard,
-        }) || nextRecoveryCard;
-      } else if (ENABLE_MODEL_RECOVERY_POLISH) {
-        nextRecoveryCard = await requestModelRecoveryCard({
-          targetBook: book,
-          cursor,
-          traceProfile: result.traceProfile || traceProfile,
+      await finalizeRecoveryCardUpdate({
+        prepared,
+        openCard: !isAutomatic,
+        isAutomatic,
+        baseRecord: {
           bookMemory: nextBookMemory,
-          supportingEvidence,
-          currentChapters: newChapters,
-          memoryState,
-          localFallback: nextRecoveryCard,
-        }) || nextRecoveryCard;
-      }
-      const record = {
+          index: nextIndex,
+          profile: result.profile,
+          traceProfile: result.traceProfile || traceProfile,
+          traceMemory: result.traceMemory || compatibilityTraceMemory(nextBookMemory),
+          summary: normalizeAnalysisSummary(result.summary),
+          cursor,
+        },
+        supportingEvidence,
+        currentChapters: newChapters,
         bookMemory: nextBookMemory,
-        index: nextIndex,
-        profile: result.profile,
         traceProfile: result.traceProfile || traceProfile,
-        traceMemory: result.traceMemory || compatibilityTraceMemory(nextBookMemory),
-        recoveryCard: nextRecoveryCard,
-        summary: normalizeAnalysisSummary(result.summary),
-        cursor,
-        updatedAt: new Date().toISOString(),
-      };
-      setAnalysisRecord(record);
-      localStorage.setItem(analysisStorageKey(book), JSON.stringify(record));
-      if (nextRecoveryCard && !isAutomatic) setRecoveryCard(nextRecoveryCard);
-      setAnalysisState({ status: "done", message: `已由 ${result.model} 更新续读接驳材料` });
-      setTraceJob({ status: "done", message: nextRecoveryCard ? `接驳材料已更新到第 ${cursor.pageIndex + 1} 页` : "本页不必先回想" });
-      showNotice(isAutomatic
-        ? (nextRecoveryCard ? "已根据新增已读内容准备接驳材料" : "新增已读已分析；本页不必先回想")
-        : (nextRecoveryCard ? "续读接驳材料已更新" : "分析完成；当前页不必先回想"));
+      });
     } catch (error) {
-      setAnalysisState({ status: "error", message: error.message || "大模型分析失败" });
-      setTraceJob({ status: "error", message: error.message || "AI Trace 失败" });
+      const message = analysisErrorMessage(error);
+      setAnalysisState({ status: "error", message });
+      setTraceJob({ status: "error", message });
     }
   }
 
@@ -1578,7 +1788,7 @@ export function App() {
           currentPageBrief: payload.currentPageBrief,
         }),
       });
-      const result = await response.json();
+      const result = await readApiJson(response);
       if (response.status === 422 && result?.fallback) {
         const fallbackPlan = applySituationBridgeJudgement(shortlist, result.judgement || { bridges: [] });
         return situationBridgeToRecoveryCard(fallbackPlan) || localFallback;
@@ -1633,7 +1843,7 @@ export function App() {
           currentText: flattenRecoverySource(currentChapters).slice(-10),
         }),
       });
-      const result = await response.json();
+      const result = await readApiJson(response);
       if (!response.ok) throw new Error(result.error || "Recovery card failed");
       return normalizeRecoveryCard(result.card, fallback) || fallback;
     } catch (error) {
@@ -1787,34 +1997,98 @@ export function App() {
       const paragraphIndex = Number.isInteger(selectionBloom?.paragraphIndex)
         ? selectionBloom.paragraphIndex
         : selectedParagraph;
+      const startOffset = selectionBloom?.startOffset ?? null;
+      const endOffset = selectionBloom?.endOffset ?? null;
+      const bloomChapterIndex = Number.isInteger(selectionBloom?.chapterIndex)
+        ? selectionBloom.chapterIndex
+        : chapterIndex;
+      const bloomPageIndex = Number.isInteger(selectionBloom?.pageIndex)
+        ? selectionBloom.pageIndex
+        : pageIndex;
       const cites = paragraphIndex !== null && paragraphIndex !== undefined ? locateEvidence(memoryEvidenceStore, {
         selectedText: text || paragraphPlainText(chapter.paragraphs[paragraphIndex]) || "",
         scopeCursor: evidenceScopeCursor,
-        currentCursor: { chapterIndex, paragraphIndex },
+        currentCursor: { chapterIndex: bloomChapterIndex, paragraphIndex },
         traceIndex: bookIndex,
         topK: 4,
       }).slice(0, 4) : [];
       if (Number.isInteger(paragraphIndex)) {
         readingAnchorRef.current = {
           paragraphIndex,
-          charOffset: Math.max(0, Number(selectionBloom?.startOffset) || 0),
+          charOffset: Math.max(0, Number(startOffset) || 0),
         };
       }
-      setSelectionAssist({
-        text,
-        mode: defaultExplainMode(text, bookProfile?.category || book?.bookType),
-        cites,
-        chapterIndex,
-        pageIndex,
-        paragraphIndex: Number.isInteger(paragraphIndex) ? paragraphIndex : 0,
-        startOffset: selectionBloom?.startOffset ?? null,
-        endOffset: selectionBloom?.endOffset ?? null,
+
+      const positionMatches = findExplainsForSelection(explains, {
+        chapterIndex: bloomChapterIndex,
+        paragraphIndex: Number.isInteger(paragraphIndex) ? paragraphIndex : null,
+        selection: text,
+        startOffset,
+        endOffset,
       });
-      queueLayoutAnchor();
-      setActivePanel("解惑");
-      setSidebarCollapsed(false);
-      setRelationshipOpen(false);
-      showNotice("已打开选文解惑");
+      const preferredMode = defaultExplainMode(text, bookProfile?.category || book?.bookType);
+      const positionCached = positionMatches
+        .slice()
+        .sort((left, right) => (right.createdAt || 0) - (left.createdAt || 0))[0] || null;
+      const textCached = positionCached ? null : pickExplainForTextReuse(explains, text, preferredMode);
+      const cached = positionCached || textCached;
+
+      if (cached) {
+        if (cached.explainSpeed === "fast" || cached.explainSpeed === "deep") {
+          setAnalysisSettings((current) => ({
+            ...current,
+            explainSpeed: cached.explainSpeed,
+          }));
+        }
+        const assist = buildAssistFromExplain(cached);
+        const openedMeta = {
+          fromExplainMode: cached.mode,
+          fromExplainSpeed: cached.explainSpeed === "deep" ? "deep" : "fast",
+        };
+        if (positionCached) {
+          setSelectionAssist({ ...assist, ...openedMeta });
+          setSelectedParagraph(cached.paragraphIndex);
+        } else {
+          setSelectionAssist({
+            ...assist,
+            ...openedMeta,
+            text,
+            cites: cites.length ? cites : assist.cites,
+            chapterIndex: bloomChapterIndex,
+            pageIndex: bloomPageIndex,
+            paragraphIndex: Number.isInteger(paragraphIndex) ? paragraphIndex : 0,
+            startOffset,
+            endOffset,
+            persistChapterIndex: cached.chapterIndex,
+            persistPageIndex: cached.pageIndex,
+            persistParagraphIndex: cached.paragraphIndex,
+            persistStartOffset: cached.startOffset ?? null,
+            persistEndOffset: cached.endOffset ?? null,
+            reusedByText: true,
+          });
+        }
+        queueLayoutAnchor();
+        setActivePanel("解惑");
+        setSidebarCollapsed(false);
+        setRelationshipOpen(false);
+        showNotice(positionCached ? "已打开选文解惑" : "已打开已有解惑");
+      } else {
+        setSelectionAssist({
+          text,
+          mode: preferredMode,
+          cites,
+          chapterIndex: bloomChapterIndex,
+          pageIndex: bloomPageIndex,
+          paragraphIndex: Number.isInteger(paragraphIndex) ? paragraphIndex : 0,
+          startOffset,
+          endOffset,
+        });
+        queueLayoutAnchor();
+        setActivePanel("解惑");
+        setSidebarCollapsed(false);
+        setRelationshipOpen(false);
+        showNotice("已打开选文解惑");
+      }
     } else if (action === "favorite") {
       toggleBookmark();
     }
@@ -2058,17 +2332,17 @@ export function App() {
     return (
       <main className="loading-screen">
         <div className="loader-mark"><FileText size={26} /></div>
-        <strong>无法加载内置书《长征》</strong>
+        <strong>{t("shelf.loadErrorTitle")}</strong>
         <span>{loadError}</span>
-        <button className="primary-button" type="button" onClick={() => void loadBuiltInBook()} title="重试加载《长征》" aria-label="重试加载《长征》">重试加载《长征》</button>
-        <button className="text-action" type="button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 选择书籍文件</button>
+        <button className="primary-button" type="button" onClick={() => void loadBuiltInBook()} title={t("shelf.retryBuiltin")} aria-label={t("shelf.retryBuiltin")}>{t("shelf.retryBuiltin")}</button>
+        <button className="text-action" type="button" onClick={() => inputRef.current?.click()}><Upload size={16} /> {t("shelf.selectFile")}</button>
         <input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} />
       </main>
     );
   }
 
   if (!book && screen !== "shelf") {
-    return <main className="loading-screen"><div className="loader-mark"><BookOpen size={26} /></div><strong>书架还没有可阅读的书</strong><span>请先导入一本 EPUB、PDF 或 MOBI / AZW3。</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> 导入书籍</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
+    return <main className="loading-screen"><div className="loader-mark"><BookOpen size={26} /></div><strong>{t("shelf.bringBooks")}</strong><span>{t("shelf.bringBooksHint")}</span><button className="primary-button" onClick={() => inputRef.current?.click()}><Upload size={16} /> {t("common.import")}</button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></main>;
   }
 
   if (screen === "skills") {
@@ -2079,51 +2353,95 @@ export function App() {
     return (
       <main className={typeBrowserExpanded ? "library-shell panel-open" : "library-shell"}>
         <header className="library-topbar">
-          <div className="brand" title={`${APP_NAME} · ${APP_SLOGAN}`} aria-label={`${APP_NAME}，${APP_SLOGAN}`}><BrandMark size={24} /><span className="sr-only">{APP_NAME}</span></div>
-          <label className={shelfSearchOpen ? "library-search active" : "library-search"} role="search" aria-label="搜索书架" title="搜索书架"><Search size={18} /><input value={shelfSearchQuery} placeholder="搜索" onFocus={() => setShelfSearchOpen(true)} onChange={(event) => { setShelfSearchQuery(event.target.value); setShelfSearchOpen(true); }} onKeyDown={(event) => { if (event.key === "Escape") setShelfSearchOpen(false); }} /><button type="button" title="图片搜索" aria-label="图片搜索"><Camera size={22} /></button></label>
-          <div className="library-actions"><button className="text-action" title="管理分类" aria-label="管理分类" onClick={() => setCategoryModalOpen(true)}><Tag size={16} /><span>管理分类</span></button><button className="primary-button" title={importStatus ? "正在导入" : "导入书籍"} aria-label={importStatus ? "正在导入" : "导入书籍"} disabled={Boolean(importStatus)} onClick={() => inputRef.current?.click()}><Upload size={16} /><span>{importStatus ? "正在导入" : "导入书籍"}</span></button><input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} /></div>
+          <div className="brand" title={`${t("app.name")} · ${t("app.slogan")}`} aria-label={`${t("app.name")}，${t("app.slogan")}`}><BrandMark size={24} /><span className="sr-only">{t("app.name")}</span></div>
+          <label className={shelfSearchOpen ? "library-search active" : "library-search"} role="search" aria-label={t("shelf.searchShelf")} title={t("shelf.searchShelf")}><Search size={18} /><input value={shelfSearchQuery} placeholder={t("common.search")} onFocus={() => setShelfSearchOpen(true)} onChange={(event) => { setShelfSearchQuery(event.target.value); setShelfSearchOpen(true); }} onKeyDown={(event) => { if (event.key === "Escape") setShelfSearchOpen(false); }} /></label>
+          <div className="library-actions">
+            <LocaleToggle />
+            <button className="text-action" title={t("common.manageTags")} aria-label={t("common.manageTags")} onClick={() => setCategoryModalOpen(true)}><Tag size={16} /><span>{t("common.manageTags")}</span></button>
+            <button className="primary-button" title={importStatus ? t("common.importing") : t("common.import")} aria-label={importStatus ? t("common.importing") : t("common.import")} disabled={Boolean(importStatus)} onClick={() => inputRef.current?.click()}><Upload size={16} /><span>{importStatus ? t("common.importing") : t("common.import")}</span></button>
+            <input ref={inputRef} className="sr-only" type="file" multiple accept={SUPPORTED_IMPORT_ACCEPT} onChange={importBook} />
+          </div>
         </header>
         <aside className="library-sidebar">
-          <div className="library-nav-title">我的书架</div>
-          <button className={activeCategory === "全部" ? "library-nav active" : "library-nav"} title={`全部图书（${shelfBooks.length}）`} aria-label={`全部图书（${shelfBooks.length}）`} onClick={() => setActiveCategory("全部")}><BookOpen size={17} /> 全部图书 <span>{shelfBooks.length}</span></button>
-          <button className="library-nav" title="最近阅读" aria-label="最近阅读"><Clock3 size={17} /> 最近阅读</button>
-          <div className="library-nav-title category-title">自定义标签 <button onClick={() => setCategoryModalOpen(true)} title="新建分类"><Plus size={15} /></button></div>
+          <div className="library-nav-title">{t("shelf.myLibrary")}</div>
+          <button className={activeCategory === "全部" ? "library-nav active" : "library-nav"} title={t("shelf.allBooksCount", { count: shelfBooks.length })} aria-label={t("shelf.allBooksCount", { count: shelfBooks.length })} onClick={() => setActiveCategory("全部")}><BookOpen size={17} /> {t("shelf.allBooks")} <span>{shelfBooks.length}</span></button>
+          <button className="library-nav" title={t("shelf.recent")} aria-label={t("shelf.recent")}><Clock3 size={17} /> {t("shelf.recent")}</button>
+          <div className="library-nav-title category-title">{t("shelf.customTags")} <button onClick={() => setCategoryModalOpen(true)} title={t("shelf.newCategory")}><Plus size={15} /></button></div>
           {categories.map((category) => <button className={activeCategory === category ? "library-nav active" : "library-nav"} title={`${category}（${bookCategories.includes(category) ? 1 : 0}）`} aria-label={`${category}（${bookCategories.includes(category) ? 1 : 0}）`} key={category} onClick={() => setActiveCategory(category)}><span className="category-dot" />{category}<span>{bookCategories.includes(category) ? 1 : 0}</span></button>)}
-          <div className="library-nav-title type-browser-title">图书类型 <span>{BOOK_TYPES.length}</span></div>
-          <button className={typeBrowserExpanded ? "library-nav rail-settings active" : "library-nav rail-settings"} title="筛选与分类" aria-label="筛选与分类" onClick={() => setTypeBrowserExpanded((value) => !value)}><Settings2 size={22} /><span>筛选与分类</span></button>
+          <div className="library-nav-title type-browser-title">{t("shelf.bookTypes")} <span>{BOOK_TYPES.length}</span></div>
+          <button className={typeBrowserExpanded ? "library-nav rail-settings active" : "library-nav rail-settings"} title={t("common.filter")} aria-label={t("common.filter")} onClick={() => setTypeBrowserExpanded((value) => !value)}><Settings2 size={22} /><span>{t("common.filter")}</span></button>
         </aside>
         <aside className="library-filter-panel" aria-hidden={!typeBrowserExpanded}>
-          <div className="filter-panel-head"><h2>筛选与分类</h2><button title="关闭" aria-label="关闭筛选与分类" onClick={() => setTypeBrowserExpanded(false)}><X size={22} /></button></div>
-          <section><h3>书架</h3><button className={activeCategory === "全部" && activeType === "全部类型" ? "filter-row active" : "filter-row"} onClick={() => { setActiveCategory("全部"); setActiveType("全部类型"); }}>全部图书<span>{shelfBooks.length}</span></button><button className="filter-row">最近阅读<History size={16} /></button></section>
-          <section><h3>自定义标签</h3>{categories.map((category) => <button className={activeCategory === category ? "filter-row active" : "filter-row"} key={category} onClick={() => setActiveCategory(category)}>{category}<span>{bookCategories.includes(category) ? 1 : 0}</span></button>)}<button className="filter-row muted" onClick={() => setCategoryModalOpen(true)}>管理分类<Tag size={15} /></button></section>
-          <section><h3>图书类型</h3><button className={activeType === "全部类型" ? "filter-row active" : "filter-row"} onClick={() => setActiveType("全部类型")}>全部类型<span>{shelfBooks.length}</span></button>{BOOK_TYPES.map((type) => <button className={activeType === type.name ? "filter-row active" : "filter-row"} key={type.id} onClick={() => setActiveType(type.name)}><i /><span>{type.name}</span><small>{shelfBooks.filter((item) => item.bookType === type.name).length}</small></button>)}</section>
+          <div className="filter-panel-head"><h2>{t("common.filter")}</h2><button title={t("common.close")} aria-label={t("common.closeFilter")} onClick={() => setTypeBrowserExpanded(false)}><X size={22} /></button></div>
+          <section><h3>{t("filter.shelf")}</h3><button className={activeCategory === "全部" && activeType === "全部类型" ? "filter-row active" : "filter-row"} onClick={() => { setActiveCategory("全部"); setActiveType("全部类型"); }}>{t("shelf.allBooks")}<span>{shelfBooks.length}</span></button><button className="filter-row">{t("shelf.recent")}<History size={16} /></button></section>
+          <section><h3>{t("filter.tags")}</h3>{categories.map((category) => <button className={activeCategory === category ? "filter-row active" : "filter-row"} key={category} onClick={() => setActiveCategory(category)}>{category}<span>{bookCategories.includes(category) ? 1 : 0}</span></button>)}<button className="filter-row muted" onClick={() => setCategoryModalOpen(true)}>{t("filter.manageTags")}<Tag size={15} /></button></section>
+          <section><h3>{t("filter.types")}</h3><button className={activeType === "全部类型" ? "filter-row active" : "filter-row"} onClick={() => setActiveType("全部类型")}>{t("filter.allTypes")}<span>{shelfBooks.length}</span></button>{BOOK_TYPES.map((type) => <button className={activeType === type.name ? "filter-row active" : "filter-row"} key={type.id} onClick={() => setActiveType(type.name)}><i /><span>{type.name}</span><small>{shelfBooks.filter((item) => item.bookType === type.name).length}</small></button>)}</section>
         </aside>
         <section className="library-content">
-          <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? "类型图书" : activeCategory === "全部" ? "正在阅读" : "分类图书"}</h1><small className="import-format-note">当前可直接阅读 EPUB、PDF、MOBI / AZW / AZW3；TXT、DOCX、FB2 等格式将作为后续解析器接入。</small></div><button className="sort-button"><SlidersHorizontal size={16} /> 最近阅读 <ChevronDown size={15} /></button></header>
-          {searchedShelfBooks.length ? <div className="book-grid">{searchedShelfBooks.map((shelfBook) => {
+          {continueShelfBook && !shelfSearchText && (
+            <section className="continue-shelf" aria-label={t("shelf.continue")}>
+              <button
+                type="button"
+                className="continue-shelf-cover"
+                onClick={() => openShelfBook(continueShelfBook)}
+                title={t("shelf.continueBook", { title: continueShelfBook.title })}
+                aria-label={t("shelf.continueBook", { title: continueShelfBook.title })}
+              >
+                <BookCover book={continueShelfBook} />
+              </button>
+              <div className="continue-shelf-copy">
+                <span className="continue-shelf-kicker"><History size={16} /> {t("shelf.continue")}</span>
+                <h1>{continueShelfBook.title}</h1>
+                <p>{continueShelfBook.creator || t("shelf.localImport")}</p>
+                <span className="continue-shelf-location">{continueShelfState?.hasRead ? continueShelfState.label : t("shelf.fromFirstPage")}</span>
+                <div className="continue-shelf-progress" aria-label={t("reader.progress", { percent: continueShelfState?.percent || 0 })}>
+                  <i><b style={{ width: `${continueShelfState?.percent || 0}%` }} /></i>
+                  <span>{continueShelfState?.percent || 0}%</span>
+                </div>
+                <button
+                  type="button"
+                  className="continue-shelf-open"
+                  onClick={() => openShelfBook(continueShelfBook)}
+                  title={t("common.open")}
+                  aria-label={t("common.open")}
+                >
+                  <ArrowRight size={19} />
+                </button>
+              </div>
+              {continueShelfContext && (
+                <ContinueShelfContextPanel
+                  context={continueShelfContext}
+                  t={t}
+                  onOpen={() => openShelfBook(continueShelfBook)}
+                />
+              )}
+            </section>
+          )}
+          <header className="library-heading"><div><p>{shelfLabel}</p><h1>{activeType !== "全部类型" ? t("shelf.typeBooks") : activeCategory === "全部" ? t("shelf.myCollection") : t("shelf.categoryBooks")}</h1><small className="import-format-note">{t("shelf.importFormats")}</small></div><button className="sort-button" title={t("shelf.sort")} aria-label={t("shelf.sort")}><SlidersHorizontal size={16} /> {t("shelf.sortRecent")} <ChevronDown size={15} /></button></header>
+          {continueShelfBook || shelfDisplayBooks.length ? <div className="book-grid">{shelfDisplayBooks.map((shelfBook) => {
             const shelfState = shelfBookStates.get(shelfBook.id) || getBookShelfState(shelfBook);
-            return <article className="book-card" key={shelfBook.id}><BookCover book={shelfBook} /><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title="删除书籍"><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || "待 AI 识别"}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || localFormatLabel(shelfBook)}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : "未读"}</b><small>{shelfState.label}</small></div><button className="read-button" onPointerDown={(event) => { if (event.button === 0) openShelfBook(shelfBook); }} onClick={() => openShelfBook(shelfBook)}>打开阅读 <ChevronRight size={17} /></button></div></article>;
+            return <article className="book-card" key={shelfBook.id}><button className="shelf-cover-action" type="button" onClick={() => openShelfBook(shelfBook)} title={t("shelf.openBook", { title: shelfBook.title })} aria-label={t("shelf.openBook", { title: shelfBook.title })}><BookCover book={shelfBook} /></button><div className="book-info"><div className="book-card-actions">{!shelfBook.local && <button className="book-delete-button" onClick={() => requestDeleteBook(shelfBook)} title={t("shelf.deleteBook")}><X size={14} /></button>}</div><div className="book-tags"><span>{shelfBook.bookType || t("shelf.pendingType")}</span></div><h2>{shelfBook.title}</h2><p>{shelfBook.creator}</p><p className="publisher">{shelfBook.publisher || localFormatLabel(shelfBook, t)}</p><div className="book-progress"><span><i style={{ width: `${shelfState.percent}%` }} /></span><b>{shelfState.hasRead ? `${shelfState.percent}%` : t("common.unread")}</b><small>{shelfState.label}</small></div><button className="read-button" onPointerDown={(event) => { if (event.button === 0) openShelfBook(shelfBook); }} onClick={() => openShelfBook(shelfBook)}>{t("common.open")} <ChevronRight size={17} /></button></div></article>;
           })}</div> : (
             <div className="empty-library">
               <ListFilter size={28} />
               {loadError && !libraryBooks.length ? (
                 <>
-                  <strong>无法加载内置书《长征》</strong>
+                  <strong>{t("shelf.loadErrorTitle")}</strong>
                   <span>{loadError}</span>
-                  <button className="primary-button" type="button" onClick={() => void loadBuiltInBook()} title="重试加载《长征》" aria-label="重试加载《长征》">重试加载《长征》</button>
-                  <button className="text-action" type="button" onClick={() => inputRef.current?.click()}>导入书籍</button>
+                  <button className="primary-button" type="button" onClick={() => void loadBuiltInBook()} title={t("shelf.retryBuiltin")} aria-label={t("shelf.retryBuiltin")}>{t("shelf.retryBuiltin")}</button>
+                  <button className="text-action" type="button" onClick={() => inputRef.current?.click()}>{t("common.import")}</button>
                 </>
               ) : (
                 <>
-                  <strong>这个分类还没有图书</strong>
-                  <span>导入一本 EPUB、PDF 或 MOBI / AZW3 后就可以开始阅读。</span>
-                  <button className="text-action" type="button" onClick={() => inputRef.current?.click()}>导入书籍</button>
+                  <strong>{t("shelf.emptyCategory")}</strong>
+                  <span>{t("shelf.emptyHint")}</span>
+                  <button className="text-action" type="button" onClick={() => inputRef.current?.click()}>{t("common.import")}</button>
                 </>
               )}
             </div>
           )}
         </section>
-        {shelfSearchOpen && <div className="library-search-panel"><div className="search-panel-head"><h2>{shelfSearchText ? "搜索结果" : "书架上的热门"}</h2><button onClick={() => setShelfSearchOpen(false)} aria-label="关闭搜索"><X size={20} /></button></div><div className="search-suggestion-grid">{(shelfSearchText ? searchedShelfBooks : shelfBooks).slice(0, 6).map((item) => <button className="search-suggestion-card" key={item.id} onClick={() => { setShelfSearchOpen(false); openShelfBook(item); }}><BookCover book={item} /><span>{item.title}</span><small>{item.bookType || localFormatLabel(item)}</small></button>)}{!shelfSearchText && shelfSearchSuggestions.map((item) => <button className="search-suggestion-card type-result" key={item.label} onClick={() => { setActiveType(item.label); setShelfSearchOpen(false); }}><i /><span>{item.label}</span><small>{item.count} 本</small></button>)}</div></div>}
+        {shelfSearchOpen && <div className="library-search-panel"><div className="search-panel-head"><h2>{shelfSearchText ? t("shelf.searchResults") : t("shelf.hotOnShelf")}</h2><button onClick={() => setShelfSearchOpen(false)} aria-label={t("common.closeSearch")}><X size={20} /></button></div><div className="search-suggestion-grid">{(shelfSearchText ? searchedShelfBooks : shelfBooks).slice(0, 6).map((item) => <button className="search-suggestion-card" key={item.id} onClick={() => { setShelfSearchOpen(false); openShelfBook(item); }}><BookCover book={item} /><span>{item.title}</span><small>{item.bookType || localFormatLabel(item, t)}</small></button>)}{!shelfSearchText && shelfSearchSuggestions.map((item) => <button className="search-suggestion-card type-result" key={item.label} onClick={() => { setActiveType(item.label); setShelfSearchOpen(false); }}><i /><span>{item.label}</span><small>{t("shelf.booksUnit", { count: item.count })}</small></button>)}</div></div>}
         {categoryModalOpen && <CategoryModal categories={categories} selected={bookCategories} newCategory={newCategory} setNewCategory={setNewCategory} onAdd={addCategory} onToggle={toggleBookCategory} onClose={() => setCategoryModalOpen(false)} />}
         {deleteCandidate && <DeleteBookConfirmModal book={deleteCandidate} onCancel={() => setDeleteCandidate(null)} onConfirm={confirmDeleteBook} />}
         {importStatus && <ImportProgressModal status={importStatus} />}
@@ -2139,17 +2457,29 @@ export function App() {
     index: bookIndex,
   });
   return (
-    <main className={`reader-shell theme-${readingTheme}${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}`}>
+    <main className={`reader-shell theme-plain${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}`}>
       <header className="reader-topbar">
-        <div className="book-title" title={`${book.title} · ${book.creator}`}><BookOpen size={17} /><span>{book.title}</span><small>{book.creator}</small>{bookProfile && <small>{bookProfile.category}</small>}</div>
         <div className="reader-status">
+          <h1 className="reader-chapter-title">{chapter.title}</h1>
+          <div className="reader-page-meta">
+            <span>{t("reader.pageOf", { current: visiblePageIndex + 1, total: pageCount })}</span>
+            {currentPageRead && <b className="read-page-tag">{t("reader.read")}</b>}
+            <button
+              className={bookmarks.some((item) => item.id === `${chapterIndex}:${visiblePageIndex}`) ? "page-bookmark active" : "page-bookmark"}
+              onClick={toggleBookmark}
+              title={bookmarks.some((item) => item.id === `${chapterIndex}:${visiblePageIndex}`) ? t("reader.removeBookmark") : t("reader.addBookmark")}
+              aria-label={t("reader.toggleBookmark")}
+            >
+              <Bookmark size={16} />
+            </button>
+          </div>
           <div className="reader-search-anchor">
             <button
               type="button"
               className={searchOpen ? "reader-search-trigger active" : "reader-search-trigger"}
               onClick={() => setSearchOpen((open) => !open)}
-              title="搜索书内内容 (Ctrl K)"
-              aria-label="搜索书内内容"
+              title={t("reader.searchShortcut")}
+              aria-label={t("reader.searchInBook")}
               aria-expanded={searchOpen}
               aria-controls="reader-search-dialog"
             >
@@ -2169,23 +2499,59 @@ export function App() {
               />
             )}
           </div>
-          <TraceStatusPill job={traceJob} />
-          <div className="reader-progress" title={`阅读进度 ${progress}%`} aria-label={`阅读进度 ${progress}%`}><i><b style={{ width: `${progress}%` }} /></i><span>{progress}%</span></div>
-          <span title="本地阅读 · 无剧透" aria-label="本地阅读 · 无剧透"><ShieldCheck size={16} /></span>
+          <button
+            type="button"
+            className="reader-page-recall"
+            onClick={openCurrentRecoveryCard}
+            title={t("reader.activeRecall")}
+            aria-label={t("reader.activeRecall")}
+            disabled={!hasPriorReadingContext}
+          >
+            <History size={18} />
+          </button>
+          <div className="reader-progress" title={t("reader.progress", { percent: progress })} aria-label={t("reader.progress", { percent: progress })}><i><b style={{ width: `${progress}%` }} /></i><span>{progress}%</span></div>
+          <LocaleToggle />
         </div>
       </header>
+      {!sidebarCollapsed && (
+        <button
+          type="button"
+          className="reader-panel-backdrop"
+          aria-label={t("reader.closePanel")}
+          title={t("reader.closePanel")}
+          onClick={() => {
+            queueLayoutAnchor();
+            setSidebarCollapsed(true);
+          }}
+        />
+      )}
       <aside className="reader-sidebar">
         <nav className="reader-tabs">
-          <button className={activePanel === "主题" && !sidebarCollapsed ? "active theme-toolbar-trigger" : "theme-toolbar-trigger"} onClick={() => toggleReaderPanel("主题")} title="阅读主题" aria-label="阅读主题"><Palette size={20} /><span>主题</span></button>
-          <button className={activePanel === "目录" && !sidebarCollapsed ? "active directory-tab" : "directory-tab"} title="目录" aria-label="目录" onClick={() => toggleReaderPanel("目录")}><ListFilter size={20} /><span>目录</span></button>
-          <button className={activePanel === "书签" && !sidebarCollapsed ? "active reader-rail-button" : "reader-rail-button"} title="书签" aria-label={`书签（${bookmarks.length}）`} onClick={() => toggleReaderPanel("书签")}><Bookmark size={20} /><span>书签</span></button>
-          <button className={activePanel === "笔记" && !sidebarCollapsed ? "active reader-rail-button" : "reader-rail-button"} title="笔记" aria-label={`笔记（${notes.length}）`} onClick={() => toggleReaderPanel("笔记")}><FileText size={20} /><span>笔记</span></button>
-          <button className={activePanel === "AI 阅读" && !sidebarCollapsed ? "active analysis-settings-trigger ai-rail-trigger" : "analysis-settings-trigger ai-rail-trigger"} onClick={() => toggleReaderPanel("AI 阅读")} title="续读恢复" aria-label="续读恢复"><Bot size={21} /> <span>续读恢复</span></button>
-          <button className="back-to-shelf" title="返回书架" aria-label="返回书架" onClick={() => setScreen("shelf")}><ArrowLeft size={20} /><span>书架</span></button>
+          <button className={activePanel === "目录" && !sidebarCollapsed ? "active directory-tab" : "directory-tab"} title={t("reader.toc")} aria-label={t("reader.toc")} onClick={() => toggleReaderPanel("目录")}><ListFilter size={20} /><span>{t("reader.toc")}</span></button>
+          <button className={activePanel === "书签" && !sidebarCollapsed ? "active reader-rail-button" : "reader-rail-button"} title={t("reader.bookmarks")} aria-label={t("reader.bookmarksCount", { count: bookmarks.length })} onClick={() => toggleReaderPanel("书签")}><Bookmark size={20} /><span>{t("reader.bookmarks")}</span></button>
+          <button className={activePanel === "笔记" && !sidebarCollapsed ? "active reader-rail-button" : "reader-rail-button"} title={t("reader.notes")} aria-label={t("reader.notesCount", { count: notes.length })} onClick={() => toggleReaderPanel("笔记")}><FileText size={20} /><span>{t("reader.notes")}</span></button>
+          <button className={activePanel === "AI 阅读" && !sidebarCollapsed ? "active analysis-settings-trigger ai-rail-trigger" : "analysis-settings-trigger ai-rail-trigger"} onClick={() => toggleReaderPanel("AI 阅读")} title={t("reader.recovery")} aria-label={t("reader.recovery")}><Bot size={21} /> <span>{t("reader.recovery")}</span></button>
+          <button className="back-to-shelf" title={t("common.backToShelf")} aria-label={t("common.backToShelf")} onClick={() => setScreen("shelf")}><ArrowLeft size={20} /><span>{t("common.shelf")}</span></button>
         </nav>
         <div className="reader-side-content">
-          {activePanel === "目录" && <div className="toc-list">{book.chapters.map((item, index) => <button className={index === chapterIndex ? "toc-row active" : "toc-row"} key={item.id} onClick={() => selectChapter(index)}><span>{index + 1}</span>{item.title}</button>)}</div>}
-          {activePanel === "主题" && <ReaderThemePanel theme={readingTheme} onChange={setReadingTheme} />}
+          {activePanel === "目录" && (
+            <div className="toc-list">
+              {book.chapters
+                .map((item, index) => ({ item, index }))
+                .filter(({ item }) => !shouldOmitFromToc(item))
+                .map(({ item, index }, displayIndex) => (
+                  <button
+                    className={index === chapterIndex ? "toc-row active" : "toc-row"}
+                    key={item.id}
+                    type="button"
+                    onClick={() => selectChapter(index)}
+                  >
+                    <span>{displayIndex + 1}</span>
+                    {item.title}
+                  </button>
+                ))}
+            </div>
+          )}
           {activePanel === "AI 阅读" && <ReaderAnalysisPanel settings={analysisSettings} setSettings={setAnalysisSettings} state={analysisState} onAnalyze={analyzeBook} />}
           {activePanel === "书签" && <BookmarkList items={bookmarks} onOpen={openBookmark} onRemove={removeBookmark} />}
           {activePanel === "笔记" && <NoteList items={notes} onOpen={openNote} onRemove={removeNote} />}
@@ -2204,7 +2570,7 @@ export function App() {
             onClose={closeSelectionAssist}
           />}
         </div>
-        <div className="side-book-meta"><span>共 {book.chapters.length} 节</span><span>{localFormatLabel(book)}</span></div>
+        <div className="side-book-meta"><span>{t("reader.sectionsTotal", { count: book.chapters.length })}</span><span>{localFormatLabel(book, t)}</span></div>
       </aside>
       <section className="reading-stage">
         {recoveryCard && <div className="recall-sheet-overlay" role="presentation">
@@ -2222,9 +2588,7 @@ export function App() {
             }}
           />
         </div>}
-        <header className="chapter-toolbar"><button className="chapter-step" disabled={chapterIndex === 0} onClick={() => selectChapter(chapterIndex - 1)} title="上一章" aria-label="上一章"><ChevronsLeft size={18} /></button><span>{chapter.title}</span><button className="chapter-step" disabled={chapterIndex === book.chapters.length - 1} onClick={() => selectChapter(chapterIndex + 1)} title="下一章" aria-label="下一章"><ChevronsRight size={18} /></button></header>
         <article className="epub-page">
-          <div className="page-title-row"><h1>{chapter.title}</h1><span>{hasPriorReadingContext && <button className="page-recall" onClick={openCurrentRecoveryCard} title="主动回忆当前页之前的内容" aria-label="主动回忆"><History size={15} /></button>}{visiblePageIndex + 1} / {pageCount} 页 {currentPageRead && <b className="read-page-tag">已读</b>}<button className={bookmarks.some((item) => item.id === `${chapterIndex}:${visiblePageIndex}`) ? "page-bookmark active" : "page-bookmark"} onClick={toggleBookmark} title={bookmarks.some((item) => item.id === `${chapterIndex}:${visiblePageIndex}`) ? "取消书签" : "添加书签"} aria-label="切换书签"><Bookmark size={16} /></button></span></div>
           <div className={`page-copy ${pageTurn ? `turn-${pageTurn}` : ""}${paginationReady ? " is-pagination-ready" : " is-pagination-settling"}`} ref={pageCopyRef} onMouseDown={closeDrawerOnBlank} onMouseUp={openSelectionBloom}>
             <div
               className="page-track"
@@ -2270,9 +2634,10 @@ export function App() {
             );
           })}</div></div>
         </article>
-        <footer className="reader-footer"><button className="page-step" disabled={visiblePageIndex === 0 && chapterIndex === 0} onClick={() => turnPage(-1)} title="上一页" aria-label="上一页"><ChevronLeft size={17} /></button><span>第 {visiblePageIndex + 1} / {pageCount} 页 <b className={currentPageRead ? "read-state read" : "read-state"}>{currentPageRead ? "已读" : "阅读中"}</b></span><button className="page-step" disabled={visiblePageIndex === pageCount - 1 && chapterIndex === book.chapters.length - 1} onClick={() => turnPage(1)} title="下一页" aria-label="下一页"><ChevronRight size={17} /></button></footer>
+        <button className="page-edge page-edge-prev" type="button" disabled={visiblePageIndex === 0 && chapterIndex === 0} onClick={() => turnPage(-1)} title={t("reader.prevPage")} aria-label={t("reader.prevPage")}><ChevronLeft size={23} /></button>
+        <button className="page-edge page-edge-next" type="button" disabled={visiblePageIndex === pageCount - 1 && chapterIndex === book.chapters.length - 1} onClick={() => turnPage(1)} title={t("reader.nextPage")} aria-label={t("reader.nextPage")}><ChevronRight size={23} /></button>
       </section>
-      {selectionBloom && <SelectionBloom selection={selectionBloom} theme={readingTheme} relationAvailable={contextRelationships.length > 0} canDeleteExplain={findExplainsForSelection(explains, selectionBloom).length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
+      {selectionBloom && <SelectionBloom selection={selectionBloom} relationAvailable={contextRelationships.length > 0} canDeleteExplain={findExplainsForSelection(explains, selectionBloom).length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
       {explainPreview?.primary && (
         <div
           className="explain-mark-preview"
@@ -2555,7 +2920,7 @@ function relationshipNodeColor(type) {
   return type === "organization" ? "#b89066" : type === "event" ? "#8e789d" : "#5b9070";
 }
 
-function SelectionBloom({ selection, theme, relationAvailable = true, canDeleteExplain = false, onAction, onClose }) {
+function SelectionBloom({ selection, relationAvailable = true, canDeleteExplain = false, onAction, onClose }) {
   const actions = [
     { id: "question", label: "解惑", icon: Sparkles, className: "question" },
     { id: "recall", label: "回忆", icon: History, className: "recall" },
@@ -2565,7 +2930,7 @@ function SelectionBloom({ selection, theme, relationAvailable = true, canDeleteE
     { id: "favorite", label: "收藏", icon: Bookmark, className: "favorite" },
     canDeleteExplain && { id: "delete", label: "删除", icon: Trash2, className: "delete" },
   ].filter(Boolean);
-  return <div className={`selection-bloom selection-popover theme-${theme} ${selection.placement || "above"}`} style={{ left: selection.x, top: selection.y }} role="dialog" aria-label="选中文本辅助" onMouseDown={(event) => event.stopPropagation()}>
+  return <div className={`selection-bloom selection-popover theme-plain ${selection.placement || "above"}`} style={{ left: selection.x, top: selection.y }} role="dialog" aria-label="选中文本辅助" onMouseDown={(event) => event.stopPropagation()}>
     <div className="selection-popover-bar" role="toolbar" aria-label={`针对“${selection.text}”的阅读操作`}>
       {actions.map((action, index) => { const Icon = action.icon; return <button className={`bloom-petal ${action.className}`} style={{ "--petal-index": index }} key={action.label} type="button" onClick={() => onAction(action.id)} title={action.label} aria-label={action.label}><Icon size={17} /><span>{action.label}</span></button>; })}
       <button className="bloom-core" type="button" onClick={onClose} title="收起辅助选项" aria-label="收起辅助选项"><span>{selection.text}</span><X size={13} /></button>
@@ -2670,18 +3035,44 @@ function SelectionAssistPanel({
     const stamp = `${text}|${mode}|${speed}|${mode === "source" ? cites.length : (explanation?.answer || "")}`;
     if (persistStampRef.current === stamp) return;
 
+    const persistChapterIndex = Number.isInteger(assist.persistChapterIndex)
+      ? assist.persistChapterIndex
+      : (assist.chapterIndex ?? cursor?.chapterIndex ?? 0);
+    const persistPageIndex = Number.isInteger(assist.persistPageIndex)
+      ? assist.persistPageIndex
+      : (assist.pageIndex ?? cursor?.pageIndex ?? 0);
+    const persistParagraphIndex = Number.isInteger(assist.persistParagraphIndex)
+      ? assist.persistParagraphIndex
+      : (assist.paragraphIndex ?? cursor?.paragraphIndex ?? 0);
+    const persistStartOffset = assist.persistStartOffset !== undefined
+      ? assist.persistStartOffset
+      : (assist.startOffset ?? null);
+    const persistEndOffset = assist.persistEndOffset !== undefined
+      ? assist.persistEndOffset
+      : (assist.endOffset ?? null);
+    const openedSpeed = assist.fromExplainSpeed === "deep" ? "deep" : "fast";
+    const sameOpenedIdentity = Boolean(
+      assist.fromExplainId
+      && assist.fromExplainMode === mode
+      && openedSpeed === speed,
+    );
+    const persistBase = {
+      id: sameOpenedIdentity ? assist.fromExplainId : undefined,
+      selection: assist.text,
+      mode,
+      explainSpeed: speed,
+      chapterIndex: persistChapterIndex,
+      pageIndex: persistPageIndex,
+      paragraphIndex: persistParagraphIndex,
+      startOffset: persistStartOffset,
+      endOffset: persistEndOffset,
+    };
+
     if (mode === "source") {
       if (!cites.length) return;
       persistStampRef.current = stamp;
       onPersistExplain({
-        selection: assist.text,
-        mode,
-        explainSpeed: speed,
-        chapterIndex: assist.chapterIndex ?? cursor?.chapterIndex ?? 0,
-        pageIndex: assist.pageIndex ?? cursor?.pageIndex ?? 0,
-        paragraphIndex: assist.paragraphIndex ?? cursor?.paragraphIndex ?? 0,
-        startOffset: assist.startOffset ?? null,
-        endOffset: assist.endOffset ?? null,
+        ...persistBase,
         title: "书内出处",
         answer: `已读范围内找到 ${cites.length} 处相关原文。`,
         highlights: [],
@@ -2704,14 +3095,7 @@ function SelectionAssistPanel({
     if (status !== "ready" || !explanation?.answer) return;
     persistStampRef.current = stamp;
     onPersistExplain({
-      selection: assist.text,
-      mode,
-      explainSpeed: speed,
-      chapterIndex: assist.chapterIndex ?? cursor?.chapterIndex ?? 0,
-      pageIndex: assist.pageIndex ?? cursor?.pageIndex ?? 0,
-      paragraphIndex: assist.paragraphIndex ?? cursor?.paragraphIndex ?? 0,
-      startOffset: assist.startOffset ?? null,
-      endOffset: assist.endOffset ?? null,
+      ...persistBase,
       title: explanation.title || "",
       answer: explanation.answer,
       highlights: explanation.highlights || [],
@@ -2955,20 +3339,8 @@ function ParagraphWithExplainMarks({
   return nodes;
 }
 
-function ReaderThemePanel({ theme, onChange }) {
-  return <section className="reader-theme-panel reader-panel-list">
-    {READING_THEMES.map((item) => { const Icon = item.icon; return <button className={theme === item.id ? "active" : ""} key={item.id} onClick={() => onChange(item.id)}><Icon size={17} /><span>{item.name}</span><small>{item.detail}</small></button>; })}
-  </section>;
-}
-
-function TraceStatusPill({ job }) {
-  if (!job || job.status === "idle") return null;
-  const label = job.status === "queued" ? "排队中" : job.status === "running" ? "Trace 中" : job.status === "error" ? "Trace 异常" : "已同步";
-  const title = job.message || label;
-  return <span className={`trace-status-pill ${job.status}`} title={title} aria-label={title} role="status"><Bot size={16} /><i className="trace-status-dot" aria-hidden="true" /></span>;
-}
-
 function ReaderAnalysisPanel({ settings, setSettings, state, onAnalyze }) {
+  const { t } = useLocale();
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const isAnalyzing = state.status === "loading";
   const updateProvider = (provider) => setSettings((current) => ({
@@ -2979,25 +3351,25 @@ function ReaderAnalysisPanel({ settings, setSettings, state, onAnalyze }) {
   const adjustThreshold = (amount) => setSettings((current) => ({ ...current, autoPageThreshold: Math.max(1, Math.min(50, Number(current.autoPageThreshold || 5) + amount)) }));
   const toggleAuto = () => setSettings((current) => ({ ...current, analysisMode: current.analysisMode === "auto" ? "read" : "auto" }));
   return <section className="reader-analysis-panel">
-    <header className="reader-ai-hero"><i><Bot size={22} /></i><div><strong>续读恢复</strong><span>整理已读范围的前文关键点、当前页前置理解和证据。</span></div></header>
+    <header className="reader-ai-hero"><i><Bot size={22} /></i><div><strong>{t("reader.memory.title")}</strong><span>{t("reader.memory.description")}</span></div></header>
     <div className="reader-panel-actions">
-      <button className="active" disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "read" })); onAnalyze("read"); }}><Sparkles size={17} /><span>{isAnalyzing ? "正在整理" : "更新恢复卡"}</span><small>只处理已读范围</small></button>
-      <button disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "full" })); onAnalyze("full"); }}><BookOpen size={17} /><span>重建材料</span><small>较慢，用于纠偏</small></button>
+      <button className="active" disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "read" })); onAnalyze("read"); }}><Sparkles size={17} /><span>{isAnalyzing ? t("reader.memory.updating") : t("reader.memory.update")}</span><small>{t("reader.memory.updateHint")}</small></button>
+      <button disabled={isAnalyzing || !settings.model.trim()} onClick={() => { setSettings((current) => ({ ...current, analysisMode: "full" })); onAnalyze("full"); }}><BookOpen size={17} /><span>{t("reader.memory.rebuild")}</span><small>{t("reader.memory.rebuildHint")}</small></button>
     </div>
-    <div className={`reader-panel-state ${state.status}`}>{state.message || "续读恢复会优先帮助你回到前文情境，而不是展示更多索引。"}</div>
+    <div className={`reader-panel-state ${state.status}`}>{state.message || t("reader.memory.defaultState")}</div>
     <section className="reader-auto-card">
-      <label className="reader-auto-row"><input type="checkbox" checked={settings.analysisMode === "auto"} onChange={toggleAuto} /><span>自动准备恢复卡</span></label>
-      <div className="reader-stepper"><span>每读</span><button title="减少页数" onClick={() => adjustThreshold(-1)}><Minus size={14} /></button><b>{settings.autoPageThreshold}</b><button title="增加页数" onClick={() => adjustThreshold(1)}><Plus size={14} /></button><span>页</span></div>
+      <label className="reader-auto-row"><input type="checkbox" checked={settings.analysisMode === "auto"} onChange={toggleAuto} /><span>{t("reader.memory.auto")}</span></label>
+      <div className="reader-stepper"><span>{t("reader.memory.everyRead")}</span><button title={t("reader.memory.decreasePages")} aria-label={t("reader.memory.decreasePages")} onClick={() => adjustThreshold(-1)}><Minus size={14} /></button><b>{settings.autoPageThreshold}</b><button title={t("reader.memory.increasePages")} aria-label={t("reader.memory.increasePages")} onClick={() => adjustThreshold(1)}><Plus size={14} /></button><span>{t("reader.memory.pages")}</span></div>
     </section>
-    <button className="reader-panel-toggle" onClick={() => setAdvancedOpen((value) => !value)}><span>模型设置</span><ChevronDown size={14} /></button>
+    <button className="reader-panel-toggle" onClick={() => setAdvancedOpen((value) => !value)}><span>{t("reader.memory.modelSettings")}</span><ChevronDown size={14} /></button>
     {advancedOpen && <div className="reader-model-panel">
       <div className="reader-provider-row"><button className={settings.provider === "deepseek" ? "active" : ""} onClick={() => updateProvider("deepseek")}>DeepSeek</button><button className={settings.provider === "openai" ? "active" : ""} onClick={() => updateProvider("openai")}>OpenAI</button></div>
-      <label>分析模型<input value={settings.model} onChange={(event) => setSettings((current) => ({ ...current, model: event.target.value }))} placeholder="deepseek-v4-flash" /></label>
-      {settings.provider === "deepseek" && <div className="reader-model-chips" role="group" aria-label="常用 DeepSeek 模型">
+      <label>{t("reader.memory.analysisModel")}<input value={settings.model} onChange={(event) => setSettings((current) => ({ ...current, model: event.target.value }))} placeholder="deepseek-v4-flash" /></label>
+      {settings.provider === "deepseek" && <div className="reader-model-chips" role="group" aria-label={t("reader.memory.commonDeepSeekModels")}>
         <button type="button" className={settings.model === "deepseek-v4-flash" ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, model: "deepseek-v4-flash" }))}>v4-flash</button>
         <button type="button" className={settings.model === "deepseek-v4-pro" ? "active" : ""} onClick={() => setSettings((current) => ({ ...current, model: "deepseek-v4-pro" }))}>v4-pro</button>
       </div>}
-      <small>回忆卡固定用 deepseek-v4-pro，并开启 thinking。分析可用 flash 或 pro。API Key 只从本机 .env 读取。</small>
+      <small>{t("reader.memory.modelHint")}</small>
     </div>}
   </section>;
 }
@@ -3008,7 +3380,7 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
   const [evidenceOpen, setEvidenceOpen] = useState(false);
   const [questionOpen, setQuestionOpen] = useState(false);
   const bridges = Array.isArray(card.bridges) && card.bridges.length
-    ? card.bridges.slice(0, 3)
+    ? dedupeSituationBridges(card.bridges).slice(0, 3)
     : (Array.isArray(card.keyPoints) ? card.keyPoints : []).slice(0, 3).map((item) => ({
       id: item.id,
       title: item.title,
@@ -3430,9 +3802,131 @@ function isEpubLibraryBook(book) {
   return String(book.fileName || "").toLowerCase().endsWith(".epub");
 }
 
-/** True when an IndexedDB EPUB was parsed before inline images were kept. */
+/** True when an IndexedDB EPUB needs re-parse (images, title cleanup, etc.). */
 function needsEpubContentReparse(book) {
   return isEpubLibraryBook(book) && book.contentParseVersion !== EPUB_CONTENT_PARSE_VERSION;
+}
+
+function remapChapterField(value, indexMap) {
+  const next = Number(value);
+  if (!Number.isInteger(next) || next < 0) return value;
+  return indexMap[next] ?? next;
+}
+
+function remapStoredChapterIndexes(book, indexMap) {
+  if (!book || !Array.isArray(indexMap) || !indexMap.length) return;
+  try {
+    const posKey = readingPositionStorageKey(book);
+    const pos = loadStored(posKey, null);
+    if (pos && Number.isInteger(Number(pos.chapterIndex))) {
+      localStorage.setItem(posKey, JSON.stringify({
+        ...pos,
+        chapterIndex: remapChapterField(pos.chapterIndex, indexMap),
+      }));
+    }
+
+    const readKey = readPagesStorageKey(book);
+    const reads = loadStored(readKey, []);
+    if (Array.isArray(reads) && reads.length) {
+      localStorage.setItem(readKey, JSON.stringify(reads.map((item) => ({
+        ...item,
+        chapterIndex: remapChapterField(item.chapterIndex, indexMap),
+      }))));
+    }
+
+    const bookmarkKey = bookmarkStorageKey(book);
+    const bookmarks = loadStored(bookmarkKey, []);
+    if (Array.isArray(bookmarks) && bookmarks.length) {
+      localStorage.setItem(bookmarkKey, JSON.stringify(bookmarks.map((item) => ({
+        ...item,
+        chapterIndex: remapChapterField(item.chapterIndex, indexMap),
+      }))));
+    }
+
+    const noteKey = notesStorageKey(book);
+    const notes = loadStored(noteKey, []);
+    if (Array.isArray(notes) && notes.length) {
+      localStorage.setItem(noteKey, JSON.stringify(notes.map((item) => ({
+        ...item,
+        chapterIndex: remapChapterField(item.chapterIndex, indexMap),
+      }))));
+    }
+
+    const explains = loadExplains(book);
+    if (explains.length) {
+      saveExplains(book, explains.map((item) => ({
+        ...item,
+        chapterIndex: remapChapterField(item.chapterIndex, indexMap),
+      })));
+    }
+  } catch {
+    // Local remap is best-effort; chapter merge still improves TOC.
+  }
+}
+
+function bookHasBrokenSyntheticToc(book) {
+  const chapters = Array.isArray(book?.chapters) ? book.chapters : [];
+  if (chapters.length < 3) return false;
+  const synthetic = chapters.filter((chapter) => isSyntheticChapterTitle(chapter?.title)).length;
+  return synthetic >= Math.ceil(chapters.length * 0.5);
+}
+
+function libraryBookNeedsRepair(book) {
+  if (!isEpubLibraryBook(book) || book.builtIn) return false;
+  if (book.contentParseVersion !== EPUB_CONTENT_PARSE_VERSION) return true;
+  if (bookHasBrokenSyntheticToc(book)) return true;
+  return (book.chapters || []).some((chapter) => shouldOmitFromToc(chapter) || isPageNumberTitle(chapter?.title));
+}
+
+/** Re-parse an imported EPUB from the local books/ folder when TOC titles were lost. */
+async function repairLibraryBookFromSource(book) {
+  if (!libraryBookNeedsRepair(book)) return null;
+  const fileName = String(book.fileName || "").trim();
+  if (!fileName.toLowerCase().endsWith(".epub")) return null;
+  try {
+    const response = await fetch(`/shelf-books/${encodeURIComponent(fileName)}`);
+    if (!response.ok) return null;
+    const parsed = await parseEpubInWorker(await response.blob());
+    if (!parsed?.chapters?.length) return null;
+    return {
+      ...book,
+      ...parsed,
+      id: book.id,
+      fingerprint: book.fingerprint,
+      fileName: book.fileName,
+      cover: parsed.cover || book.cover || "",
+      bookType: book.bookType || "",
+      indexSchema: book.indexSchema || [],
+      local: false,
+      format: "EPUB",
+      contentParseVersion: EPUB_CONTENT_PARSE_VERSION,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Normalize TOC for already-imported books: drop empty front matter, merge page-number fragments. */
+function upgradeLibraryBookChapters(book) {
+  if (!book?.chapters?.length) return book;
+  const versionStale = book.contentParseVersion !== EPUB_CONTENT_PARSE_VERSION;
+  const needsNormalize = book.chapters.some((chapter) => (
+    shouldOmitFromToc(chapter)
+    || isPageNumberTitle(chapter?.title)
+    || isSyntheticChapterTitle(chapter?.title)
+  ));
+  if (!versionStale && !needsNormalize) return book;
+
+  const { chapters, indexMap, changed } = normalizeChapterList(book.chapters);
+  if (!changed) {
+    return { ...book, contentParseVersion: EPUB_CONTENT_PARSE_VERSION };
+  }
+  remapStoredChapterIndexes(book, indexMap);
+  return {
+    ...book,
+    chapters,
+    contentParseVersion: EPUB_CONTENT_PARSE_VERSION,
+  };
 }
 
 function createClassificationPayload(book) {
@@ -3453,8 +3947,8 @@ function getFileExtension(file) {
   return String(file?.name || "").split(".").pop()?.toLowerCase() || "";
 }
 
-function localFormatLabel(book) {
-  return `本地 ${book?.format || "EPUB"}`;
+function localFormatLabel(book, t = (key) => key) {
+  return t("reader.localFormat", { format: book?.format || "EPUB" });
 }
 
 function SearchDialog({ book, query, setQuery, results, onSelect, onClose }) {
@@ -4541,6 +5035,124 @@ function getBookShelfState(book) {
   const latest = [...readPages].sort((left, right) => right.chapterIndex - left.chapterIndex || right.pageIndex - left.pageIndex || right.paragraphIndex - left.paragraphIndex)[0];
   const percent = Math.max(1, Math.min(100, Math.round(((latest.chapterIndex + 1) / book.chapters.length) * 100)));
   return { hasRead: true, percent, label: `读到第 ${latest.chapterIndex + 1} / ${book.chapters.length} 节` };
+}
+
+/** Sync resume context for the home continue-shelf third column (no API / no catalog recs). */
+function buildContinueShelfContext(book) {
+  if (!book?.chapters?.length) return null;
+  const saved = loadStored(readingPositionStorageKey(book), {});
+  const lastActivity = loadStored(readingActivityStorageKey(book), null);
+  const analysis = hydrateAnalysisRecord(loadStored(analysisStorageKey(book), null), book);
+  const notes = loadStored(notesStorageKey(book), []);
+  const bookmarks = loadStored(bookmarkStorageKey(book), []);
+  const cursor = normalizeRecoveryCursor(book, saved);
+  const chapterTitle = book.chapters[cursor.chapterIndex]?.title || "";
+  const absence = lastActivity ? describeReadingAbsence(lastActivity) : { intensity: "unknown" };
+  let anchors = [];
+  const pickAnchorTitle = (item) => String(item?.title || item?.name || item?.detail || "").trim();
+  const dedupeAnchors = (items) => {
+    const seen = new Set();
+    const next = [];
+    for (const [index, item] of (items || []).entries()) {
+      const title = pickAnchorTitle(item);
+      const key = title.replace(/\s+/g, "").toLowerCase();
+      if (!title || seen.has(key)) continue;
+      seen.add(key);
+      next.push({ id: item.id || `anchor-${index}`, title });
+      if (next.length >= 2) break;
+    }
+    return next;
+  };
+  const cachedBridges = analysis?.recoveryCard?.bridges?.length
+    ? analysis.recoveryCard.bridges
+    : (analysis?.recoveryCard?.keyPoints || []);
+  anchors = dedupeAnchors(cachedBridges);
+  if (!anchors.length) {
+    try {
+      const { card } = prepareSituationRecovery(
+        book,
+        analysis?.bookMemory || {},
+        saved,
+        lastActivity,
+        analysis?.bookMemory?.reader || {},
+        {
+          mode: "manual",
+          notes,
+          bookmarks,
+          explains: loadExplains(book),
+          bookType: book.bookType || analysis?.profile?.category || "",
+        },
+      );
+      const bridges = card?.bridges?.length ? card.bridges : (card?.keyPoints || []);
+      anchors = dedupeAnchors(bridges);
+    } catch {
+      anchors = [];
+    }
+  }
+  const recentNote = [...notes].sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))[0] || null;
+  const recentBookmark = [...bookmarks].sort((left, right) => Number(right.createdAt || 0) - Number(left.createdAt || 0))[0] || null;
+  return {
+    chapterTitle,
+    pageIndex: cursor.pageIndex,
+    absenceIntensity: absence?.intensity || "unknown",
+    anchors,
+    recentNote: recentNote ? {
+      excerpt: String(recentNote.selection || recentNote.content || "").trim().slice(0, 48),
+    } : null,
+    recentBookmark: recentBookmark ? {
+      excerpt: String(recentBookmark.excerpt || recentBookmark.chapterTitle || "").trim().slice(0, 48),
+    } : null,
+  };
+}
+
+function ContinueShelfContextPanel({ context, t, onOpen }) {
+  if (!context) return null;
+  const intensity = ["fresh", "light", "medium", "deep", "unknown"].includes(context.absenceIntensity)
+    ? context.absenceIntensity
+    : "unknown";
+  const leaveOff = context.chapterTitle
+    ? t("shelf.contextChapterPage", { chapter: context.chapterTitle, page: (context.pageIndex || 0) + 1 })
+    : t("shelf.fromFirstPage");
+  return (
+    <aside className="continue-shelf-context" aria-label={t("shelf.contextTitle")}>
+      <header>
+        <span>{t("shelf.contextTitle")}</span>
+        <small>{t(`shelf.absence.${intensity}`)}</small>
+      </header>
+      <button type="button" className="continue-shelf-context-place" onClick={onOpen} title={t("common.open")} aria-label={t("common.open")}>
+        <b>{t("shelf.contextLeaveOff")}</b>
+        <span>{leaveOff}</span>
+      </button>
+      <div className="continue-shelf-context-anchors">
+        <b>{t("shelf.contextAnchors")}</b>
+        {context.anchors.length ? (
+          <ol>
+            {context.anchors.map((item) => (
+              <li key={item.id}><button type="button" onClick={onOpen} title={item.title}>{item.title}</button></li>
+            ))}
+          </ol>
+        ) : (
+          <p>{t("shelf.contextNoAnchors")}</p>
+        )}
+      </div>
+      {(context.recentNote?.excerpt || context.recentBookmark?.excerpt) && (
+        <footer className="continue-shelf-context-traces">
+          {context.recentNote?.excerpt && (
+            <button type="button" onClick={onOpen} title={t("shelf.contextRecentNote")}>
+              <FileText size={14} />
+              <span>{context.recentNote.excerpt}</span>
+            </button>
+          )}
+          {context.recentBookmark?.excerpt && (
+            <button type="button" onClick={onOpen} title={t("shelf.contextRecentBookmark")}>
+              <Bookmark size={14} />
+              <span>{context.recentBookmark.excerpt}</span>
+            </button>
+          )}
+        </footer>
+      )}
+    </aside>
+  );
 }
 
 function bookmarkStorageKey(book) {

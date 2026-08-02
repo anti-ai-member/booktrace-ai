@@ -273,6 +273,8 @@ Season companion (type-honest bridges): Feature 021 (`constitution/features/021-
 
 Also delivered this season: Feature 020 open-book reliability (`constitution/features/020-open-book-reliability.md`).
 
+Mobile / Phase 11 is **paused**; remaining Phase 8 aid workspaces and core desktop usefulness (bridges, 解惑, open-book reliability) take priority over Capacitor.
+
 Phase 8 quality gate:
 
 - Reader feedback changes ranking without flooding the card with noise.
@@ -330,9 +332,60 @@ Phase 10 quality gate:
 
 ---
 
+## Phase 11: Mobile Capacitor + Second-Layer Access
+
+Status: **paused** (2026-08-01). Product priority returns to core desktop usefulness; resume Phase 11 only on explicit request.
+
+Goal (when resumed):
+
+Deliver phone iOS/Android via Capacitor; dissolve catalog disadvantage with frictionless import, cross-device sync, and explicit second-layer positioning; keep situation-bridge hit rate as the win condition.
+
+Season north star:
+
+> 用「导入无感 + 双端同步 + 第二层定位」消解书源劣势；用「续读接驳命中率」赢德。
+
+Constitution vehicle: Feature 022 (`constitution/features/022-mobile-capacitor-season.md`).
+
+### Feature 022a — Phone reading UE
+
+Status: paused — Chrome-first groundwork partially landed (`constitution/features/022a-phone-reading-ue.md`); not the active delivery track.
+
+- Responsive shelf/reader overlays at ≤760px remain in CSS as dormant work.
+- Capacitor / real-device packaging not started.
+- Design/plan kept for later: `docs/superpowers/specs/2026-08-01-phone-ue-chrome-first-design.md`, `docs/superpowers/plans/2026-08-01-phone-ue-chrome-first.md`.
+
+### Feature 022b — Capacitor shell (iOS + Android)
+
+- Wrap existing Vite/React build with Capacitor.
+- Add only necessary plugins (share / filesystem / status bar).
+- Document debug/release build steps; no RN/Flutter rewrite.
+
+### Feature 022c — Frictionless import on mobile
+
+- Share-in / open-with / Files import paths; clear errors; duplicate fingerprint opens existing book.
+- Onboarding and empty shelf state the second-layer story (books come from elsewhere).
+
+### Feature 022d — Cross-device sync (lite → full)
+
+- Sync progress, Memory, notes, bookmarks, explains across devices; book blobs as needed.
+- Interim: Wi‑Fi or local transfer desktop→phone if cloud sync is not ready in-quarter.
+- Never imply a server-side bookstore catalog.
+
+Phase 11 quality gate:
+
+- Capacitor debug build opens builtin or imported book and completes page turns + History bridges on a phone-sized device/emulator.
+- At least one mobile import path works end-to-end.
+- Sync or interim transfer restores one book’s progress + Memory across two profiles/devices.
+- `npm run build` and `npm run situation-bridge:evaluate` remain green.
+- No online bookstore or catalog-scraping work enters scope.
+
+---
+
 ## Deferred (explicitly out of current phases)
 
 - Large PDF conversion / OCR until Memory quality is stable.
 - Social reading, community, recommendation feeds.
 - Ability-tree visual productization (currently secondary).
 - Chatbot-style freeform Q&A as the primary reading flow.
+- Competing with 微信读书 / Kindle on catalog size or building an online bookstore.
+- React Native / Flutter rewrite of the reader (Capacitor is the default mobile path).
