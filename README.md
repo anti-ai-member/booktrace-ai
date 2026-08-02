@@ -12,6 +12,10 @@ It is not another AI summary tool. Its core question is:
 
 When you reopen a book, BookTrace restores your reading situation: where you stopped, up to three relevant context bridges, an optional active-recall prompt, and evidence links back to the original text. It keeps the work inside a quiet, paginated reading experience instead of moving you into a separate AI dashboard.
 
+<p align="center">
+  <img src="./docs/assets/booktrace-reader-demo.gif" alt="BookTrace AI: bookshelf, paginated reading, and situation recovery" width="960" />
+</p>
+
 ## Why BookTrace
 
 | A typical reader | BookTrace AI |

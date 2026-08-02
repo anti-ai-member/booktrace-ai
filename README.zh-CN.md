@@ -4,6 +4,10 @@
 
 [English README](./README.md)
 
+<p align="center">
+  <img src="./docs/assets/booktrace-reader-demo.gif" alt="BookTrace AI demo: bookshelf, paginated reading, and situation recovery" width="960" />
+</p>
+
 书脉是一个本地优先、开源的阅读陪伴工具，服务于这样的时刻：隔了几天重新打开一本长书，却不知道眼前这一页和前文有什么关系。
 
 它不是另一个“AI 总结器”。它首先回答的是：
