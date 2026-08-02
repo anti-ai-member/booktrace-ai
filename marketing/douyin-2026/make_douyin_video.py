@@ -8,13 +8,15 @@ voiceover in publish-copy.md.
 from __future__ import annotations
 
 import math
-import os
-import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent / "python-packages"))
-
-import imageio_ffmpeg
+try:
+    import imageio_ffmpeg
+except ImportError as exc:  # pragma: no cover - helper script dependency guard
+    raise SystemExit(
+        "Missing dependency: imageio_ffmpeg. Install with "
+        "`pip install -r marketing/douyin-2026/requirements.txt`."
+    ) from exc
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 
