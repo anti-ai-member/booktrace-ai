@@ -1189,12 +1189,12 @@ export function App() {
     }
   }
 
-  async function openCurrentRecoveryCard() {
+  async function openRecoveryCardForIntent({ focusText = "", focusCursor = null, contextText = "", entryContext = "page" } = {}) {
     if (!hasPriorReadingContext) {
       showNotice("还没有前文可回忆");
       return;
     }
-    const cursor = { ...getReadCursor(), pageWidth, pageHeight };
+    const cursor = { ...(focusCursor || getReadCursor()), pageWidth, pageHeight };
     const memoryState = loadStored(recoveryMemoryStorageKey(book), {});
     const { shortlist, card: localCard } = prepareSituationRecovery(book, bookMemory, cursor, null, memoryState, {
       mode: "manual",
@@ -1202,6 +1202,9 @@ export function App() {
       notes,
       explains,
       bookmarks,
+      focusText,
+      currentPageText: contextText,
+      entryContext,
     });
     if (localCard) {
       setRecoveryCard(localCard);
@@ -1219,6 +1222,30 @@ export function App() {
     });
     if (judgedCard) setRecoveryCard(judgedCard);
     setTraceJob({ status: "done", message: judgedCard ? "续读接驳已就绪" : "已使用本地接驳" });
+  }
+
+  function openCurrentRecoveryCard() {
+    return openRecoveryCardForIntent();
+  }
+
+  function openSelectionRecoveryCard(selection) {
+    const focusText = String(selection?.fullText || "").trim().slice(0, 500);
+    const focusParagraphIndex = Number.isInteger(selection?.paragraphIndex)
+      ? selection.paragraphIndex
+      : selectedParagraph;
+    if (!focusText || !Number.isInteger(focusParagraphIndex)) {
+      showNotice("请先选中需要接上前文的内容");
+      return;
+    }
+    const focusChapterIndex = Number.isInteger(selection?.chapterIndex) ? selection.chapterIndex : chapterIndex;
+    const focusPageIndex = Number.isInteger(selection?.pageIndex) ? selection.pageIndex : pageIndex;
+    const paragraph = book.chapters[focusChapterIndex]?.paragraphs?.[focusParagraphIndex];
+    return openRecoveryCardForIntent({
+      focusText,
+      contextText: `${focusText}\n${paragraphPlainText(paragraph)}`.trim(),
+      focusCursor: { chapterIndex: focusChapterIndex, pageIndex: focusPageIndex, paragraphIndex: focusParagraphIndex },
+      entryContext: "selection",
+    });
   }
 
   function openSearchResult(result) {
@@ -1799,9 +1826,11 @@ export function App() {
   }
 
   async function requestSituationBridgeJudgement({ shortlist, localFallback = null }) {
-    const retainMemoryAid = (card) => card && localFallback?.memoryAid
-      ? { ...card, memoryAid: localFallback.memoryAid }
-      : card;
+    const retainCardContext = (card) => card ? {
+      ...card,
+      ...(localFallback?.memoryAid ? { memoryAid: localFallback.memoryAid } : {}),
+      ...(localFallback?.entryContext ? { entryContext: localFallback.entryContext } : {}),
+    } : card;
     const payload = adjudicatorPayloadFromShortlist(shortlist);
     if (!payload?.gaps?.length || !(payload.candidates?.length >= 2)) {
       return localFallback;
@@ -1822,13 +1851,13 @@ export function App() {
       const result = await readApiJson(response);
       if (response.status === 422 && result?.fallback) {
         const fallbackPlan = applySituationBridgeJudgement(shortlist, result.judgement || { bridges: [] });
-        return retainMemoryAid(situationBridgeToRecoveryCard(fallbackPlan)) || localFallback;
+        return retainCardContext(situationBridgeToRecoveryCard(fallbackPlan)) || localFallback;
       }
       if (!response.ok) {
         throw new Error(result.error || "Situation bridge failed");
       }
       const plan = applySituationBridgeJudgement(shortlist, result.judgement);
-      return retainMemoryAid(situationBridgeToRecoveryCard(plan)) || localFallback;
+      return retainCardContext(situationBridgeToRecoveryCard(plan)) || localFallback;
     } catch (error) {
       if (isMissingApiKeyError(error?.message)) noticeMissingApiKey("已改用本地接驳");
       console.warn("Situation bridge fallback:", error);
@@ -2023,7 +2052,7 @@ export function App() {
       setRelationshipOpen(true);
       showNotice("已打开上下文关系");
     } else if (action === "recall") {
-      openCurrentRecoveryCard();
+      openSelectionRecoveryCard(selectionBloom);
     } else if (action === "question") {
       const text = selectionBloom?.fullText || "";
       const paragraphIndex = Number.isInteger(selectionBloom?.paragraphIndex)
@@ -3433,7 +3462,7 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack, onMemoryAid }) {
   return <aside className={`recall-sheet ${card.intensity === "deep" ? "deep" : ""}`} role="dialog" aria-modal="true" aria-label="续读接驳卡">
     <header className="recall-sheet-head">
       <div className="recall-sheet-title">
-        <span>{card.absenceLabel || "继续阅读前"}</span>
+        <span>{card.entryContext === "selection" ? t("reader.recall.selectionContext") : (card.absenceLabel || "继续阅读前")}</span>
         <strong>接上前文</strong>
       </div>
       <button type="button" className="recall-icon" onClick={() => onClose("skipped")} title="跳过续读恢复" aria-label="跳过续读恢复"><X size={18} /></button>
@@ -4393,7 +4422,7 @@ function prepareSituationRecovery(book, bookMemoryInput = {}, savedPosition = {}
   );
   if (!book?.chapters?.length) return { shortlist: null, card: null };
   const cursor = normalizeRecoveryCursor(book, savedPosition);
-  const currentPageText = (book.chapters[cursor.chapterIndex]?.paragraphs || [])
+  const currentPageText = options.currentPageText || (book.chapters[cursor.chapterIndex]?.paragraphs || [])
     .slice(Math.max(0, (cursor.paragraphIndex || 0) - 2), (cursor.paragraphIndex || 0) + 1)
     .map((item) => (typeof item === "object" ? item.text : item))
     .filter(Boolean)
@@ -4411,6 +4440,7 @@ function prepareSituationRecovery(book, bookMemoryInput = {}, savedPosition = {}
     mode: options.mode || "auto",
     minAbsenceMs: options.mode === "manual" ? 0 : RECOVERY_CARD_MIN_ABSENCE_MS,
     bookType: options.bookType || book?.bookType || "",
+    focusText: options.focusText || "",
   });
   const plan = finalizeSituationBridgePlan(shortlist, null);
   const card = situationBridgeToRecoveryCard(plan);
@@ -4421,7 +4451,7 @@ function prepareSituationRecovery(book, bookMemoryInput = {}, savedPosition = {}
     currentPageText,
     bridges: plan?.bridges || [],
   }) : null;
-  return { shortlist, card: card ? { ...card, memoryAid } : null };
+  return { shortlist, card: card ? { ...card, memoryAid, entryContext: options.entryContext || "page" } : null };
 }
 
 function buildSituationRecoveryCard(book, bookMemoryInput = {}, savedPosition = {}, lastActivity = null, memoryState = {}, options = {}) {

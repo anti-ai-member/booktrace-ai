@@ -82,6 +82,7 @@ export function prepareSituationBridgeShortlist({
   bookMemory = null,
   cursor = null,
   currentPageText = "",
+  focusText = "",
   lastActivity = null,
   reader = null,
   notes = [],
@@ -104,7 +105,8 @@ export function prepareSituationBridgeShortlist({
   }
 
   const pageText = normaliseText(currentPageText || extractCurrentPageText(book, normalizedCursor));
-  const gaps = extractPageGaps(pageText, memory, normalizedCursor, bias);
+  const extractedGaps = extractPageGaps(pageText, memory, normalizedCursor, bias);
+  const gaps = focusText ? filterSituationGapsByFocus(extractedGaps, focusText) : extractedGaps;
   if (!gaps.length) return suppressedPlan("page-not-dependent", absence);
 
   const fuel = collectRecallFuel({
@@ -555,6 +557,22 @@ function collectRecallFuel({
   // pool here lets one Memory anchor explain more than one explicit dependency.
   void pageText;
   return dedupeFuel(fuel).sort((a, b) => b.strength - a.strength);
+}
+
+export function filterSituationGapsByFocus(gaps = [], focusText = "") {
+  const focus = normaliseText(focusText);
+  if (!focus) return gaps;
+  const compactFocus = compactForLink(focus);
+  const focusTerms = significantTerms(focus);
+  return (gaps || []).filter((gap) => {
+    const label = compactForLink(gap?.label);
+    const context = compactForLink(gap?.context || gap?.label);
+    if (label.length >= 2 && (compactFocus.includes(label) || label.includes(compactFocus))) return true;
+    if (compactFocus.length >= 4 && context.includes(compactFocus)) return true;
+    const gapTerms = significantTerms(`${gap?.label || ""} ${gap?.context || ""}`);
+    const shared = [...focusTerms].filter((term) => gapTerms.has(term));
+    return shared.length >= (focus.length >= 12 ? 2 : 1);
+  });
 }
 
 function fuseCandidates(gaps, fuel, reader = null, bias = null) {

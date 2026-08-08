@@ -94,6 +94,7 @@ export const messagesEn = {
   "reader.removeBookmark": "Remove bookmark",
   "reader.searchShortcut": "Search in book (Ctrl K)",
   "reader.activeRecall": "Active recall",
+  "reader.recall.selectionContext": "For the selected passage",
   "reader.closePanel": "Close panel",
   "reader.sectionsTotal": "{count} sections",
   "reader.skipRecovery": "Skip resume card",

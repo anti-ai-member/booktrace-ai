@@ -307,6 +307,8 @@ review.
 2. **Natural active recall actions (P1):** connect continue-reading recall,
    current-page understanding, selected-text recall, and evidence jumps into a
    single low-friction reading flow instead of a separate AI destination.
+   Implementation vehicle: Feature 028
+   (`constitution/features/028-contextual-active-recall.md`) — **complete**.
 3. **Local reader-memory assets (P1):** consolidate bookmarks, notes, explains,
    recovery outcomes, and remembered/missed feedback into reusable Reader
    Memory that affects later recall without overpowering current-page fit.

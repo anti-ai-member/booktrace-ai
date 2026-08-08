@@ -94,6 +94,7 @@ export const messagesZh = {
   "reader.removeBookmark": "取消书签",
   "reader.searchShortcut": "搜索书内内容 (Ctrl K)",
   "reader.activeRecall": "主动回忆",
+  "reader.recall.selectionContext": "针对选中内容",
   "reader.closePanel": "关闭侧栏",
   "reader.sectionsTotal": "共 {count} 节",
   "reader.skipRecovery": "跳过续读恢复",
