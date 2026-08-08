@@ -163,6 +163,26 @@ Goal:
 
 Close the gap between “architecture complete” and the mission bar: when a reader returns after time away, the first AI-native experience restores the reading situation model with model-backed recall by default.
 
+### Feature 026 — Precision-first situation-bridge hit rate
+
+Status: complete (Verified).
+
+Priority: P0 — current highest-value product task.
+
+- Require a demonstrated current-page dependency before a Memory anchor can be
+  selected.
+- Make gap-to-candidate linkage primary; importance, recency, forgetting, and
+  reader feedback remain secondary ranking signals.
+- Remove unrelated high-strength filler and add adversarial precision fixtures.
+- Keep recall to at most three evidenced, distinct anchors; prefer suppression
+  when reliable linkage is insufficient.
+
+Spec: `constitution/features/026-precision-first-situation-bridges.md`.
+
+Verification: 12/12 offline fixtures pass; precision 94,
+suppressAccuracy 100, overall 98; smoke and production build pass; independent
+sub-agent review PASS.
+
 ### Feature 007 — Reopen model recovery
 
 Status: complete (Verified).
@@ -269,6 +289,34 @@ Implementation vehicle this season: Feature 019 (`constitution/features/019-read
 - Concept / argument / timeline aids appear only when Memory has reliable edges for the current type and page.
 - Reuse left-push workspace patterns; no permanent index rail.
 
+Implementation vehicle: Feature 027
+(`constitution/features/027-type-adaptive-memory-aid.md`) — **complete
+(Verified)**. The recovery card exposes an on-demand, evidence-backed timeline,
+concept, argument, relationship, or episodic chain only when two or more
+relevant prior memories connect to the current page. Canonical category mapping,
+incremental relation retention, no-spoiler bounds, bilingual chrome, source
+jumps, and the left-push workspace are covered by offline gates and independent
+review.
+
+### Planned follow-up queue
+
+1. **Type-adaptive Memory Aid (P1):** history/military favors timeline,
+   decisions, people, and places; science/technical favors concepts and
+   mechanisms; philosophy/social science favors argument chains; fiction and
+   biography favor entities, motives, relationships, and episodic change.
+2. **Natural active recall actions (P1):** connect continue-reading recall,
+   current-page understanding, selected-text recall, and evidence jumps into a
+   single low-friction reading flow instead of a separate AI destination.
+3. **Local reader-memory assets (P1):** consolidate bookmarks, notes, explains,
+   recovery outcomes, and remembered/missed feedback into reusable Reader
+   Memory that affects later recall without overpowering current-page fit.
+4. **On-demand local relationship/concept views (P2):** show a small evidenced
+   relationship, causal, concept, or argument view only when the current page
+   benefits from it; no permanent global graph.
+5. **Memory thread map (P2):** generate a read-bounded 5–9 node local mind map
+   centered on the current page, with type-adaptive structure, expandable one
+   level, explicit/inferred edge styling, and source jumps for every node.
+
 Season companion (type-honest bridges): Feature 021 (`constitution/features/021-type-honest-bridges.md`) — **delivered** (gap/fuel `typeBias`). Full on-demand aid workspaces remain later Phase 8 work.
 
 Also delivered this season: Feature 020 open-book reliability (`constitution/features/020-open-book-reliability.md`).
@@ -296,6 +344,11 @@ Prove mission success standards beyond 《长征》 offline scaffolding.
 - Expand fixtures / sample books with coherent multi-chapter text per supported type.
 - Live eval path reports relevance, coverage, recoveryFit with non-vacuous mid-page checks.
 - Failures point to concrete Memory or prompt problems.
+
+This phase is the P1 regression foundation for every Memory change: benchmark
+multiple books, book types, reopen states, current-page dependencies, evidence
+quality, no-spoiler behavior, noise rejection, and useful suppression. Do not
+accept a prompt or ranking revision based only on one title or visual review.
 
 ### Feature 013 — Sample shelf completeness
 
@@ -389,3 +442,15 @@ Phase 11 quality gate:
 - Chatbot-style freeform Q&A as the primary reading flow.
 - Competing with 微信读书 / Kindle on catalog size or building an online bookstore.
 - React Native / Flutter rewrite of the reader (Capacitor is the default mobile path).
+
+---
+
+## Product Reliability Track
+
+Status: ongoing foundation work.
+
+- **Import and reopen reliability (P1):** stable multi-import, deduplication,
+  non-blocking parse, exact per-book position restore, and preserved Memory on
+  reopen are release gates, not optional polish.
+- Changes in this track must retain readable error states and must never block
+  the foreground reader while background parsing or Memory jobs run.

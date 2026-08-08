@@ -36,8 +36,9 @@ Fixtures live in `scripts/fixtures/situation-bridge-cases.json`, labeled by crit
 ## Pass criteria
 
 - `overall` ≥ 80
-- `precision` ≥ 70
-- `suppressAccuracy` ≥ 80
+- every fixture passes, including adversarial forbidden-anchor cases
+- `precision` ≥ 85
+- `suppressAccuracy` ≥ 85
 - `budgetCompliance` = 100
 - `inventIdReject` = 100
 

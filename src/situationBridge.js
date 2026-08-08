@@ -18,6 +18,14 @@ const CAUSAL_MARK = /因此|于是|所以|导致|因为|由于|使得|造成|结
 const INTENT_MARK = /决定|命令|主张|计划|目标|反对|要求|下令|部署|企图|想要/;
 const TEMPORAL_MARK = /此前|之后|当时|此刻|翌日|次日|同年|那年|阶段|之前|后来/;
 const SPATIAL_MARK = /抵达|离开|进入|驻|进驻|退往|向|在.{1,8}(城|镇|县|省|山|河|江|湖|村|市)/;
+const IRRELEVANCE_MARK = /(?:与|和|同).{0,12}(?:无关|不相关)|题外|顺带一提|unrelated|aside/i;
+const LINK_STOP_TERMS = new Set([
+  "一个", "一些", "这个", "那个", "这些", "那些", "他们", "她们", "我们", "本页", "当前",
+  "此前", "此刻", "之后", "后来", "因此", "于是", "所以", "因为", "由于", "但是", "然而",
+  "决定", "需要", "可以", "已经", "仍然", "继续", "相关", "事情", "内容", "阶段", "如何",
+  "进行", "形成", "发生", "出现", "提到", "说明", "问题", "关系", "重要", "主要",
+  "the", "and", "that", "this", "with", "from", "into", "because", "therefore",
+]);
 
 const MAX_GAPS = 6;
 const MAX_CANDIDATES = 12;
@@ -29,25 +37,35 @@ const MAX_BRIDGES_SHOW = 3;
  * the same displayed memory anchor even when upstream candidate IDs differ.
  */
 export function dedupeSituationBridges(items = []) {
-  const unique = new Map();
-  items.filter(Boolean).forEach((item, index) => {
+  const unique = [];
+  items.filter(Boolean).forEach((item) => {
     const key = situationBridgeAnchorKey(item);
     if (!key) return;
-    const existing = unique.get(key);
-    if (!existing || situationBridgeQuality(item) > situationBridgeQuality(existing.item)) {
-      unique.set(key, { item, index: existing?.index ?? index });
+    const title = normaliseAnchorTitle(item);
+    const duplicateIndex = unique.findIndex((entry) => {
+      if (entry.key === key) return true;
+      const existingTitle = entry.title;
+      const shorter = Math.min(title.length, existingTitle.length);
+      return shorter >= 4 && (title.includes(existingTitle) || existingTitle.includes(title));
+    });
+    if (duplicateIndex < 0) {
+      unique.push({ item, key, title });
+    } else if (situationBridgeQuality(item) > situationBridgeQuality(unique[duplicateIndex].item)) {
+      unique[duplicateIndex] = { item, key, title };
     }
   });
-  return [...unique.values()]
-    .sort((left, right) => left.index - right.index)
-    .map((entry) => entry.item);
+  return unique.map((entry) => entry.item);
 }
 
 function situationBridgeAnchorKey(item = {}) {
-  const title = normaliseText(item.title || item.name || item.label)
+  const title = normaliseAnchorTitle(item);
+  return title ? `title:${title}` : (item.candidateId || item.memoryKey || item.id ? `id:${item.candidateId || item.memoryKey || item.id}` : "");
+}
+
+function normaliseAnchorTitle(item = {}) {
+  return normaliseText(item.title || item.name || item.label)
     .toLocaleLowerCase()
     .replace(/[\s·・，,。.!！?？:：;；'"“”‘’（）()【】\[\]_-]/g, "");
-  return title ? `title:${title}` : (item.candidateId || item.memoryKey || item.id ? `id:${item.candidateId || item.memoryKey || item.id}` : "");
 }
 
 function situationBridgeQuality(item = {}) {
@@ -105,7 +123,8 @@ export function prepareSituationBridgeShortlist({
   if (!offer.ok) return suppressedPlan(offer.reason, absence);
 
   const candidates = fuseCandidates(gaps, fuel, reader, bias).slice(0, MAX_CANDIDATES);
-  if (candidates.length < 2) return suppressedPlan("no-bridges", absence);
+  const minimumCandidates = mode === "manual" ? 1 : MAX_BRIDGES_AUTO;
+  if (candidates.length < minimumCandidates) return suppressedPlan("no-bridges", absence);
 
   const localBridges = matchBridgesLocal(gaps, candidates, mode, reader, bias);
   const chapterTitle = book.chapters[normalizedCursor.chapterIndex]?.title || `第 ${normalizedCursor.chapterIndex + 1} 节`;
@@ -122,6 +141,7 @@ export function prepareSituationBridgeShortlist({
       label: clip(gap.label, 40),
       kind: gap.kind,
       importance: gap.importance,
+      context: clip(gap.context || gap.label, 100),
     })),
     candidates: candidates.map((item) => ({
       id: item.candidateId || item.id,
@@ -129,6 +149,7 @@ export function prepareSituationBridgeShortlist({
       snippet: clip(item.snippet, 80),
       channel: item.channel,
       forGapId: item.forGapId || null,
+      linkReason: item.linkReason || null,
       evidence: item.evidence,
     })),
     localBridges,
@@ -142,7 +163,9 @@ export function finalizeSituationBridgePlan(shortlist, judgement = null) {
     return shortlist || suppressedPlan("no-bridges");
   }
 
-  const minBridges = shortlist.mode === "manual" ? 2 : MAX_BRIDGES_AUTO;
+  // A manual recall request may have one real prerequisite. Returning that one
+  // is more useful than padding the card; automatic interruption stays stricter.
+  const minBridges = shortlist.mode === "manual" ? 1 : MAX_BRIDGES_AUTO;
   const judgedBridges = Array.isArray(judgement?.bridges) ? judgement.bridges : null;
   const usedJudged = Boolean(judgedBridges && judgedBridges.length >= minBridges);
   const preferredBridges = usedJudged ? judgedBridges : shortlist.localBridges || [];
@@ -215,12 +238,15 @@ export function adjudicatorPayloadFromShortlist(shortlist) {
       id: gap.id,
       label: gap.label,
       kind: gap.kind,
+      context: clip(gap.context || gap.label, 100),
     })),
     candidates: (shortlist.candidates || []).slice(0, MAX_CANDIDATES).map((item) => ({
       id: item.id,
       title: item.title,
       snippet: item.snippet,
       channel: item.channel || "",
+      forGapId: item.forGapId || null,
+      linkReason: item.linkReason || null,
     })),
     currentPageBrief: clip(shortlist.currentPageBrief || "", 400),
   };
@@ -235,6 +261,10 @@ export function applySituationBridgeJudgement(shortlist, judgement) {
       const candidate = byId.get(item.candidateId);
       const gap = gapById.get(item.gapId);
       if (!candidate || !gap) return null;
+      // IDs being valid is not enough: the local precision gate authorized
+      // this candidate for one specific dependency. The judge may rank or
+      // reject that pair, but cannot invent a new cross-pairing.
+      if (!candidate.linkReason || candidate.forGapId !== gap.id) return null;
       const whyNeeded = clip(item.whyNeeded || whyNeededText(gap, candidate), 72);
       // The candidate title is source-bounded. Do not let a model rename it into
       // another already-visible anchor.
@@ -374,6 +404,7 @@ function extractPageGaps(pageText, memory, cursor, bias = null) {
           label: clean,
           kind,
           importance: Math.min(1, Math.max(existing.importance, scaled)),
+          context: clip(meta.context || existing.context || clean, 120),
         };
       }
       return;
@@ -383,6 +414,7 @@ function extractPageGaps(pageText, memory, cursor, bias = null) {
       label: clean,
       kind,
       importance: Math.min(1, scaled),
+      context: clip(meta.context || clean, 120),
     });
   };
 
@@ -397,33 +429,29 @@ function extractPageGaps(pageText, memory, cursor, bias = null) {
     const entity = (scoped.entities || []).find((item) => normaliseText(item.name) === name);
     const kind = entity?.kind === "place" ? "spatial" : entity?.kind === "organization" ? "relation" : "person";
     const importance = entity?.priority === "primary" ? 0.72 : entity?.priority === "recent" ? 0.58 : 0.4;
-    pushGap(name, kind, importance, { primary: entity?.priority === "primary" });
-  });
-
-  extractLooseNames(text).forEach((name) => {
-    pushGap(name, "person", 0.48);
+    pushGap(name, kind, importance, { primary: entity?.priority === "primary", context: sentenceContaining(text, name) });
   });
 
   if (CAUSAL_MARK.test(text)) {
     const clause = text.split(/[。！？!?]/).find((part) => CAUSAL_MARK.test(part));
-    if (clause) pushGap(clip(clause, 36), "causal", 0.7);
+    if (clause) pushGap(clip(clause, 36), "causal", 0.7, { context: clause });
   }
   if (INTENT_MARK.test(text)) {
     const clause = text.split(/[。！？!?]/).find((part) => INTENT_MARK.test(part));
-    if (clause) pushGap(clip(clause, 36), "intent", 0.62);
+    if (clause) pushGap(clip(clause, 36), "intent", 0.62, { context: clause });
   }
   if (TEMPORAL_MARK.test(text)) {
-    pushGap("此前阶段如何接到此刻", "temporal", 0.5);
+    pushGap("此前阶段如何接到此刻", "temporal", 0.5, { context: text });
   }
   if (SPATIAL_MARK.test(text)) {
     const placeHit = entityNames.find((name) => text.includes(name) && (scoped.entities || []).some((item) => item.kind === "place" && normaliseText(item.name) === name));
-    if (placeHit) pushGap(placeHit, "spatial", 0.55);
+    if (placeHit) pushGap(placeHit, "spatial", 0.55, { context: sentenceContaining(text, placeHit) });
   }
 
   const conceptHints = (scoped.topics || []).concat(scoped.arguments || [])
     .map((item) => normaliseText(item.name || item.title))
     .filter((name) => name.length >= 2 && text.includes(name));
-  conceptHints.slice(0, 3).forEach((name) => pushGap(name, "concept", 0.6));
+  conceptHints.slice(0, 3).forEach((name) => pushGap(name, "concept", 0.6, { context: sentenceContaining(text, name) }));
 
   // Low-information descriptive page: only weak gaps → caller suppresses via importance.
   if (!ACTION_HINT.test(text) && !CAUSAL_MARK.test(text) && gaps.every((gap) => gap.importance < 0.5)) {
@@ -453,6 +481,9 @@ function collectRecallFuel({
     if (NOISE_PATTERNS.test(`${item.name} ${item.summary}`)) return;
     if (isBroadMegaTopic(item.name) && !isEpisodeWorthyAnchor(item)) return;
     const channel = channelForMemoryItem(item);
+    const evidence = toEvidence(item);
+    if (!hasUsableBridgeEvidence(evidence)) return;
+    if (!isEvidenceBeforeCursor(evidence, cursor)) return;
     fuel.push({
       id: `mem:${item.id}`,
       channel,
@@ -460,7 +491,7 @@ function collectRecallFuel({
       snippet: clip(item.summary, 80),
       strength: memoryStrength(item, reader),
       gapKinds: kindsForChannel(channel),
-      evidence: toEvidence(item),
+      evidence,
       priority: item.priority || "secondary",
     });
   });
@@ -520,7 +551,8 @@ function collectRecallFuel({
 
   recentParagraphFuel(book, cursor).forEach((item) => fuel.push(item));
 
-  // Drop fuel that shares almost no lexical contact with page or gaps later; keep for now.
+  // Pair linkage is applied after gaps are known. Keeping the full bounded fuel
+  // pool here lets one Memory anchor explain more than one explicit dependency.
   void pageText;
   return dedupeFuel(fuel).sort((a, b) => b.strength - a.strength);
 }
@@ -530,7 +562,10 @@ function fuseCandidates(gaps, fuel, reader = null, bias = null) {
   const scored = [];
   gaps.forEach((gap) => {
     const ranked = fuel
-      .map((item) => ({ item, score: scoreGapFuel(gap, item, reader, typeWeights) }))
+      .map((item) => {
+        const link = scorePairLink(gap, item);
+        return { item, link, score: scoreGapFuel(gap, item, reader, typeWeights, link) };
+      })
       .filter((entry) => entry.score >= 0.22)
       .sort((a, b) => b.score - a.score)
       .slice(0, 3);
@@ -539,19 +574,10 @@ function fuseCandidates(gaps, fuel, reader = null, bias = null) {
         ...entry.item,
         candidateId: entry.item.id,
         forGapId: gap.id,
+        linkReason: entry.link.reason,
+        linkScore: entry.link.score,
         fuseScore: entry.score + (1 / (index + 1)) * 0.05,
       });
-    });
-  });
-
-  // Global top-ups so strong fuel not tied to a gap still can appear (weak).
-  fuel.slice(0, 4).forEach((item) => {
-    if (scored.some((entry) => entry.id === item.id)) return;
-    scored.push({
-      ...item,
-      candidateId: item.id,
-      forGapId: gaps[0]?.id || null,
-      fuseScore: item.strength * 0.5,
     });
   });
 
@@ -579,6 +605,7 @@ function matchBridgesLocal(gaps, candidates, mode, reader = null, bias = null) {
       whyNeeded: whyNeededText(gap, item),
       gapKind: gap.kind,
       evidence: item.evidence,
+      linkReason: item.linkReason || scorePairLink(gap, item).reason,
       score,
     });
     return true;
@@ -592,20 +619,6 @@ function matchBridgesLocal(gaps, candidates, mode, reader = null, bias = null) {
       .sort((a, b) => b.score - a.score)[0];
     if (best) pushBridge(gap, best.item, best.score);
   });
-
-  // One gap must not cap the card at a single bridge when other strong candidates remain.
-  if (bridges.length && bridges.length < MAX_BRIDGES_AUTO) {
-    const fillGap = sortedGaps[0];
-    candidates
-      .filter((item) => !usedCandidates.has(item.candidateId || item.id))
-      .map((item) => ({ item, score: scoreGapFuel(fillGap, item, reader, typeWeights) }))
-      .filter((entry) => entry.score >= threshold)
-      .sort((a, b) => b.score - a.score)
-      .forEach((entry) => {
-        if (bridges.length >= MAX_BRIDGES_SHOW) return;
-        pushBridge(fillGap, entry.item, entry.score);
-      });
-  }
 
   return bridges;
 }
@@ -633,22 +646,90 @@ function whyNeededText(gap, candidate) {
   return `读懂本页前，先接上：${clip(candidate.title, 16)}。`;
 }
 
-function scoreGapFuel(gap, item, reader = null, bias = null) {
+function scoreGapFuel(gap, item, reader = null, bias = null, knownLink = null) {
   if (!gap || !item) return 0;
+  const link = knownLink || scorePairLink(gap, item);
+  if (!link.ok) return 0;
   const typeWeights = bias || typeBias();
   const kindFactor = Number(typeWeights[gap.kind]) || 1;
-  const kindBonus = (item.gapKinds || []).includes(gap.kind) ? 0.22 * kindFactor : 0;
-  const label = normaliseText(gap.label);
-  const hay = normaliseText(`${item.title} ${item.snippet}`);
-  let overlap = 0;
-  if (label && hay.includes(label)) overlap += 0.5;
-  tokenize(label).forEach((token) => {
-    if (token.length >= 2 && hay.includes(token)) overlap += 0.08;
-  });
+  const kindBonus = (item.gapKinds || []).includes(gap.kind) ? 0.14 * kindFactor : 0;
   const strength = Number(item.strength) || 0.3;
-  const traceBonus = item.channel === "readerTrace" ? 0.12 : 0;
+  const traceBonus = item.channel === "readerTrace" ? 0.08 : 0;
+  const explanatoryBonus = explanatoryChannelBonus(gap.kind, item.channel);
   const readerDelta = readerSignalDelta(item.id || item.candidateId, reader);
-  return Math.min(1.4, overlap + kindBonus + strength * 0.45 + traceBonus + readerDelta);
+  return Math.min(1.4, link.score + kindBonus + strength * 0.22 + traceBonus + explanatoryBonus + readerDelta);
+}
+
+/**
+ * A strong Memory is not automatically a useful bridge. This gate proves that
+ * the candidate and the current-page dependency share an evidenced anchor.
+ */
+function scorePairLink(gap, item) {
+  if (!gap || !item || !hasUsableBridgeEvidence(item.evidence)) return { ok: false, score: 0, reason: null };
+  const label = compactForLink(gap.label);
+  const context = compactForLink(`${gap.context || ""} ${gap.label || ""}`);
+  const title = compactForLink(item.title);
+  const candidateSource = `${item.title || ""} ${item.snippet || ""} ${item.evidence?.quote || item.evidence?.excerpt || ""}`;
+  if (IRRELEVANCE_MARK.test(candidateSource)) return { ok: false, score: 0, reason: null };
+  const candidate = compactForLink(candidateSource);
+  if (!title || !candidate || !context) return { ok: false, score: 0, reason: null };
+
+  if ((title.length >= 2 && context.includes(title)) || (label.length >= 2 && candidate.includes(label))) {
+    return { ok: true, score: 0.58, reason: "direct-anchor" };
+  }
+
+  const contextTerms = significantTerms(context);
+  const titleTerms = significantTerms(title);
+  const candidateTerms = significantTerms(candidate);
+  const titleHits = [...titleTerms].filter((term) => contextTerms.has(term));
+  if (titleHits.length >= 1) {
+    return { ok: true, score: Math.min(0.54, 0.42 + titleHits.length * 0.04), reason: "title-overlap" };
+  }
+
+  const shared = [...contextTerms].filter((term) => candidateTerms.has(term));
+  if (shared.length >= 2) {
+    return { ok: true, score: Math.min(0.5, 0.32 + shared.length * 0.035), reason: "context-overlap" };
+  }
+  return { ok: false, score: 0, reason: null };
+}
+
+function explanatoryChannelBonus(gapKind, channel) {
+  if (["causal", "intent", "temporal", "state"].includes(gapKind) && ["causal", "intent", "proximity"].includes(channel)) return 0.08;
+  if (gapKind === "concept" && channel === "concept") return 0.08;
+  if (gapKind === "spatial" && channel === "spatial") return 0.06;
+  if (["person", "relation"].includes(gapKind) && ["entity", "causal"].includes(channel)) return 0.05;
+  return 0;
+}
+
+function hasUsableBridgeEvidence(evidence) {
+  if (!evidence) return false;
+  const quote = normaliseText(evidence.quote || evidence.excerpt || evidence.cite?.quote || "");
+  return quote.length >= 4;
+}
+
+function significantTerms(value) {
+  const text = normaliseText(value).toLowerCase();
+  const terms = new Set(tokenize(text).filter((term) => !LINK_STOP_TERMS.has(term)));
+  const runs = text.match(/[\u4e00-\u9fff]{2,}/g) || [];
+  runs.forEach((run) => {
+    const maxSize = Math.min(4, run.length);
+    for (let size = 2; size <= maxSize; size += 1) {
+      for (let index = 0; index <= run.length - size; index += 1) {
+        const term = run.slice(index, index + size);
+        if (!LINK_STOP_TERMS.has(term)) terms.add(term);
+      }
+    }
+  });
+  return terms;
+}
+
+function compactForLink(value) {
+  return normaliseText(value).toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "");
+}
+
+function sentenceContaining(text, needle) {
+  const sentence = normaliseText(text).split(/[。！？!?]/).find((part) => part.includes(needle));
+  return sentence || normaliseText(text);
 }
 
 /** Secondary Reader Memory signal only; never replaces gap fit. */
@@ -705,7 +786,7 @@ function recentParagraphFuel(book, cursor) {
   for (let chapterIndex = cursor.chapterIndex; chapterIndex >= 0 && remaining > 0; chapterIndex -= 1) {
     const paragraphs = chapters[chapterIndex]?.paragraphs || [];
     const end = chapterIndex === cursor.chapterIndex
-      ? Math.max(0, Number(cursor.paragraphIndex || 0) - 1)
+      ? Number(cursor.paragraphIndex || 0) - 1
       : paragraphs.length - 1;
     for (let paragraphIndex = end; paragraphIndex >= 0 && remaining > 0; paragraphIndex -= 1) {
       const raw = paragraphs[paragraphIndex];
@@ -764,11 +845,22 @@ function nearParagraphSnippet(book, anchor) {
 function isBeforeCursor(item, cursor) {
   const chapterIndex = Number(item.chapterIndex);
   const paragraphIndex = Number(item.paragraphIndex);
-  if (!Number.isInteger(chapterIndex)) return true;
+  if (!Number.isInteger(chapterIndex)) return false;
   if (chapterIndex < cursor.chapterIndex) return true;
   if (chapterIndex > cursor.chapterIndex) return false;
-  if (!Number.isInteger(paragraphIndex)) return true;
-  return paragraphIndex <= Number(cursor.paragraphIndex || 0);
+  if (Number.isInteger(paragraphIndex)) return paragraphIndex < Number(cursor.paragraphIndex || 0);
+  const pageIndex = Number(item.pageIndex);
+  if (Number.isInteger(pageIndex)) return pageIndex < Number(cursor.pageIndex || 0);
+  return false;
+}
+
+function isEvidenceBeforeCursor(evidence, cursor) {
+  if (!evidence) return false;
+  return isBeforeCursor({
+    chapterIndex: evidence.chapterIndex,
+    paragraphIndex: evidence.paragraphIndex,
+    pageIndex: evidence.pageIndex,
+  }, cursor);
 }
 
 function extractCurrentPageText(book, cursor) {
@@ -778,17 +870,6 @@ function extractCurrentPageText(book, cursor) {
   const end = Math.min(paragraphs.length - 1, Number(cursor.paragraphIndex ?? paragraphs.length - 1));
   const start = Math.max(0, end - 2);
   return paragraphs.slice(start, end + 1).map((item) => (typeof item === "object" ? item.text : item)).filter(Boolean).join("\n");
-}
-
-function extractLooseNames(text) {
-  const names = [];
-  const re = /([一-龥]{2,4})(?:说|道|问|答|命令|决定|率|带|在|向|对)/g;
-  let match = re.exec(text);
-  while (match) {
-    names.push(match[1]);
-    match = re.exec(text);
-  }
-  return [...new Set(names)].slice(0, 4);
 }
 
 function toEvidence(item) {

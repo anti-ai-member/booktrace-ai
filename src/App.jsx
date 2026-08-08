@@ -47,6 +47,7 @@ import {
 } from "./epub.js";
 import { BOOK_TYPES, findBookType } from "./bookTaxonomy.js";
 import { buildMemoryCandidates, buildMemoryEvidenceStore, locateEvidence } from "./memoryEngine.js";
+import { buildTypeAdaptiveMemoryAid } from "./memoryAid.js";
 import {
   bookMemoryFromLegacy,
   collectMemoryAnchors,
@@ -418,6 +419,7 @@ export function App() {
   const [analysisSummaryOpen, setAnalysisSummaryOpen] = useState(false);
   const [selectionAssist, setSelectionAssist] = useState(null);
   const [relationshipOpen, setRelationshipOpen] = useState(false);
+  const [memoryAidWorkspace, setMemoryAidWorkspace] = useState(null);
   const [readingProgress, setReadingProgress] = useState(() => ({ ...createReadingProgress(), ...loadStored("yuezhi-reading-progress", createReadingProgress()) }));
   const [aiIndex, setAiIndex] = useState(null);
   const [memoryEvidenceStore, setMemoryEvidenceStore] = useState(null);
@@ -1257,6 +1259,32 @@ export function App() {
     showNotice(`已定位到“${relationship.relation}”的原文证据`);
   }
 
+  function openMemoryAid(aid) {
+    if (!aid?.items?.length) return;
+    queueLayoutAnchor();
+    setRecoveryCard(null);
+    setMemoryAidWorkspace(null);
+    setRelationshipOpen(false);
+    setMemoryAidWorkspace(aid);
+    setSidebarCollapsed(true);
+    showNotice(t("reader.memoryAid.opened", { title: t(aid.titleKey || "reader.memoryAid.general") }));
+  }
+
+  function closeMemoryAid() {
+    queueLayoutAnchor();
+    setMemoryAidWorkspace(null);
+  }
+
+  function openMemoryAidEvidence(item) {
+    if (!item?.evidence) return;
+    recordProgress({ evidenceJumps: 1, xp: 1 });
+    setMemoryAidWorkspace(null);
+    openSearchResult({
+      ...item.evidence,
+      chapterTitle: book.chapters[item.evidence.chapterIndex]?.title || "原文",
+    });
+  }
+
   function addCategory(event) {
     event.preventDefault();
     const trimmed = newCategory.trim();
@@ -1771,6 +1799,9 @@ export function App() {
   }
 
   async function requestSituationBridgeJudgement({ shortlist, localFallback = null }) {
+    const retainMemoryAid = (card) => card && localFallback?.memoryAid
+      ? { ...card, memoryAid: localFallback.memoryAid }
+      : card;
     const payload = adjudicatorPayloadFromShortlist(shortlist);
     if (!payload?.gaps?.length || !(payload.candidates?.length >= 2)) {
       return localFallback;
@@ -1791,13 +1822,13 @@ export function App() {
       const result = await readApiJson(response);
       if (response.status === 422 && result?.fallback) {
         const fallbackPlan = applySituationBridgeJudgement(shortlist, result.judgement || { bridges: [] });
-        return situationBridgeToRecoveryCard(fallbackPlan) || localFallback;
+        return retainMemoryAid(situationBridgeToRecoveryCard(fallbackPlan)) || localFallback;
       }
       if (!response.ok) {
         throw new Error(result.error || "Situation bridge failed");
       }
       const plan = applySituationBridgeJudgement(shortlist, result.judgement);
-      return situationBridgeToRecoveryCard(plan) || localFallback;
+      return retainMemoryAid(situationBridgeToRecoveryCard(plan)) || localFallback;
     } catch (error) {
       if (isMissingApiKeyError(error?.message)) noticeMissingApiKey("已改用本地接驳");
       console.warn("Situation bridge fallback:", error);
@@ -1988,6 +2019,7 @@ export function App() {
       queueLayoutAnchor();
       setActivePanel("目录");
       setSidebarCollapsed(false);
+      setMemoryAidWorkspace(null);
       setRelationshipOpen(true);
       showNotice("已打开上下文关系");
     } else if (action === "recall") {
@@ -2203,6 +2235,8 @@ export function App() {
 
   function toggleReaderPanel(panel) {
     queueLayoutAnchor();
+    setRelationshipOpen(false);
+    setMemoryAidWorkspace(null);
     if (activePanel === panel && !sidebarCollapsed) {
       setSidebarCollapsed(true);
       return;
@@ -2457,7 +2491,7 @@ export function App() {
     index: bookIndex,
   });
   return (
-    <main className={`reader-shell theme-plain${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}`}>
+    <main className={`reader-shell theme-plain${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}${memoryAidWorkspace ? " memory-aid-open" : ""}`}>
       <header className="reader-topbar">
         <div className="reader-status">
           <h1 className="reader-chapter-title">{chapter.title}</h1>
@@ -2577,6 +2611,7 @@ export function App() {
           <RecoveryCard
             card={recoveryCard}
             onTrack={recordRecoveryInteraction}
+            onMemoryAid={openMemoryAid}
             onClose={(action = "continue") => {
               recordRecoveryInteraction(action, recoveryCard);
               setRecoveryCard(null);
@@ -2701,6 +2736,7 @@ export function App() {
         />
       )}
       {relationshipOpen && <RelationshipWorkspace relationships={contextRelationships} onEvidence={openRelationshipEvidence} onClose={() => { queueLayoutAnchor(); setRelationshipOpen(false); setActivePanel("目录"); }} />}
+      {memoryAidWorkspace && <MemoryAidWorkspace aid={memoryAidWorkspace} onEvidence={openMemoryAidEvidence} onClose={closeMemoryAid} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </main>
   );
@@ -3374,7 +3410,8 @@ function ReaderAnalysisPanel({ settings, setSettings, state, onAnalyze }) {
   </section>;
 }
 
-function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
+function RecoveryCard({ card, onClose, onEvidence, onTrack, onMemoryAid }) {
+  const { t } = useLocale();
   const [hintOpen, setHintOpen] = useState(false);
   const [answerOpen, setAnswerOpen] = useState(false);
   const [evidenceOpen, setEvidenceOpen] = useState(false);
@@ -3458,6 +3495,7 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
 
     <footer className="recall-sheet-footer">
       <div className="recall-sheet-footer-tools">
+        {card.memoryAid && <button type="button" className="recall-icon" onClick={() => onMemoryAid?.(card.memoryAid)} title={t("reader.memoryAid.open", { title: t(card.memoryAid.titleKey || "reader.memoryAid.general") })} aria-label={t("reader.memoryAid.open", { title: t(card.memoryAid.titleKey || "reader.memoryAid.general") })}><GitBranch size={16} /></button>}
         <button
           type="button"
           className={evidenceOpen ? "recall-icon active" : "recall-icon"}
@@ -3474,6 +3512,35 @@ function RecoveryCard({ card, onClose, onEvidence, onTrack }) {
       <button type="button" className="recall-icon recall-continue" onClick={() => onClose("continued")} title="继续阅读" aria-label="继续阅读"><BookOpen size={17} /></button>
     </footer>
   </aside>;
+}
+
+function MemoryAidWorkspace({ aid, onEvidence, onClose }) {
+  const { t } = useLocale();
+  const title = t(aid.titleKey || "reader.memoryAid.general");
+  const subtitle = t(aid.subtitleKey || "reader.memoryAid.generalHint");
+  return <section className={`memory-aid-workspace kind-${aid.kind}`} aria-label={title}>
+    <header className="memory-aid-header">
+      <div><span>{t("reader.memoryAid.kicker")}</span><h2>{title}</h2><small>{subtitle}</small></div>
+      <button type="button" onClick={onClose} title={t("reader.memoryAid.close", { title })} aria-label={t("reader.memoryAid.close", { title })}><X size={18} /></button>
+    </header>
+    <ol className="memory-aid-chain">
+      {aid.items.map((item, index) => <li key={item.id || `${aid.kind}-${index}`}>
+        <span className="memory-aid-node" aria-hidden="true"><i /></span>
+        <button type="button" onClick={() => onEvidence(item)} title={t("reader.memoryAid.viewSource", { title: item.title })} aria-label={t("reader.memoryAid.viewSource", { title: item.title })}>
+          <small>{translateAidRelation(item.relation, t)}</small>
+          <strong>{item.title}</strong>
+          <span>{item.summary}</span>
+          <em>{t("reader.memoryAid.evidence", { chapter: item.evidence.chapterIndex + 1 })} <ChevronRight size={13} /></em>
+        </button>
+      </li>)}
+    </ol>
+    <footer><Quote size={14} /><span>{t("reader.memoryAid.footer")}</span></footer>
+  </section>;
+}
+
+function translateAidRelation(relation, t) {
+  const key = ({ 起点: "start", 前置: "prerequisite", 关联: "related", 因果: "causal", 随后: "next", 承接: "supports", 同一进程: "sameProcess", 同一线索: "sameThread", 观点: "claim", 理由: "reason", 论据: "evidence", 例证: "example", 质疑: "objection", 结论: "conclusion" })[relation];
+  return key ? t(`reader.memoryAid.relation.${key}`) : relation;
 }
 
 function buildRecoveryQuestionHint(evidence) {
@@ -4346,7 +4413,15 @@ function prepareSituationRecovery(book, bookMemoryInput = {}, savedPosition = {}
     bookType: options.bookType || book?.bookType || "",
   });
   const plan = finalizeSituationBridgePlan(shortlist, null);
-  return { shortlist, card: situationBridgeToRecoveryCard(plan) };
+  const card = situationBridgeToRecoveryCard(plan);
+  const memoryAid = card ? buildTypeAdaptiveMemoryAid({
+    bookType: options.bookType || book?.bookType || "",
+    bookMemory,
+    cursor,
+    currentPageText,
+    bridges: plan?.bridges || [],
+  }) : null;
+  return { shortlist, card: card ? { ...card, memoryAid } : null };
 }
 
 function buildSituationRecoveryCard(book, bookMemoryInput = {}, savedPosition = {}, lastActivity = null, memoryState = {}, options = {}) {

@@ -75,8 +75,24 @@ async function evaluateCase(fixture, options) {
     const inventedSurvived = (poisoned.bridges || []).some(
       (item) => item.candidateId === "invented-cand" || item.gapId === "invented-gap",
     );
+    const firstCandidate = shortlist.candidates?.[0];
+    const wrongGap = shortlist.gaps?.find((gap) => gap.id !== firstCandidate?.forGapId);
+    const mismatched = firstCandidate && wrongGap
+      ? applySituationBridgeJudgement(shortlist, {
+        bridges: [{
+          gapId: wrongGap.id,
+          candidateId: firstCandidate.id,
+          whyNeeded: "合法 ID 也不能跨缺口错配",
+          confidence: "high",
+        }],
+      })
+      : null;
+    const mismatchSurvived = Boolean(mismatched?.bridges?.some(
+      (item) => item.candidateId === firstCandidate?.id && item.gapId === wrongGap?.id,
+    ));
     return scoreRow(fixture, plan, shortlist, {
       inventedRejected: !inventedSurvived,
+      pairMismatchRejected: !mismatchSurvived,
       liveMeta,
     });
   }
@@ -131,11 +147,13 @@ function localJudgementFromShortlist(shortlist) {
   const used = new Set();
   for (const gap of gaps) {
     if (bridges.length >= 3) break;
-    const match = candidates.find((item) => {
-      if (used.has(item.id)) return false;
-      if (item.forGapId && item.forGapId === gap.id) return true;
-      return overlaps(item.title, gap.label) || overlaps(item.snippet, gap.label);
-    }) || candidates.find((item) => !used.has(item.id));
+    const match = candidates.find(
+      (item) => !used.has(item.id) && item.forGapId === gap.id && item.linkReason,
+    ) || candidates.find((item) => (
+      !used.has(item.id)
+      && !item.forGapId
+      && (overlaps(item.title, gap.label) || overlaps(item.snippet, gap.label))
+    ));
     if (!match) continue;
     used.add(match.id);
     bridges.push({
@@ -167,6 +185,10 @@ function scoreRow(fixture, plan, shortlist, extras = {}) {
     const evidenceOk = bridges.every((item) => item.whyNeeded && item.evidence);
     checks.push({ id: "evidence", pass: evidenceOk });
 
+    if (plan?.source === "local") {
+      checks.push({ id: "pairLink", pass: bridges.every((item) => Boolean(item.linkReason)) });
+    }
+
     const precision = scorePrecision(bridges, expect.titleHints || []);
     checks.push({ id: "precision", pass: precision >= 0.5, value: precision });
 
@@ -175,6 +197,13 @@ function scoreRow(fixture, plan, shortlist, extras = {}) {
         (hint) => !bridges.some((bridge) => overlaps(bridge.title, hint) || overlaps(bridge.whyNeeded, hint)),
       );
       checks.push({ id: "mustInclude", pass: missing.length === 0, missing });
+    }
+
+    if (expect.forbiddenTitleHints?.length) {
+      const leaked = expect.forbiddenTitleHints.filter(
+        (hint) => bridges.some((bridge) => overlaps(bridge.title, hint) || overlaps(bridge.whyNeeded, hint)),
+      );
+      checks.push({ id: "forbiddenAbsent", pass: leaked.length === 0, leaked });
     }
 
     if (expect.gapKinds?.length && plan?.gaps?.length) {
@@ -190,6 +219,7 @@ function scoreRow(fixture, plan, shortlist, extras = {}) {
 
   if (expect.rejectInventedIds) {
     checks.push({ id: "inventedRejected", pass: extras.inventedRejected !== false });
+    checks.push({ id: "pairMismatchRejected", pass: extras.pairMismatchRejected !== false });
   }
 
   const budget = scoreBudget(shortlist);
@@ -213,6 +243,7 @@ function scoreRow(fixture, plan, shortlist, extras = {}) {
     precision: checks.find((item) => item.id === "precision")?.value ?? (expect.suppressed ? 1 : 0),
     budgetOk: budget.ok,
     inventedRejected: extras.inventedRejected !== false,
+    pairMismatchRejected: extras.pairMismatchRejected !== false,
   };
 }
 
@@ -278,16 +309,18 @@ function summarise(rows) {
   }
 
   const pass = {
-    passed: scores.overall >= 80
-      && scores.precision >= 70
-      && scores.suppressAccuracy >= 80
+    passed: rows.every((row) => row.passed)
+      && scores.overall >= 80
+      && scores.precision >= 85
+      && scores.suppressAccuracy >= 85
       && scores.budgetCompliance === 100
       && scores.inventIdReject === 100,
     reasons: [],
   };
   if (scores.overall < 80) pass.reasons.push(`overall ${scores.overall} < 80`);
-  if (scores.precision < 70) pass.reasons.push(`precision ${scores.precision} < 70`);
-  if (scores.suppressAccuracy < 80) pass.reasons.push(`suppressAccuracy ${scores.suppressAccuracy} < 80`);
+  if (!rows.every((row) => row.passed)) pass.reasons.push("every fixture must pass");
+  if (scores.precision < 85) pass.reasons.push(`precision ${scores.precision} < 85`);
+  if (scores.suppressAccuracy < 85) pass.reasons.push(`suppressAccuracy ${scores.suppressAccuracy} < 85`);
   if (scores.budgetCompliance < 100) pass.reasons.push("budgetCompliance must be 100");
   if (scores.inventIdReject < 100) pass.reasons.push("inventIdReject must be 100");
 

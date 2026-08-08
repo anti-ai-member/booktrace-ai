@@ -78,6 +78,7 @@ const dependent = buildSituationBridgePlan({
 assert(!dependent.suppressed, `expected bridges, got ${dependent.reason}`);
 assert(dependent.bridges.length >= 2, "expected >=2 bridges");
 assert(dependent.bridges.every((item) => item.whyNeeded && item.evidence), "bridges need whyNeeded+evidence");
+assert(dependent.bridges.every((item) => item.linkReason), "local bridges need a pair-link reason");
 const card = situationBridgeToRecoveryCard(dependent);
 assert(card?.bridges?.length >= 2, "card mapping failed");
 
@@ -104,8 +105,15 @@ assert(
 );
 
 const offer = shouldOfferSituationBridge({
-  gaps: [{ id: "g1", label: "夏英杰", kind: "person", importance: 0.7 }],
-  fuel: [{ id: "f1", title: "夏英杰", snippet: "率部转移", strength: 0.7, gapKinds: ["person"] }],
+  gaps: [{ id: "g1", label: "夏英杰", context: "夏英杰下令北上", kind: "person", importance: 0.7 }],
+  fuel: [{
+    id: "f1",
+    title: "夏英杰",
+    snippet: "率部转移",
+    strength: 0.7,
+    gapKinds: ["person"],
+    evidence: { quote: "夏英杰率部转移" },
+  }],
   mode: "auto",
 });
 assert(offer.ok, "offer should pass with strong gap/fuel");
@@ -127,17 +135,19 @@ assert(payload.candidates.every((item) => item.snippet.length <= 80), "snippet b
 const fakeGap = shortlist.gaps[0];
 const fakeA = shortlist.candidates[0];
 const fakeB = shortlist.candidates[1];
+const fakeAGap = shortlist.gaps.find((gap) => gap.id === fakeA.forGapId) || fakeGap;
+const fakeBGap = shortlist.gaps.find((gap) => gap.id === fakeB.forGapId) || fakeGap;
 const judged = applySituationBridgeJudgement(shortlist, {
   bridges: [
     {
-      gapId: fakeGap.id,
+      gapId: fakeAGap.id,
       candidateId: fakeA.id,
       title: fakeA.title,
       whyNeeded: "本页还在沿用此事",
       confidence: "high",
     },
     {
-      gapId: shortlist.gaps[1]?.id || fakeGap.id,
+      gapId: fakeBGap.id,
       candidateId: fakeB.id,
       title: fakeB.title,
       whyNeeded: "接上前文才读得通",
@@ -145,7 +155,7 @@ const judged = applySituationBridgeJudgement(shortlist, {
     },
   ],
   question: {
-    gapId: fakeGap.id,
+    gapId: fakeAGap.id,
     candidateId: fakeA.id,
     prompt: "当时为何封锁渡口？",
     hint: "想一想转移",
@@ -175,6 +185,47 @@ assert(
     || rejected.bridges.every((item) => item.candidateId !== "invented-cand"),
   "invented ids rejected",
 );
+
+const wrongGap = shortlist.gaps.find((gap) => gap.id !== fakeA.forGapId);
+if (wrongGap) {
+  const mismatched = applySituationBridgeJudgement(shortlist, {
+    bridges: [{
+      gapId: wrongGap.id,
+      candidateId: fakeA.id,
+      whyNeeded: "合法 ID 不能跨缺口错配",
+      confidence: "high",
+    }],
+  });
+  assert(
+    mismatched.suppressed || mismatched.bridges.every(
+      (item) => item.candidateId !== fakeA.id || item.gapId !== wrongGap.id,
+    ),
+    "candidate must not be adjudicated onto an unauthorized gap",
+  );
+}
+
+const strictPriorBook = {
+  id: "strict-prior",
+  chapters: [
+    { id: "p0", title: "前章", paragraphs: ["窗外落着安静的雨。"] },
+    { id: "p1", title: "当前章", paragraphs: ["因为封锁渡口的决定没有执行，后续计划被迫全部改变。"] },
+  ],
+};
+const strictPriorOptions = {
+  book: strictPriorBook,
+  bookMemory: { version: 2, entities: [], episodic: [], timeline: [], topics: [], arguments: [], relationships: [] },
+  cursor: { chapterIndex: 1, pageIndex: 0, paragraphIndex: 0 },
+  currentPageText: strictPriorBook.chapters[1].paragraphs[0],
+  mode: "manual",
+  minAbsenceMs: 0,
+};
+const noCurrentEcho = buildSituationBridgePlan(strictPriorOptions);
+assert(noCurrentEcho.suppressed, "current paragraph must not become prior-context fuel");
+const noUnpositionedAsset = buildSituationBridgePlan({
+  ...strictPriorOptions,
+  notes: [{ id: "legacy-note", selection: "封锁渡口", content: "封锁渡口改变计划" }],
+});
+assert(noUnpositionedAsset.suppressed, "unpositioned reader assets must not be treated as prior evidence");
 
 // Reader Memory bridge feedback (Task 2)
 const remembered = markReaderBridgeFeedback(null, { action: "remembered", keys: ["cand:a", "cand:b"] });

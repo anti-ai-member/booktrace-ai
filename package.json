@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "verify:pagination": "node scripts/verify-page-fill.mjs",
     "verify:situation-bridge": "node scripts/verify-situation-bridge.mjs",
+    "verify:memory-aid": "node scripts/verify-memory-aid.mjs",
     "situation-bridge:evaluate": "node scripts/situation-bridge-eval.mjs",
     "situation-bridge:evaluate:live": "node scripts/situation-bridge-eval.mjs --live",
     "trace:evaluate": "node scripts/trace-eval.mjs",

@@ -757,6 +757,7 @@ ${scopeInstruction}
 5. priority 只允许 primary、recent 或 secondary。primary 是默认展示层；recent 表示最近已读新增；secondary 可展开。
 6. relationships 只输出原文能直接证明的关系。没有可靠关系就返回空数组。
 7. 优先填充 memory 六类桶；若某类不适用，返回空数组。可同时返回 legacy 字段作为兼容。
+8. causes/causedBy/prerequisites/relatedTo/supports/respondsTo 只能引用本次或上次 Memory 中的同名条目；没有原文证据的链路必须留空。
 
 输出 JSON：
 {
@@ -764,8 +765,8 @@ ${scopeInstruction}
   "memory":{
     "entities":[{"kind":"person|organization|place|term","name":"","priority":"primary|recent|secondary","attributes":["1-2 个角色标签"],"summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
     "timeline":[{"kind":"event|timepoint","name":"","priority":"primary|recent|secondary","summary":"","causes":[],"causedBy":[],"evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
-    "topics":[{"kind":"concept|definition|mechanism|framework|example","name":"","priority":"primary|recent|secondary","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
-    "arguments":[{"kind":"claim|reason|evidence|example|conclusion|objection","name":"","priority":"primary|recent|secondary","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+    "topics":[{"kind":"concept|definition|mechanism|framework|example","name":"","priority":"primary|recent|secondary","summary":"","prerequisites":["仅填写本次 Memory 中可由原文证明的前置概念名"],"relatedTo":["仅填写本次 Memory 中可由原文证明的相关概念名"],"evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
+    "arguments":[{"kind":"claim|reason|evidence|example|conclusion|objection","name":"","priority":"primary|recent|secondary","summary":"","claim":"","reason":"","example":"","conclusion":"","supports":["所支持的 Memory 条目名"],"respondsTo":["所回应或反驳的 Memory 条目名"],"evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
     "episodic":[{"kind":"event|scene","name":"","priority":"primary|recent|secondary","summary":"","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}],
     "relationships":[{"source":"","sourceType":"person|organization|event","target":"","targetType":"person|organization|event","relation":"","relationKind":"command|belongs|cooperate|conflict|participate|other","importance":"primary|secondary","evidence":{"chapterIndex":0,"paragraphIndex":0,"quote":""}}]
   },
