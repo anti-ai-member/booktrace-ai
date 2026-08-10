@@ -312,6 +312,8 @@ review.
 3. **Local reader-memory assets (P1):** consolidate bookmarks, notes, explains,
    recovery outcomes, and remembered/missed feedback into reusable Reader
    Memory that affects later recall without overpowering current-page fit.
+   Implementation vehicle: Feature 029
+   (`constitution/features/029-local-reader-memory-assets.md`) — **complete**.
 4. **On-demand local relationship/concept views (P2):** show a small evidenced
    relationship, causal, concept, or argument view only when the current page
    benefits from it; no permanent global graph.

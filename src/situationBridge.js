@@ -1,9 +1,11 @@
 import {
   collectMemoryAnchors,
+  consolidateReaderMemoryAssets,
   filterBookMemoryByCursor,
   hasBookMemoryContent,
   normalizeBookMemory,
   readerForgettingScore,
+  updateReaderMemory,
 } from "./memoryModels.js";
 import {
   hintFromEvidenceExcerpt,
@@ -95,6 +97,12 @@ export function prepareSituationBridgeShortlist({
   const absence = describeAbsence(lastActivity);
   const normalizedCursor = normalizeCursor(cursor);
   const memory = normalizeBookMemory(bookMemory || {});
+  const readerState = consolidateReaderMemoryAssets(updateReaderMemory(memory.reader, reader || {}), {
+    notes,
+    explains,
+    bookmarks,
+    cursor: normalizedCursor,
+  });
   const bias = typeBias(bookType || book?.bookType || "");
 
   if (mode === "auto" && minAbsenceMs > 0 && Number(lastActivity || 0) && Date.now() - Number(lastActivity) < minAbsenceMs) {
@@ -116,19 +124,19 @@ export function prepareSituationBridgeShortlist({
     notes,
     explains,
     bookmarks,
-    reader,
+    reader: readerState,
     pageText,
   });
   if (!fuel.length) return suppressedPlan("no-bridges", absence);
 
-  const offer = shouldOfferSituationBridge({ gaps, fuel, mode, reader, bias });
+  const offer = shouldOfferSituationBridge({ gaps, fuel, mode, reader: readerState, bias });
   if (!offer.ok) return suppressedPlan(offer.reason, absence);
 
-  const candidates = fuseCandidates(gaps, fuel, reader, bias).slice(0, MAX_CANDIDATES);
+  const candidates = fuseCandidates(gaps, fuel, readerState, bias).slice(0, MAX_CANDIDATES);
   const minimumCandidates = mode === "manual" ? 1 : MAX_BRIDGES_AUTO;
   if (candidates.length < minimumCandidates) return suppressedPlan("no-bridges", absence);
 
-  const localBridges = matchBridgesLocal(gaps, candidates, mode, reader, bias);
+  const localBridges = matchBridgesLocal(gaps, candidates, mode, readerState, bias);
   const chapterTitle = book.chapters[normalizedCursor.chapterIndex]?.title || `第 ${normalizedCursor.chapterIndex + 1} 节`;
 
   return {
@@ -675,7 +683,8 @@ function scoreGapFuel(gap, item, reader = null, bias = null, knownLink = null) {
   const traceBonus = item.channel === "readerTrace" ? 0.08 : 0;
   const explanatoryBonus = explanatoryChannelBonus(gap.kind, item.channel);
   const readerDelta = readerSignalDelta(item.id || item.candidateId, reader);
-  return Math.min(1.4, link.score + kindBonus + strength * 0.22 + traceBonus + explanatoryBonus + readerDelta);
+  const assetDelta = readerAssetSignalDelta(item.id || item.candidateId, reader);
+  return Math.min(1.4, link.score + kindBonus + strength * 0.22 + traceBonus + explanatoryBonus + readerDelta + assetDelta);
 }
 
 /**
@@ -861,15 +870,26 @@ function nearParagraphSnippet(book, anchor) {
 }
 
 function isBeforeCursor(item, cursor) {
-  const chapterIndex = Number(item.chapterIndex);
-  const paragraphIndex = Number(item.paragraphIndex);
+  const hasChapter = item.chapterIndex !== null && item.chapterIndex !== undefined && item.chapterIndex !== "";
+  const chapterIndex = hasChapter ? Number(item.chapterIndex) : Number.NaN;
+  const hasParagraph = item.paragraphIndex !== null && item.paragraphIndex !== undefined && item.paragraphIndex !== "";
+  const paragraphIndex = hasParagraph ? Number(item.paragraphIndex) : Number.NaN;
   if (!Number.isInteger(chapterIndex)) return false;
   if (chapterIndex < cursor.chapterIndex) return true;
   if (chapterIndex > cursor.chapterIndex) return false;
   if (Number.isInteger(paragraphIndex)) return paragraphIndex < Number(cursor.paragraphIndex || 0);
-  const pageIndex = Number(item.pageIndex);
+  const hasPage = item.pageIndex !== null && item.pageIndex !== undefined && item.pageIndex !== "";
+  const pageIndex = hasPage ? Number(item.pageIndex) : Number.NaN;
   if (Number.isInteger(pageIndex)) return pageIndex < Number(cursor.pageIndex || 0);
   return false;
+}
+
+function readerAssetSignalDelta(key, reader) {
+  if (!key || !reader) return 0;
+  if (String(key).startsWith("note:") && reader.noteRefs?.includes(key)) return 0.06;
+  if (String(key).startsWith("explain:") && reader.explainRefs?.includes(key)) return 0.06;
+  if (String(key).startsWith("bookmark:") && reader.bookmarkRefs?.includes(key)) return 0.035;
+  return 0;
 }
 
 function isEvidenceBeforeCursor(evidence, cursor) {

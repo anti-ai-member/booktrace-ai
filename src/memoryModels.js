@@ -1,4 +1,4 @@
-const MEMORY_VERSION = 2;
+const MEMORY_VERSION = 3;
 const PRIORITY_RANK = { primary: 3, recent: 2, secondary: 1 };
 const BUCKETS = ["entities", "timeline", "topics", "arguments", "episodic", "relationships"];
 const BUCKET_CAPS = {
@@ -251,7 +251,51 @@ export function updateReaderMemory(reader = null, patch = {}) {
     missedKeys: uniqueStrings([...(current.missedKeys || []), ...(patch.missedKeys || [])]),
     noteRefs: uniqueStrings([...(current.noteRefs || []), ...(patch.noteRefs || [])]),
     bookmarkRefs: uniqueStrings([...(current.bookmarkRefs || []), ...(patch.bookmarkRefs || [])]),
+    explainRefs: uniqueStrings([...(current.explainRefs || []), ...(patch.explainRefs || [])]),
     forgettingScores: { ...current.forgettingScores, ...(patch.forgettingScores || {}) },
+  });
+}
+
+/**
+ * Rebuild the Reader Memory asset index from durable local source records.
+ * Text stays in the note/bookmark/explain stores; Reader Memory keeps only
+ * stable references and compact activity metadata.
+ */
+export function consolidateReaderMemoryAssets(reader = null, {
+  notes = [],
+  bookmarks = [],
+  explains = [],
+  cursor = null,
+} = {}) {
+  const current = normalizeReaderMemory(reader);
+  const positioned = (items, kind) => (Array.isArray(items) ? items : [])
+    .filter((item) => isReaderAssetBeforeCursor(item, cursor))
+    .map((item) => ({
+      ref: readerAssetRef(kind, item),
+      createdAt: readerAssetTimestamp(item),
+    }))
+    .filter((item) => item.ref);
+  const noteAssets = positioned(notes, "note");
+  const bookmarkAssets = positioned(bookmarks, "bookmark");
+  const explainAssets = positioned(explains, "explain");
+  const noteRefs = uniqueStrings(noteAssets.map((item) => item.ref));
+  const bookmarkRefs = uniqueStrings(bookmarkAssets.map((item) => item.ref));
+  const explainRefs = uniqueStrings(explainAssets.map((item) => item.ref));
+  const latestAssetAt = [...noteAssets, ...bookmarkAssets, ...explainAssets]
+    .reduce((latest, item) => Math.max(latest, item.createdAt), 0) || null;
+
+  return normalizeReaderMemory({
+    ...current,
+    noteRefs,
+    bookmarkRefs,
+    explainRefs,
+    assetCounts: {
+      notes: noteRefs.length,
+      bookmarks: bookmarkRefs.length,
+      explains: explainRefs.length,
+    },
+    latestAssetAt,
+    lastActivityAt: Math.max(Number(current.lastActivityAt) || 0, Number(latestAssetAt) || 0) || null,
   });
 }
 
@@ -456,9 +500,51 @@ function normalizeReaderMemory(reader = null) {
     missedKeys: uniqueStrings(value.missedKeys),
     noteRefs: uniqueStrings(value.noteRefs || value.noteIds),
     bookmarkRefs: uniqueStrings(value.bookmarkRefs || value.bookmarkIds),
+    explainRefs: uniqueStrings(value.explainRefs || value.explainIds),
+    assetCounts: {
+      notes: Math.max(0, Number(value.assetCounts?.notes) || 0),
+      bookmarks: Math.max(0, Number(value.assetCounts?.bookmarks) || 0),
+      explains: Math.max(0, Number(value.assetCounts?.explains) || 0),
+    },
+    latestAssetAt: Number(value.latestAssetAt) || null,
     activeReadingMs: Math.max(0, Number(value.activeReadingMs) || 0),
     forgettingScores: normalizeScoreMap(value.forgettingScores),
   };
+}
+
+function readerAssetRef(kind, item) {
+  const id = String(item?.id ?? "").trim();
+  if (!id) return "";
+  return `${kind}:${id}`;
+}
+
+function readerAssetTimestamp(item) {
+  const raw = item?.updatedAt || item?.createdAt || null;
+  const numeric = Number(raw);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const parsed = Date.parse(raw || "");
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function isReaderAssetBeforeCursor(item, cursor) {
+  if (!item || !cursor) return false;
+  const hasChapter = item.chapterIndex !== null && item.chapterIndex !== undefined && item.chapterIndex !== "";
+  const hasCurrentChapter = cursor.chapterIndex !== null && cursor.chapterIndex !== undefined && cursor.chapterIndex !== "";
+  const chapterIndex = hasChapter ? Number(item.chapterIndex) : Number.NaN;
+  const currentChapter = hasCurrentChapter ? Number(cursor.chapterIndex) : Number.NaN;
+  if (!Number.isInteger(chapterIndex) || !Number.isInteger(currentChapter)) return false;
+  if (chapterIndex < currentChapter) return true;
+  if (chapterIndex > currentChapter) return false;
+  const hasParagraph = item.paragraphIndex !== null && item.paragraphIndex !== undefined && item.paragraphIndex !== "";
+  const paragraphIndex = hasParagraph ? Number(item.paragraphIndex) : Number.NaN;
+  const currentParagraph = Number(cursor.paragraphIndex);
+  if (Number.isInteger(paragraphIndex) && Number.isInteger(currentParagraph)) {
+    return paragraphIndex < currentParagraph;
+  }
+  const hasPage = item.pageIndex !== null && item.pageIndex !== undefined && item.pageIndex !== "";
+  const pageIndex = hasPage ? Number(item.pageIndex) : Number.NaN;
+  const currentPage = Number(cursor.pageIndex);
+  return Number.isInteger(pageIndex) && Number.isInteger(currentPage) && pageIndex < currentPage;
 }
 
 function mergeReaderMemory(left, right) {
