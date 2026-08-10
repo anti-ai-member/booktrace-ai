@@ -317,6 +317,8 @@ review.
 4. **On-demand local relationship/concept views (P2):** show a small evidenced
    relationship, causal, concept, or argument view only when the current page
    benefits from it; no permanent global graph.
+   Implementation vehicle: Feature 030
+   (`constitution/features/030-on-demand-local-context-views.md`) — **complete**.
 5. **Memory thread map (P2):** generate a read-bounded 5–9 node local mind map
    centered on the current page, with type-adaptive structure, expandable one
    level, explicit/inferred edge styling, and source jumps for every node.

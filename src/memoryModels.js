@@ -437,6 +437,8 @@ function normalizeEpisodicItem(item = {}, index = 0) {
     summary: cleanText(item.summary || item.detail) || name,
     priority: normalizePriority(item.priority),
     chapterTitle: cleanText(item.chapterTitle) || "",
+    causes: asStringArray(item.causes),
+    causedBy: asStringArray(item.causedBy),
     evidence,
     occurrences: normalizeOccurrences(item.occurrences, evidence),
     updatedAt: item.updatedAt || new Date().toISOString(),

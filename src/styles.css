@@ -5169,6 +5169,31 @@ body { background: var(--desk-paper); }
   box-shadow: 18px 0 40px rgb(46 50 44 / .06);
 }
 
+.relationship-workspace.context-mode-concept,
+.relationship-workspace.context-mode-causal,
+.relationship-workspace.context-mode-argument {
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.relationship-node.concept,
+.relationship-node.definition,
+.relationship-node.mechanism,
+.relationship-node.framework {
+  border-color: #b8ced0;
+  color: #405f61;
+  background: #f6fbfb;
+}
+
+.relationship-node.claim,
+.relationship-node.reason,
+.relationship-node.evidence,
+.relationship-node.conclusion,
+.relationship-node.objection {
+  border-color: #d8cbb9;
+  color: #6a5945;
+  background: #fcfaf5;
+}
+
 .reader-shell.relationship-open .reader-search-panel-overlay,
 .reader-shell.relationship-open.sidebar-collapsed .reader-search-panel-overlay {
   left: calc(72px + min(52vw, 1065px) + 22px);

@@ -48,6 +48,7 @@ import {
 import { BOOK_TYPES, findBookType } from "./bookTaxonomy.js";
 import { buildMemoryCandidates, buildMemoryEvidenceStore, locateEvidence } from "./memoryEngine.js";
 import { buildTypeAdaptiveMemoryAid } from "./memoryAid.js";
+import { buildLocalContextView } from "./localContextView.js";
 import {
   bookMemoryFromLegacy,
   collectMemoryAnchors,
@@ -419,6 +420,7 @@ export function App() {
   const [analysisSummaryOpen, setAnalysisSummaryOpen] = useState(false);
   const [selectionAssist, setSelectionAssist] = useState(null);
   const [relationshipOpen, setRelationshipOpen] = useState(false);
+  const [contextViewWorkspace, setContextViewWorkspace] = useState(null);
   const [memoryAidWorkspace, setMemoryAidWorkspace] = useState(null);
   const [readingProgress, setReadingProgress] = useState(() => ({ ...createReadingProgress(), ...loadStored("yuezhi-reading-progress", createReadingProgress()) }));
   const [aiIndex, setAiIndex] = useState(null);
@@ -2040,8 +2042,8 @@ export function App() {
         showNotice("暂无直接出处，可搜索相关原文");
       }
     } else if (action === "relation") {
-      if (!contextRelationships.length) {
-        showNotice("当前页附近还没有可靠关系证据");
+      if (!selectionContextView?.edges?.length) {
+        showNotice("选中内容附近还没有可靠关联证据");
         setSelectionBloom(null);
         return;
       }
@@ -2049,8 +2051,9 @@ export function App() {
       setActivePanel("目录");
       setSidebarCollapsed(false);
       setMemoryAidWorkspace(null);
+      setContextViewWorkspace(selectionContextView);
       setRelationshipOpen(true);
-      showNotice("已打开上下文关系");
+      showNotice(`已打开${selectionContextView.title}`);
     } else if (action === "recall") {
       openSelectionRecoveryCard(selectionBloom);
     } else if (action === "question") {
@@ -2513,11 +2516,17 @@ export function App() {
   }
 
   const currentPageRead = isPageRead(chapterIndex, pageIndex);
-  const contextRelationships = contextualRelationships(bookIndex.relationships || [], {
-    chapterIndex,
-    pageParagraphs: currentPageParagraphs,
-    selectedParagraph,
-    index: bookIndex,
+  const selectionContextView = buildLocalContextView({
+    bookMemory,
+    cursor: {
+      chapterIndex: Number.isInteger(selectionBloom?.chapterIndex) ? selectionBloom.chapterIndex : chapterIndex,
+      pageIndex: Number.isInteger(selectionBloom?.pageIndex) ? selectionBloom.pageIndex : pageIndex,
+      paragraphIndex: Number.isInteger(selectionBloom?.paragraphIndex)
+        ? selectionBloom.paragraphIndex
+        : (Number.isInteger(selectedParagraph) ? selectedParagraph : currentPageParagraphs.at(-1)?.paragraphIndex || 0),
+    },
+    focusText: selectionBloom?.fullText || "",
+    pageText: currentPageParagraphs.map((item) => item.text || "").join("\n"),
   });
   return (
     <main className={`reader-shell theme-plain${sidebarCollapsed ? " sidebar-collapsed" : ""}${relationshipOpen ? " relationship-open" : ""}${memoryAidWorkspace ? " memory-aid-open" : ""}`}>
@@ -2701,7 +2710,7 @@ export function App() {
         <button className="page-edge page-edge-prev" type="button" disabled={visiblePageIndex === 0 && chapterIndex === 0} onClick={() => turnPage(-1)} title={t("reader.prevPage")} aria-label={t("reader.prevPage")}><ChevronLeft size={23} /></button>
         <button className="page-edge page-edge-next" type="button" disabled={visiblePageIndex === pageCount - 1 && chapterIndex === book.chapters.length - 1} onClick={() => turnPage(1)} title={t("reader.nextPage")} aria-label={t("reader.nextPage")}><ChevronRight size={23} /></button>
       </section>
-      {selectionBloom && <SelectionBloom selection={selectionBloom} relationAvailable={contextRelationships.length > 0} canDeleteExplain={findExplainsForSelection(explains, selectionBloom).length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
+      {selectionBloom && <SelectionBloom selection={selectionBloom} relationAvailable={Boolean(selectionContextView?.edges?.length)} contextLabel={selectionContextView?.actionLabel || "关联"} canDeleteExplain={findExplainsForSelection(explains, selectionBloom).length > 0} onAction={handleBloomAction} onClose={() => setSelectionBloom(null)} />}
       {explainPreview?.primary && (
         <div
           className="explain-mark-preview"
@@ -2764,7 +2773,7 @@ export function App() {
           onSave={saveNote}
         />
       )}
-      {relationshipOpen && <RelationshipWorkspace relationships={contextRelationships} onEvidence={openRelationshipEvidence} onClose={() => { queueLayoutAnchor(); setRelationshipOpen(false); setActivePanel("目录"); }} />}
+      {relationshipOpen && contextViewWorkspace && <RelationshipWorkspace contextView={contextViewWorkspace} onEvidence={openRelationshipEvidence} onClose={() => { queueLayoutAnchor(); setRelationshipOpen(false); setContextViewWorkspace(null); setActivePanel("目录"); }} />}
       {memoryAidWorkspace && <MemoryAidWorkspace aid={memoryAidWorkspace} onEvidence={openMemoryAidEvidence} onClose={closeMemoryAid} />}
       {notice && <div className="toast" role="status">{notice}</div>}
     </main>
@@ -2926,13 +2935,20 @@ function formatReadingTime(seconds) {
   return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
 }
 
-function RelationshipWorkspace({ relationships, onEvidence, onClose }) {
+function RelationshipWorkspace({ contextView, onEvidence, onClose }) {
+  const relationships = (contextView?.edges || []).map((edge) => ({
+    ...edge,
+    source: edge.sourceName,
+    target: edge.targetName,
+    relationKind: edge.relationKind || "other",
+    importance: edge.priority,
+  }));
   const [view, setView] = useState("graph");
-  const [selectedName, setSelectedName] = useState(relationships[0]?.source || "");
+  const [selectedName, setSelectedName] = useState(contextView?.focusLabel || relationships[0]?.source || "");
   useEffect(() => {
-    setSelectedName(relationships[0]?.source || "");
+    setSelectedName(contextView?.focusLabel || relationships[0]?.source || "");
     setView("graph");
-  }, [relationships]);
+  }, [contextView]);
   const visibleRelationships = useMemo(() => view === "organization"
     ? relationships.filter((item) => item.relationKind === "command" || item.relationKind === "belongs")
     : relationships, [relationships, view]);
@@ -2940,13 +2956,14 @@ function RelationshipWorkspace({ relationships, onEvidence, onClose }) {
   const selectedRelationship = visibleRelationships.find((item) => item.source === selectedName || item.target === selectedName) || visibleRelationships[0];
   const entities = useMemo(() => uniqueRelationshipEntities(visibleRelationships), [visibleRelationships]);
 
-  return <section className="relationship-workspace context-relationship-workspace" aria-label="上下文关系">
-    <header className="relationship-header"><div><span>当前页辅助</span><h2>上下文关系</h2><small>{visibleRelationships.length} 条可追溯关系</small></div><button onClick={onClose} title="关闭上下文关系"><X size={18} /></button></header>
-    <div className="relationship-view-switch" role="tablist"><button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>局部关系</button>{relationships.length >= 3 && <button className={view === "organization" ? "active" : ""} onClick={() => setView("organization")}>组织层级</button>}{relationships.length >= 4 && <button className={view === "matrix" ? "active" : ""} onClick={() => setView("matrix")}>矩阵</button>}</div>
+  const relationshipMode = contextView?.mode === "relationship";
+  return <section className={`relationship-workspace context-relationship-workspace context-mode-${contextView?.mode || "relationship"}`} aria-label={contextView?.title || "上下文关联"}>
+    <header className="relationship-header"><div><span>选中内容辅助</span><h2>{contextView?.title || "上下文关联"}</h2><small>{visibleRelationships.length} 条可追溯关联</small></div><button onClick={onClose} title="关闭上下文关联" aria-label="关闭上下文关联"><X size={18} /></button></header>
+    {relationshipMode && <div className="relationship-view-switch" role="tablist"><button className={view === "graph" ? "active" : ""} onClick={() => setView("graph")}>局部关系</button>{relationships.some((item) => item.relationKind === "command" || item.relationKind === "belongs") && <button className={view === "organization" ? "active" : ""} onClick={() => setView("organization")}>组织层级</button>}{relationships.length >= 4 && <button className={view === "matrix" ? "active" : ""} onClick={() => setView("matrix")}>矩阵</button>}</div>}
     <div className="relationship-canvas">
       {view === "matrix" ? <RelationshipMatrix entities={entities} relationships={visibleRelationships} onSelect={setSelectedName} /> : visibleRelationships.length ? <ReactFlow nodes={graph.nodes} edges={graph.edges} fitView nodesDraggable={false} nodesConnectable={false} elementsSelectable onNodeClick={(_event, node) => setSelectedName(node.data.entityName)} onEdgeClick={(_event, edge) => setSelectedName(edge.data.relationship.source)}><Background gap={18} size={1} color="#e3ebe2" /><Controls showInteractive={false} /></ReactFlow> : <div className="relationship-empty">当前页附近还没有可靠关系证据。选中人物或组织后再查看，会更准确。</div>}
     </div>
-    {selectedRelationship && <footer className="relationship-detail"><div><span>{selectedRelationship.source} <i>·</i> {selectedRelationship.relation} <i>·</i> {selectedRelationship.target}</span><small>第 {selectedRelationship.evidence.chapterIndex + 1} 节 · 原文证据</small></div><button onClick={() => onEvidence(selectedRelationship)}>查看原文 <ChevronRight size={15} /></button></footer>}
+    {selectedRelationship && <footer className="relationship-detail"><div><span>{selectedRelationship.source} <i>·</i> {selectedRelationship.relation} <i>·</i> {selectedRelationship.target}</span><small>第 {selectedRelationship.evidence.chapterIndex + 1} 节 · 原文证据</small></div><button onClick={() => onEvidence(selectedRelationship)} title="查看原文" aria-label="查看原文"><ChevronRight size={15} /></button></footer>}
   </section>;
 }
 
@@ -2985,12 +3002,12 @@ function relationshipNodeColor(type) {
   return type === "organization" ? "#b89066" : type === "event" ? "#8e789d" : "#5b9070";
 }
 
-function SelectionBloom({ selection, relationAvailable = true, canDeleteExplain = false, onAction, onClose }) {
+function SelectionBloom({ selection, relationAvailable = true, contextLabel = "关联", canDeleteExplain = false, onAction, onClose }) {
   const actions = [
     { id: "question", label: "解惑", icon: Sparkles, className: "question" },
     { id: "recall", label: "回忆", icon: History, className: "recall" },
     { id: "source", label: "出处", icon: FileText, className: "source" },
-    relationAvailable && { id: "relation", label: "关系", icon: Network, className: "relation" },
+    relationAvailable && { id: "relation", label: contextLabel, icon: Network, className: "relation" },
     { id: "note", label: "笔记", icon: Lightbulb, className: "note" },
     { id: "favorite", label: "收藏", icon: Bookmark, className: "favorite" },
     canDeleteExplain && { id: "delete", label: "删除", icon: Trash2, className: "delete" },
@@ -3693,48 +3710,6 @@ function hasIndexEvidence(item, book = null) {
   const chapter = book.chapters.find((candidate, index) => (candidate.sourceChapterIndex ?? index) === chapterIndex)
     || book.chapters[chapterIndex];
   return Boolean(chapter && Array.isArray(chapter.paragraphs) && paragraphIndex < chapter.paragraphs.length);
-}
-
-function contextualRelationships(relationships = [], context = {}) {
-  const pageParagraphIndexes = (context.pageParagraphs || [])
-    .map((item) => item.paragraphIndex)
-    .filter(Number.isInteger);
-  const minParagraph = pageParagraphIndexes.length ? Math.min(...pageParagraphIndexes) : Number(context.selectedParagraph || 0);
-  const maxParagraph = pageParagraphIndexes.length ? Math.max(...pageParagraphIndexes) : Number(context.selectedParagraph || 0);
-  const entityNamesOnPage = new Set(["people", "organizations"]
-    .flatMap((key) => context.index?.[key] || [])
-    .filter((entry) => (entry.occurrences || []).some((occurrence) => (
-      occurrence.chapterIndex === context.chapterIndex
-      && occurrence.paragraphIndex >= minParagraph - 2
-      && occurrence.paragraphIndex <= maxParagraph + 2
-    )))
-    .map((entry) => entry.name)
-    .filter(Boolean));
-
-  return (relationships || [])
-    .filter(hasIndexEvidence)
-    .map((relationship) => {
-      const evidence = relationship.evidence || relationship.occurrence || relationship.occurrences?.[0] || {};
-      return { ...relationship, evidence };
-    })
-    .filter((relationship) => {
-      const evidence = relationship.evidence || {};
-      if (Number(evidence.chapterIndex) > Number(context.chapterIndex)) return false;
-      const sameChapter = Number(evidence.chapterIndex) === Number(context.chapterIndex);
-      const nearPage = sameChapter
-        && Number(evidence.paragraphIndex) >= minParagraph - 8
-        && Number(evidence.paragraphIndex) <= maxParagraph + 8;
-      const endpointOnPage = entityNamesOnPage.has(relationship.source) || entityNamesOnPage.has(relationship.target);
-      return nearPage || endpointOnPage;
-    })
-    .sort((left, right) => {
-      const leftPrimary = left.importance === "primary" ? 1 : 0;
-      const rightPrimary = right.importance === "primary" ? 1 : 0;
-      const leftDistance = Math.abs(Number(left.evidence?.paragraphIndex || 0) - maxParagraph);
-      const rightDistance = Math.abs(Number(right.evidence?.paragraphIndex || 0) - maxParagraph);
-      return rightPrimary - leftPrimary || leftDistance - rightDistance;
-    })
-    .slice(0, 5);
 }
 
 function hasReadingIndexContent(index = {}) {

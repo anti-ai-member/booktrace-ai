@@ -12,6 +12,7 @@
     "verify:memory-aid": "node scripts/verify-memory-aid.mjs",
     "verify:active-recall": "node scripts/verify-active-recall.mjs",
     "verify:reader-memory-assets": "node scripts/verify-reader-memory-assets.mjs",
+    "verify:local-context-view": "node scripts/verify-local-context-view.mjs",
     "situation-bridge:evaluate": "node scripts/situation-bridge-eval.mjs",
     "situation-bridge:evaluate:live": "node scripts/situation-bridge-eval.mjs --live",
     "trace:evaluate": "node scripts/trace-eval.mjs",
